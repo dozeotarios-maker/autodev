@@ -31,12 +31,17 @@ export class Lifecycle {
       return { ok: false, reason: 'Already RUNNING in this instance' }
     }
 
+    // Set state synchronously before async I/O so callers see RUNNING immediately
+    // (prevents a second concurrent input from also entering run()).
+    this.state = 'RUNNING'
+
     const acquired = await this.acquireLockAtomic(idea)
     if (!acquired) {
+      // Rollback — another process holds the lock
+      this.state = 'ARMED'
       return { ok: false, reason: 'Another session is already running in this repo' }
     }
 
-    this.state = 'RUNNING'
     await this.opts.onRunning?.()
     return { ok: true }
   }

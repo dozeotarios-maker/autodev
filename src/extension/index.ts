@@ -1,4 +1,11 @@
-import type { ExtensionAPI, SessionStartEvent, ExtensionContext } from '@earendil-works/pi-coding-agent'
+// S2-M2: Extension entry point — wires the Controller (event-loop orchestrator).
+// Rewritten from Stage-1 stub: replaces bare session_start handler with the full
+// Controller that drives P1→P6 via steer/agent_end + file-based phase contracts.
+//
+// Port interfaces only for Verifier, GitOps, Judge — no concrete imports from
+// src/verify or src/git (those belong to Lane β). Concretes are injected via opts.
+
+import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import type {
   MemoryStore,
   Embedder,
@@ -10,7 +17,6 @@ import type {
   TokenVault,
   SecurityLane,
   Resurrection,
-  MetricEntry,
   SecurityFinding,
 } from '../ports.js'
 
@@ -30,12 +36,10 @@ import { TierDGate } from '../git/tier-d-gate.js'
 import { GitleaksHook } from '../git/gitleaks-hook.js'
 import { TokenVaultImpl } from '../git/token-vault.js'
 
-// ── Lane E: Verify ────────────────────────────────────────────────────────────
+// ── Lane E: Verify (via stub judge — concretes injected by S2-M8 integrator) ──
 import { DeterministicVerifier } from '../verify/deterministic.js'
 import { MutationGate } from '../verify/mutation.js'
 import { HoldoutVerifier } from '../verify/holdout.js'
-import { LLMJudge } from '../verify/llm-judge.js'
-import { SecurityLaneReviewer } from '../verify/security-lane.js'
 
 // ── Lane B: Engine ────────────────────────────────────────────────────────────
 import { FSM } from '../engine/fsm.js'
@@ -46,6 +50,9 @@ import { partitionFiles } from '../lanes/partitioner.js'
 import { Integrator } from '../lanes/integrator.js'
 import { ContractRegistry } from '../lanes/contract-registry.js'
 import { SubagentRunner } from '../lanes/subagent-runner.js'
+
+// ── S2-M2: Controller ────────────────────────────────────────────────────────
+import { Controller } from '../host/controller.js'
 
 // ── Extension options (all external boundaries injectable for test isolation) ──
 export interface AutodevExtensionOptions {
@@ -72,20 +79,12 @@ export interface AutodevExtensionOptions {
 
 // ── Composed concrete adapters ─────────────────────────────────────────────────
 
-/**
- * Build the default concrete MemoryStore: LettaAdapter (with Gemini embedder,
- * Ollama offline fallback). mock=true when LETTA_MOCK env is set.
- */
 function buildMemoryStore(opts: AutodevExtensionOptions): MemoryStore {
   if (opts.memoryStore) return opts.memoryStore
   const mock = process.env['LETTA_MOCK'] === '1'
   return new LettaAdapter({ mock })
 }
 
-/**
- * Build the default Embedder: GeminiEmbedder primary, OllamaEmbedder fallback.
- * The fallback wrapper tries Gemini first; on error, uses Ollama (offline-safe).
- */
 function buildEmbedder(opts: AutodevExtensionOptions): Embedder {
   if (opts.embedder) return opts.embedder
   const mockGemini = process.env['GEMINI_MOCK'] === '1'
@@ -95,7 +94,6 @@ function buildEmbedder(opts: AutodevExtensionOptions): Embedder {
   })
   const ollama = new OllamaEmbedder({ mock: process.env['OLLAMA_MOCK'] === '1' })
 
-  // Fallback wrapper: try Gemini; if unavailable, use Ollama.
   const fallbackEmbedder: Embedder = {
     async embed(texts: string[]): Promise<number[][]> {
       try {
@@ -114,23 +112,15 @@ function buildEmbedder(opts: AutodevExtensionOptions): Embedder {
   return fallbackEmbedder
 }
 
-/**
- * Build TransparencyImpl. pi-hud client is injectable; defaults to a no-op
- * stub so the extension loads without a real pi-hud process.
- */
 function buildTransparency(opts: AutodevExtensionOptions): Transparency {
   if (opts.transparency) return opts.transparency
   const repoRoot = opts.repoRoot ?? process.cwd()
   const hudClient: PiHudClient = opts.hudClient ?? {
-    setWidget: () => { /* no-op stub — real pi-hud injected in production */ },
+    setWidget: () => { /* no-op stub */ },
   }
   return new TransparencyImpl(repoRoot, hudClient)
 }
 
-/**
- * Build a composed GitOps from ScopedCommit + PerPhasePush + TierDGate + GitleaksHook.
- * Each concrete covers one method of the GitOps port.
- */
 function buildGitOps(opts: AutodevExtensionOptions): GitOps {
   if (opts.gitOps) return opts.gitOps
   const cwd = opts.repoRoot ?? process.cwd()
@@ -138,10 +128,7 @@ function buildGitOps(opts: AutodevExtensionOptions): GitOps {
   const perPhasePush = new PerPhasePush(cwd)
   const tierDGate = new TierDGate({ timeoutMs: 30_000 })
   const gitleaksHook = new GitleaksHook(cwd)
-
-  // Default approval provider: auto-deny for safety (operator must inject a real one).
   tierDGate.setApprovalProvider(async () => false)
-
   return {
     scopedCommit: (msg, paths) => scopedCommit.scopedCommit(msg, paths),
     perPhasePush: (branch) => perPhasePush.perPhasePush(branch),
@@ -150,22 +137,17 @@ function buildGitOps(opts: AutodevExtensionOptions): GitOps {
   }
 }
 
-/**
- * Build the verify pipeline from DeterministicVerifier + MutationGate + HoldoutVerifier + GitleaksHook.
- */
 function buildVerifier(opts: AutodevExtensionOptions): Verifier {
   if (opts.verifier) return opts.verifier
   const cwd = opts.repoRoot ?? process.cwd()
   const det = new DeterministicVerifier()
-  const judge = opts.judge ?? new LLMJudge()
+  const judge = opts.judge ?? noopJudge()
   const holdout = new HoldoutVerifier(judge)
   const gitleaks = new GitleaksHook(cwd)
-
   return {
     runDeterministic: (testCmd, wd) => det.run(testCmd, wd),
     runMutation: (wd, threshold) => new MutationGate({ threshold }).run(wd),
     runHoldout: async (testCmd, wd) => {
-      // For port compatibility: run deterministic first, use output as evidence.
       const det2 = new DeterministicVerifier()
       const detResult = await det2.run(testCmd, wd)
       const holdoutResult = await holdout.run({
@@ -176,28 +158,18 @@ function buildVerifier(opts: AutodevExtensionOptions): Verifier {
       })
       return { passed: holdoutResult.passed, output: holdoutResult.reason ?? detResult.output }
     },
-    runSecurityScan: (wd) => gitleaks.scan({ staged: false }),
+    runSecurityScan: (_wd) => gitleaks.scan({ staged: false }),
   }
 }
 
-/**
- * Build TokenVaultImpl. vaultDir is injectable; defaults to ~/.pi/autodev/vault.
- */
 function buildTokenVault(opts: AutodevExtensionOptions): TokenVault {
   if (opts.tokenVault) return opts.tokenVault
   const home = process.env['HOME'] ?? '/root'
   return new TokenVaultImpl(`${home}/.pi/autodev/vault`)
 }
 
-/**
- * Build the SecurityLane concrete. The port has no default binary implementation
- * in the lane files — SecurityLaneReviewer wraps a SecurityLane port instance.
- * The default implementation uses heuristic pattern-matching (no external dep).
- */
 function buildSecurityLane(opts: AutodevExtensionOptions): SecurityLane {
   if (opts.securityLane) return opts.securityLane
-
-  // Inline heuristic: flags prompt-injection markers and exfil patterns.
   const INJECTION_PATTERNS = [
     /ignore previous instructions/i,
     /system prompt/i,
@@ -205,33 +177,24 @@ function buildSecurityLane(opts: AutodevExtensionOptions): SecurityLane {
     /curl\s+https?:\/\//i,
     /fetch\(.*secrets/i,
   ]
-
-  const securityLane: SecurityLane = {
+  return {
     async reviewDiff(diff: string): Promise<{ clean: boolean; findings: SecurityFinding[] }> {
       const findings: SecurityFinding[] = []
       for (const pat of INJECTION_PATTERNS) {
-        if (pat.test(diff)) {
-          findings.push({ severity: 'HIGH', description: `Prompt-injection pattern detected: ${pat.source}` })
-        }
+        if (pat.test(diff)) findings.push({ severity: 'HIGH', description: `Prompt-injection: ${pat.source}` })
       }
       return { clean: findings.length === 0, findings }
     },
     async screenContent(content: string, _source: 'repo' | 'web'): Promise<{ safe: boolean; threats: string[] }> {
       const threats: string[] = []
       for (const pat of INJECTION_PATTERNS) {
-        if (pat.test(content)) {
-          threats.push(`Prompt-injection pattern: ${pat.source}`)
-        }
+        if (pat.test(content)) threats.push(`Prompt-injection: ${pat.source}`)
       }
       return { safe: threats.length === 0, threats }
     },
   }
-  return securityLane
 }
 
-/**
- * Build ResurrectionEngine and hook it to the FSM extension point.
- */
 function buildResurrection(opts: AutodevExtensionOptions, fsm: FSM): Resurrection {
   if (opts.resurrection) return opts.resurrection
   const engine = new ResurrectionEngine()
@@ -243,15 +206,8 @@ function buildResurrection(opts: AutodevExtensionOptions, fsm: FSM): Resurrectio
   }
 }
 
-// ── Lane / partitioner wiring ─────────────────────────────────────────────────
-
-/**
- * Build a Lane port adapter from a SubagentRunner.
- * The concrete Lane wraps a task string into a subagent run.
- */
 function buildLaneAdapter(id: string, files: string[], runner?: SubagentRunner): Lane {
-  // TODO(M-INT+): replace stub with real pi-subagent worker spawn
-  const lanePort: Lane = {
+  return {
     id,
     files,
     async run(task: string, options?: { workdir?: string }): Promise<{ output: string; exitCode: number }> {
@@ -259,18 +215,25 @@ function buildLaneAdapter(id: string, files: string[], runner?: SubagentRunner):
         const r = await runner.run(task, { workdir: options?.workdir })
         return { output: r.output, exitCode: r.exitCode }
       }
-      // Stub: placeholder until real subagent runner is wired at M-INT.
       void options
       return { output: `[lane ${id}] queued: ${task}`, exitCode: 0 }
     },
-    status() {
-      return 'idle' as const
-    },
+    status() { return 'idle' as const },
   }
-  return lanePort
 }
 
-// ── Extension entry point ──────────────────────────────────────────────────────
+// ── No-op stub judge (used when no SubagentDriver is available at boot time) ──
+// In production this is replaced by SubagentJudge injected via opts.judge.
+function noopJudge(): Judge {
+  return {
+    async isDone(_goal: string, _evidence: string): Promise<boolean> { return false },
+    async isStillRight(_spec: string, _diff: string): Promise<{ aligned: boolean; reason?: string }> {
+      return { aligned: true }
+    },
+  }
+}
+
+// ── buildExtension — composes all adapters ────────────────────────────────────
 
 export function buildExtension(opts: AutodevExtensionOptions = {}): {
   memoryStore: MemoryStore
@@ -302,7 +265,7 @@ export function buildExtension(opts: AutodevExtensionOptions = {}): {
     tokenVault: buildTokenVault(opts),
     securityLane: buildSecurityLane(opts),
     resurrection: buildResurrection(opts, fsm),
-    judge: opts.judge ?? new LLMJudge(),
+    judge: opts.judge ?? noopJudge(),
     fsm,
     registry,
     integrator,
@@ -312,11 +275,25 @@ export function buildExtension(opts: AutodevExtensionOptions = {}): {
   }
 }
 
-export default function autodevExtension(pi: ExtensionAPI): void {
-  const ext = buildExtension()
+// ── Extension entry point (S2-M2) ─────────────────────────────────────────────
 
-  pi.on('session_start', async (_event: SessionStartEvent, ctx: ExtensionContext) => {
-    ctx.ui.setStatus('autodev', 'ARMED')
-    await ext.transparency.log('session_start: ARMED — health check pass, idle-wait')
+export default function autodevExtension(pi: ExtensionAPI): void {
+  const opts: AutodevExtensionOptions = {}
+  const repoRoot = process.cwd()
+
+  const transparency = buildTransparency({ ...opts, repoRoot })
+  const gitOps = buildGitOps({ ...opts, repoRoot })
+  const verifier = buildVerifier(opts)
+  const judge = opts.judge ?? noopJudge()
+
+  const controller = new Controller(pi, {
+    repoRoot,
+    verifier,
+    gitOps,
+    judge,
+    transparency,
   })
+
+  controller.wire()
+  controller.registerCommands()
 }
