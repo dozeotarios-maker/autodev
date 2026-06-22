@@ -1,0 +1,53 @@
+default_model: inherit
+provider: claude-bridge
+best_model: claude-opus-4-8
+thinking_default: xhigh
+
+roles:
+  planner: inherit
+  architect: inherit
+  critic: inherit
+  executor: inherit
+  reviewer: inherit
+  tester: inherit
+  integrator: inherit
+  stack-selector: inherit
+  complexity-scorer: inherit
+  humanizer: inherit
+  designer: inherit
+
+done_judge:
+  model: inherit
+  thinking: low
+  note: >
+    H2 separate cheap done? judge — same model, lowest thinking level.
+    Unbiased completion check separate from the builder's context.
+
+embedder:
+  default: gemini
+  fallback: ollama
+  gemini:
+    model: text-embedding-004
+    dimensions: 768
+    note: >
+      gemini-embedding-001 / text-embedding-004 — strong free tier, high limits.
+      Verify current free-tier limits at build (web-currency rule D2).
+  ollama:
+    model: qwen3-embedding:0.6b
+    dimensions: 1024
+    note: >
+      Local offline fallback for private/air-gapped repos. No cloud egress.
+      Pull with: ollama pull qwen3-embedding:0.6b
+
+letta:
+  base_url: http://localhost:8283
+  agent_id: autodev-default
+  note: >
+    Letta (letta-ai/letta, Apache-2.0, SQLite default).
+    Start with: letta server --port 8283
+
+codebase_memory:
+  base_url: http://localhost:7777
+  note: >
+    codebase-memory-mcp (DeusData, single static C binary).
+    Wraps via pi-mcp-adapter. Verify license + version at build.

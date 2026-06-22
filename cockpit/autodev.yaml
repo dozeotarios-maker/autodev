@@ -1,0 +1,107 @@
+models:
+  default: inherit
+  provider: claude-bridge
+  best_model: claude-opus-4-8
+  thinking: xhigh
+
+tiers:
+  XS:
+    file_estimate: 1
+    panel_size: 0
+    lane_count: 1
+    review_rounds: 1
+    thinking: low
+  S:
+    file_estimate: few
+    panel_size: 2
+    lane_count: 2
+    review_rounds: 1
+    thinking: med
+  M:
+    file_estimate: 6
+    panel_size: 4
+    lane_count: 3
+    review_rounds: 2
+    thinking: high
+  L:
+    file_estimate: many
+    panel_size: 6
+    lane_count: 5
+    review_rounds: 3
+    thinking: high
+  XL:
+    file_estimate: big
+    panel_size: 8
+    lane_count: 5
+    review_rounds: 5
+    thinking: xhigh
+
+caps:
+  max_lanes: 5
+  max_review_rounds: 5
+  max_panel_size: 8
+  max_re_plan_rounds: 3
+  tier_d_timeout_seconds: 300
+
+runaway_backstop:
+  max_iterations: 50
+  max_tokens_per_run: 2000000
+  action_on_breach: halt_and_escalate
+
+mutation_threshold: 80
+
+commands:
+  - /autodev-status
+  - /autodev-config
+  - /autodev-tokens
+  - /autodev-pause
+  - /autodev-resume
+  - /autodev-doctor
+
+command_behaviors:
+  /autodev-status:
+    description: Returns JSON with current phase, task, lane_status, model, uptime
+    output: '{ phase, task, lane_status, model, uptime }'
+  /autodev-pause:
+    description: Sets a pause-file that the FSM checks before each transition
+    effect: write .autodev/PAUSE
+  /autodev-resume:
+    description: Removes the pause-file and resumes the FSM
+    effect: delete .autodev/PAUSE
+  /autodev-config:
+    description: Shows current cockpit configuration
+    output: cockpit/autodev.yaml contents
+  /autodev-tokens:
+    description: Shows token vault status (never reveals actual tokens)
+    output: '{ projects: [...], has_token: bool }'
+  /autodev-doctor:
+    description: Health-checks all backends and reports up/down status
+    output: '{ letta: {ok, details}, codebase: {ok, details}, embedder: {ok, details} }'
+
+doctor_checks:
+  - letta
+  - codebase-memory-mcp
+  - embedder
+
+memory:
+  layer_a:
+    adapter: codebase-memory-mcp
+    fallback: tree-sitter-lsp
+  layer_b:
+    adapter: letta
+    backend: sqlite
+    wal_mode: true
+    busy_timeout_ms: 5000
+
+planes:
+  global: ~/.pi/autodev/global/
+  per_repo: .autodev/
+
+safety:
+  kill_file: .autodev/AGENT_STOP
+  pause_file: .autodev/PAUSE
+  tier_d_actions:
+    - push-main
+    - migrate
+    - prod-write
+    - mass-delete
