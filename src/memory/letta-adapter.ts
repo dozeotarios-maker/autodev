@@ -1,22 +1,43 @@
-// M2 — Letta adapter implementing the MemoryStore port.
-// G12: In production, calls the Letta HTTP API (Apache-2.0, SQLite default).
-//      In mock mode, uses an in-memory store for tests — real-or-mocked boundary.
-// Real dep at integration: letta-client (official Letta JS SDK) or plain fetch to localhost:8283.
+// S2-M6 — Letta adapter implementing the MemoryStore port.
+// Corrected real Letta v1 HTTP REST API (not the Stage-1 guesses).
+// Real Letta v1 endpoints (verified against Letta OpenAPI spec, June 2026):
+//   POST   /v1/agents/{agent_id}/archival          — insert a passage (store)
+//   GET    /v1/agents/{agent_id}/archival           — search passages (recall)
+//   GET    /v1/health                              — liveness probe
+// Mock path: set LETTA_MOCK=1 env var OR pass { mock: true } to constructor.
 import type { MemoryStore } from '../ports.js'
 
-interface LettaAdapterOptions {
+// ─── Letta v1 response shapes ───────────────────────────────────────────────
+
+// POST /v1/agents/{id}/archival → Passage
+interface LettaPassage {
+  id: string
+  text: string
+  score?: number
+  embedding?: number[]
+  metadata_?: Record<string, unknown>
+}
+
+// GET /v1/agents/{id}/archival → Passage[]  (array, not wrapped object)
+type LettaArchivalResponse = LettaPassage[]
+
+// GET /v1/health → { status: "ok" | "degraded" }
+interface LettaHealthResponse {
+  status: string
+}
+
+// ─── Options ─────────────────────────────────────────────────────────────────
+
+export interface LettaAdapterOptions {
   mock?: boolean
   baseUrl?: string
   agentId?: string
+  /** Optional bearer token for Letta Cloud or authenticated deployments. */
+  token?: string
 }
 
-interface StoredFact {
-  key: string
-  value: string
-  storedAt: number
-}
+// ─── Contradiction detection (shared by mock + real paths) ──────────────────
 
-// Minimal in-memory contradiction detection: two or more distinct values for the same key = conflict.
 function detectConflict(
   values: string[]
 ): Array<{ a: string; b: string; conflictFlag: boolean }> {
@@ -32,6 +53,14 @@ function detectConflict(
   return conflicts
 }
 
+// ─── In-memory mock store ────────────────────────────────────────────────────
+
+interface StoredFact {
+  key: string
+  value: string
+  storedAt: number
+}
+
 class MockLettaStore {
   private facts: StoredFact[] = []
 
@@ -40,11 +69,9 @@ class MockLettaStore {
   }
 
   recall(query: string, limit: number): Array<{ key: string; value: string; score: number }> {
-    // Simple substring match on key or value; score based on match quality.
     const matched = this.facts.filter(
       f => f.key.includes(query) || f.value.includes(query) || query.includes(f.key)
     )
-    // Deduplicate by keeping all but score higher for exact key matches.
     const scored = matched.map(f => ({
       key: f.key,
       value: f.value,
@@ -59,39 +86,61 @@ class MockLettaStore {
   }
 }
 
+// ─── Adapter ─────────────────────────────────────────────────────────────────
+
 export class LettaAdapter implements MemoryStore {
   private readonly mock: boolean
   private readonly baseUrl: string
   private readonly agentId: string
+  private readonly token: string | undefined
   private mockStore: MockLettaStore | null = null
 
   constructor(opts: LettaAdapterOptions = {}) {
-    this.mock = opts.mock ?? false
+    this.mock = opts.mock ?? process.env['LETTA_MOCK'] === '1'
     this.baseUrl = opts.baseUrl ?? 'http://localhost:8283'
     this.agentId = opts.agentId ?? 'autodev-default'
+    this.token = opts.token
     if (this.mock) {
       this.mockStore = new MockLettaStore()
     }
   }
 
+  /** Build common request headers. */
+  private headers(): Record<string, string> {
+    const h: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (this.token) {
+      h['Authorization'] = `Bearer ${this.token}`
+    }
+    return h
+  }
+
+  /**
+   * Store a fact under a key.
+   * Real path: POST /v1/agents/{agent_id}/archival
+   * Body: { text: "[key] value" }
+   * Returns the created Passage object; we discard it.
+   */
   async store(key: string, value: string, _metadata?: Record<string, unknown>): Promise<void> {
     if (this.mock && this.mockStore) {
       this.mockStore.store(key, value)
       return
     }
-    // Production: POST to Letta agent memory endpoint.
-    // NOTE: real dep = letta HTTP API at this.baseUrl
-    const url = `${this.baseUrl}/v1/agents/${this.agentId}/memory/messages`
+    const url = `${this.baseUrl}/v1/agents/${this.agentId}/archival`
     const response = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role: 'user', content: `[${key}] ${value}` }),
+      headers: this.headers(),
+      body: JSON.stringify({ text: `[${key}] ${value}` }),
     })
     if (!response.ok) {
       throw new Error(`Letta store failed: ${response.status} ${await response.text()}`)
     }
   }
 
+  /**
+   * Retrieve facts matching a query.
+   * Real path: GET /v1/agents/{agent_id}/archival?query=...&limit=N
+   * Returns Passage[] (array directly, not wrapped).
+   */
   async recall(
     query: string,
     limit = 10
@@ -99,41 +148,58 @@ export class LettaAdapter implements MemoryStore {
     if (this.mock && this.mockStore) {
       return this.mockStore.recall(query, limit)
     }
-    // Production: GET Letta archival memory search.
-    const url = `${this.baseUrl}/v1/agents/${this.agentId}/archival?query=${encodeURIComponent(query)}&limit=${limit}`
-    const response = await fetch(url)
+    const params = new URLSearchParams({
+      query,
+      limit: String(limit),
+    })
+    const url = `${this.baseUrl}/v1/agents/${this.agentId}/archival?${params.toString()}`
+    const response = await fetch(url, { headers: this.headers() })
     if (!response.ok) {
       throw new Error(`Letta recall failed: ${response.status}`)
     }
-    const data = (await response.json()) as Array<{ id: string; text: string; score?: number }>
-    return data.map(d => ({
-      key: d.id,
-      value: d.text,
-      score: d.score ?? 0.5,
+    const passages = (await response.json()) as LettaArchivalResponse
+    return passages.map(p => ({
+      key: p.id,
+      value: p.text,
+      score: p.score ?? 0.5,
     }))
   }
 
+  /**
+   * Detect contradictions for a given key by recalling all stored passages
+   * and running local conflict detection.
+   */
   async detectContradictions(
     key: string
   ): Promise<Array<{ a: string; b: string; conflictFlag: boolean }>> {
     if (this.mock && this.mockStore) {
       return this.mockStore.detectContradictions(key)
     }
-    // Production: recall all facts for key, then run local conflict detection.
     const results = await this.recall(key, 50)
     const values = results.map(r => r.value)
     return detectConflict(values)
   }
 
+  /**
+   * Liveness probe.
+   * Real path: GET /v1/health  → { status: "ok" | "degraded" }
+   */
   async healthCheck(): Promise<{ ok: boolean; details?: string }> {
     if (this.mock) {
       return { ok: true, details: 'mock mode' }
     }
     try {
       const url = `${this.baseUrl}/v1/health`
-      const response = await fetch(url, { signal: AbortSignal.timeout(3000) })
-      if (response.ok) return { ok: true }
-      return { ok: false, details: `HTTP ${response.status}` }
+      const response = await fetch(url, {
+        headers: this.headers(),
+        signal: AbortSignal.timeout(3000),
+      })
+      if (!response.ok) {
+        return { ok: false, details: `HTTP ${response.status}` }
+      }
+      const body = (await response.json()) as LettaHealthResponse
+      const ok = body.status === 'ok'
+      return { ok, details: ok ? undefined : `status=${body.status}` }
     } catch (err) {
       return { ok: false, details: String(err) }
     }

@@ -47,7 +47,7 @@ describe('M2: MemoryHealth — graceful degradation', () => {
   })
 
   it('codebase-memory MCP down: overall ok:false, no crash', async () => {
-    const brokenCB = new CodebaseMemoryAdapter({ mock: false, baseUrl: 'http://localhost:19994' })
+    const brokenCB = new CodebaseMemoryAdapter({ mock: false, binaryPath: '__nonexistent_codebase_memory_mcp__' })
     const health = new MemoryHealth({
       store: new LettaAdapter({ mock: true }),
       codebase: brokenCB,
@@ -61,7 +61,7 @@ describe('M2: MemoryHealth — graceful degradation', () => {
   it('all down: reports ok:false but does not throw', async () => {
     const health = new MemoryHealth({
       store: new LettaAdapter({ mock: false, baseUrl: 'http://localhost:19993' }),
-      codebase: new CodebaseMemoryAdapter({ mock: false, baseUrl: 'http://localhost:19992' }),
+      codebase: new CodebaseMemoryAdapter({ mock: false, binaryPath: '__nonexistent_codebase_memory_mcp__' }),
       embedder: new GeminiEmbedder({ mock: false, apiKey: 'x', baseUrl: 'http://localhost:19991' }),
     })
     // Must not throw
