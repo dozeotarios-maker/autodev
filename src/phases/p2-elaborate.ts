@@ -12,23 +12,45 @@ import type { P2Context, P2Output } from './phase-output.js'
 import { validateP2Output } from './phase-output.js'
 import type { PhaseResult } from './phase-executor.js'
 import { wrapUntrusted } from './safe-prompt.js'
+import { DEFAULT_SIZING } from '../engine/complexity.js'
 
 const ROLE_DIRECTIVES = `
 ## Role: Elaboration Agent (P2)
 You are the P2 ELABORATE phase. Your job:
 1. Build a domain model from the spec (entities, relationships, invariants).
-2. Run a persona debate: use the subagent tool to spawn 5 personas (user, dev, security, ops, PM).
+2. Run a persona debate: use the subagent tool to spawn persona agents.
    Each persona critiques the domain model from their perspective.
 3. Collect all objections; synthesise them into the personaDebate array.
 `.trim()
 
-const PERSONAS = ['user', 'developer', 'security', 'ops', 'product-manager']
+const ALL_PERSONAS = ['user', 'developer', 'security', 'ops', 'product-manager']
 
 export function buildP2Instruction(ctx: P2Context, outputFile: string): string {
-  const personaTasks = PERSONAS.map((p) => ({
-    agent: p,
-    task: `Review this domain model as a ${p} and list your top 3 objections or concerns.\n${wrapUntrusted(ctx.p1.spec)}`,
-  }))
+  const sizing = ctx.sizing ?? DEFAULT_SIZING
+  const panelPersonas = sizing.panelPersonas
+  const personas = ALL_PERSONAS.slice(0, panelPersonas)
+  const skipPanel = panelPersonas === 0
+
+  const panelSection = skipPanel
+    ? [
+        `## Persona panel`,
+        'Panel skipped (XS tier — panelPersonas=0). Set personaDebate to [].',
+      ]
+    : [
+        `## Persona panel (run as parallel subagents, ${panelPersonas} personas)`,
+        'Call the `subagent` tool with:',
+        '```json',
+        JSON.stringify({
+          tasks: personas.map((p, i) => ({
+            index: i,
+            agent: p,
+            task: `Review this domain model as a ${p} and list your top 3 objections or concerns.\n${wrapUntrusted(ctx.p1.spec)}`,
+          })),
+          concurrency: panelPersonas,
+          worktree: false,
+        }, null, 2),
+        '```',
+      ]
 
   return [
     ROLE_DIRECTIVES,
@@ -37,11 +59,7 @@ export function buildP2Instruction(ctx: P2Context, outputFile: string): string {
     `Spec:\n${wrapUntrusted(ctx.p1.spec)}`,
     `Stack ADR:\n${wrapUntrusted(ctx.p1.stackAdr)}`,
     '',
-    `## Persona panel (run as parallel subagents)`,
-    'Call the `subagent` tool with:',
-    '```json',
-    JSON.stringify({ tasks: personaTasks.map((t, i) => ({ index: i, ...t })), concurrency: 5, worktree: false }, null, 2),
-    '```',
+    ...panelSection,
     '',
     `## Required output`,
     `Write your result as valid JSON to: ${outputFile}`,
@@ -66,8 +84,6 @@ export function buildP2Instruction(ctx: P2Context, outputFile: string): string {
 }
 
 export class P2Elaborate {
-  private executor: PhaseExecutor<P2Context, P2Output>
-
   constructor(
     private readonly hostAgent: HostAgent,
     private readonly outputDir: string,
@@ -76,27 +92,30 @@ export class P2Elaborate {
     // for potential direct invocation (e.g. in alternative flow or direct-invoke path).
     _subagentDriver?: SubagentDriver,
     private readonly timeoutMs?: number
-  ) {
-    const outputFile = path.join(outputDir, 'p2-domain.json')
-    this.executor = new PhaseExecutor<P2Context, P2Output>(hostAgent, {
+  ) {}
+
+  async execute(ctx: P2Context): Promise<PhaseResult<P2Output>> {
+    const outputFile = path.join(this.outputDir, 'p2-domain.json')
+    const panelPersonas = ctx.sizing?.panelPersonas ?? DEFAULT_SIZING.panelPersonas
+
+    const executor = new PhaseExecutor<P2Context, P2Output>(this.hostAgent, {
       phase: 'P2',
       outputFile,
-      buildInstruction: (ctx) => buildP2Instruction(ctx, outputFile),
+      buildInstruction: (c) => buildP2Instruction(c, outputFile),
       validate: validateP2Output,
       gate: async (output) => {
         if (!output.domainModel || output.domainModel.trim().length < 20) {
           return 'P2 domainModel is too short (< 20 chars)'
         }
-        if (!Array.isArray(output.personaDebate) || output.personaDebate.length === 0) {
+        // Relax empty-debate gate when XS (panelPersonas=0) — panel was intentionally skipped
+        if (panelPersonas > 0 && (!Array.isArray(output.personaDebate) || output.personaDebate.length === 0)) {
           return 'P2 personaDebate must have at least one entry'
         }
         return null
       },
-      timeoutMs,
+      timeoutMs: this.timeoutMs,
     })
-  }
 
-  async execute(ctx: P2Context): Promise<PhaseResult<P2Output>> {
-    return this.executor.execute(ctx)
+    return executor.execute(ctx)
   }
 }

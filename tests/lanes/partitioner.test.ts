@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { partitionFiles, LaneAssignment } from '../../src/lanes/partitioner.js'
+import { tierSizing } from '../../src/engine/complexity.js'
 
 describe('M4: file-DAG partitioner', () => {
   it('assigns non-conflicting files to separate lanes', () => {
@@ -48,5 +49,37 @@ describe('M4: file-DAG partitioner', () => {
     for (const lane of lanes) {
       expect(lane.files.length).toBeGreaterThan(0)
     }
+  })
+})
+
+describe('S2.5: partitionFiles maxLanes param', () => {
+  it('XS tier laneCap=1 → at most 1 lane', () => {
+    const sizing = tierSizing('XS')
+    const fileSets = Array.from({ length: 8 }, (_, i) => [`src/file${i}.ts`])
+    const lanes = partitionFiles(fileSets, sizing.laneCap)
+    expect(lanes.length).toBeLessThanOrEqual(1)
+    expect(sizing.laneCap).toBe(1)
+  })
+
+  it('S tier laneCap=2 → at most 2 lanes', () => {
+    const sizing = tierSizing('S')
+    const fileSets = Array.from({ length: 8 }, (_, i) => [`src/file${i}.ts`])
+    const lanes = partitionFiles(fileSets, sizing.laneCap)
+    expect(lanes.length).toBeLessThanOrEqual(2)
+    expect(sizing.laneCap).toBe(2)
+  })
+
+  it('XL tier laneCap=5 → at most 5 lanes (same as default)', () => {
+    const sizing = tierSizing('XL')
+    const fileSets = Array.from({ length: 10 }, (_, i) => [`src/file${i}.ts`])
+    const lanes = partitionFiles(fileSets, sizing.laneCap)
+    expect(lanes.length).toBeLessThanOrEqual(5)
+    expect(sizing.laneCap).toBe(5)
+  })
+
+  it('default maxLanes=5 (no arg) keeps existing behavior', () => {
+    const fileSets = Array.from({ length: 10 }, (_, i) => [`src/file${i}.ts`])
+    const lanes = partitionFiles(fileSets) // no maxLanes arg
+    expect(lanes.length).toBeLessThanOrEqual(5)
   })
 })

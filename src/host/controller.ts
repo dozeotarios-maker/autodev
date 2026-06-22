@@ -41,6 +41,9 @@ import { P4Build } from '../phases/p4-build.js'
 import { P5Verify } from '../phases/p5-verify.js'
 import { P6Release } from '../phases/p6-release.js'
 import type { P1Output, P2Output, P3Output, P4Output, P5Output } from '../phases/phase-output.js'
+import { scoreComplexity, tierSizing, DEFAULT_SIZING } from '../engine/complexity.js'
+import type { Sizing, ComplexityInput } from '../engine/complexity.js'
+import type { RetroWriter } from '../engine/retro.js'
 
 // ── compactAsync ─────────────────────────────────────────────────────────────
 
@@ -80,6 +83,8 @@ export interface ControllerOptions {
   steerTimeoutMs?: number
   /** Pause-file path; default .autodev/PAUSE */
   pauseFilePath?: string
+  /** Optional RetroWriter for post-run retro (injected for test isolation) */
+  retroWriter?: RetroWriter
 }
 
 // ── Controller ────────────────────────────────────────────────────────────────
@@ -98,6 +103,8 @@ export class Controller {
   private phaseStore: PhaseStore = {}
   private currentIdea = ''
   private startedAt = Date.now()
+  private currentSizing: Sizing = DEFAULT_SIZING
+  private currentRunId = ''
 
   constructor(
     private readonly pi: ExtensionAPI,
@@ -369,18 +376,44 @@ export class Controller {
    */
   private async _runPhases(ctx: ExtensionContext): Promise<void> {
     try {
+      // ── Run-start: default tier M, set thinking level ─────────────────────
+      this.currentRunId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      this.currentSizing = tierSizing('M')
+      const pi = this.pi as unknown as { setThinkingLevel?: (level: string) => void }
+      pi.setThinkingLevel?.(this.currentSizing.thinkingLevel)
+
       await this.journal.write({ type: 'pre-action', phase: 'P1', action: 'starting P1 DISCOVER' })
 
       // ── P1 DISCOVER ──────────────────────────────────────────────────────
       if (await this._isPaused()) { await this._waitResume() }
 
       const p1 = new P1Discover(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
-      const p1Result = await p1.execute({ phase: 'P1', idea: this.currentIdea })
+      const p1Result = await p1.execute({ phase: 'P1', idea: this.currentIdea, sizing: this.currentSizing })
       if (!p1Result.ok || !p1Result.output) {
         await this._escalate('P1', p1Result.reason ?? 'P1 failed')
         return
       }
       this.phaseStore.p1 = p1Result.output
+
+      // ── Post-P1 rescore: update tier+sizing from the spec text ────────────
+      const rescoreInput = this._rescoreFromSpec(this.phaseStore.p1.spec)
+      const rescoreResult = scoreComplexity(rescoreInput)
+      const newSizing = tierSizing(rescoreResult.tier)
+      const prevTier = this.currentSizing.thinkingLevel === 'low' ? 'XS'
+        : this.currentSizing.thinkingLevel === 'medium' ? 'S'
+        : this.currentSizing.thinkingLevel === 'high' && this.currentSizing.panelPersonas === 4 ? 'M'
+        : this.currentSizing.thinkingLevel === 'high' ? 'L'
+        : 'XL'
+      if (rescoreResult.tier !== prevTier) {
+        await this.journal.write({
+          type: 'decision',
+          phase: 'P1',
+          action: `tier: ${prevTier} -> ${rescoreResult.tier} (post-P1 rescore)`,
+        })
+        this.currentSizing = newSizing
+        pi.setThinkingLevel?.(this.currentSizing.thinkingLevel)
+      }
+
       await this.journal.write({ type: 'completion', phase: 'P1', action: 'P1 complete' })
       this.opts.transparency.setHudStatus('P1→P2', this.currentIdea.slice(0, 60), 'compacting', 'opus')
 
@@ -392,7 +425,7 @@ export class Controller {
       if (await this._isPaused()) { await this._waitResume() }
 
       const p2 = new P2Elaborate(this.hostAgent, this.outputDir, this.subagentDriver, this.opts.steerTimeoutMs)
-      const p2Result = await p2.execute({ phase: 'P2', p1: this.phaseStore.p1 })
+      const p2Result = await p2.execute({ phase: 'P2', p1: this.phaseStore.p1, sizing: this.currentSizing })
       if (!p2Result.ok || !p2Result.output) {
         await this._escalate('P2', p2Result.reason ?? 'P2 failed')
         return
@@ -413,6 +446,7 @@ export class Controller {
         phase: 'P3',
         p1: this.phaseStore.p1,
         p2: this.phaseStore.p2,
+        sizing: this.currentSizing,
       })
       if (!p3Result.ok || !p3Result.output) {
         // P3 exhausted re-plan rounds — surface operator brief
@@ -437,7 +471,7 @@ export class Controller {
       if (await this._isPaused()) { await this._waitResume() }
 
       const p4 = new P4Build(this.hostAgent, this.outputDir, this.subagentDriver, this.opts.steerTimeoutMs)
-      const p4Result = await p4.execute({ phase: 'P4', p3: this.phaseStore.p3 })
+      const p4Result = await p4.execute({ phase: 'P4', p3: this.phaseStore.p3, sizing: this.currentSizing })
       if (!p4Result.ok || !p4Result.output) {
         await this._escalate('P4', p4Result.reason ?? 'P4 failed')
         return
@@ -465,6 +499,7 @@ export class Controller {
         phase: 'P5',
         p3: this.phaseStore.p3,
         p4: this.phaseStore.p4,
+        sizing: this.currentSizing,
       })
 
       // H9 backedge: P4→P3 on divergent diff
@@ -482,6 +517,7 @@ export class Controller {
           phase: 'P3',
           p1: this.phaseStore.p1,
           p2: this.phaseStore.p2,
+          sizing: this.currentSizing,
         })
         if (!p3bResult.ok || !p3bResult.output) {
           const p3bFail = p3bResult as { ok: false; reason?: string }
@@ -510,12 +546,21 @@ export class Controller {
       if (await this._isPaused()) { await this._waitResume() }
 
       const p6 = new P6Release(this.hostAgent, this.outputDir, this.opts.gitOps, undefined, this.opts.steerTimeoutMs)
-      const p6Result = await p6.execute({ phase: 'P6', p5: this.phaseStore.p5 })
+      const p6Result = await p6.execute({ phase: 'P6', p5: this.phaseStore.p5, sizing: this.currentSizing })
       if (!p6Result.ok || !p6Result.output) {
         await this._escalate('P6', p6Result.reason ?? 'P6 failed')
         return
       }
       await this.journal.write({ type: 'completion', phase: 'P6', action: `P6 release: ${p6Result.output.commitSha}` })
+
+      // Retro: success (BEFORE lifecycle.release)
+      const tierLabel = rescoreResult.tier
+      await this.opts.retroWriter?.write({
+        runId: this.currentRunId,
+        lesson: `${this.currentIdea.slice(0, 120)} → ${p6Result.output.commitSha}`,
+        bugPattern: 'none',
+        convention: tierLabel,
+      })
 
       // All done
       await this.lifecycle.release()
@@ -533,6 +578,15 @@ export class Controller {
     await this.journal.write({ type: 'decision', phase, action: `HARD BLOCK: ${reason}`, suspect: true })
     await this.opts.transparency.log(`ESCALATE [${phase}]: ${reason}`)
     this.opts.transparency.setHudStatus(phase, 'BLOCKED', 'failed', 'none')
+    // Retro: halt (BEFORE lifecycle.release)
+    if (this.currentRunId) {
+      await this.opts.retroWriter?.write({
+        runId: this.currentRunId,
+        lesson: reason,
+        bugPattern: phase,
+        convention: 'halted',
+      })
+    }
     await this.lifecycle.release()
   }
 
@@ -541,6 +595,34 @@ export class Controller {
     await this.opts.transparency.log(`OPERATOR BRIEF [${phase}]: ${brief.slice(0, 200)}`)
     this.opts.transparency.setHudStatus(phase, 'OPERATOR NEEDED', 'paused', 'none')
     await this.lifecycle.release()
+  }
+
+  /**
+   * Heuristic: extract ComplexityInput signals from the P1 spec text.
+   * Word-count proxies file-estimate; keyword scan drives novelty/blast/irreversibility.
+   */
+  private _rescoreFromSpec(spec: string): ComplexityInput {
+    const words = spec.split(/\s+/).filter(Boolean).length
+
+    // Word-count → rough file count proxy (1 file per ~30 words, capped at 20)
+    const files = Math.min(Math.max(1, Math.floor(words / 30)), 20)
+
+    // Novelty keywords
+    const noveltyHigh = /\b(distributed|microservice|event.sourcing|CQRS|novel|new architecture|redesign|rethink|blockchain|AI|ML|machine.learning)\b/i
+    const noveltyMed = /\b(integration|migration|refactor|redesign|new.feature|extend|plugin)\b/i
+    const novelty = noveltyHigh.test(spec) ? 'high' : noveltyMed.test(spec) ? 'med' : 'low'
+
+    // Blast-radius keywords (1–5)
+    const blastHigh = /\b(cross.service|platform.wide|global|all.users|blast.radius.critical|schema.migration|database.migration|breaking.change)\b/i
+    const blastMed = /\b(multiple.services|shared.library|core.module|api.change|breaking)\b/i
+    const blastRadius = blastHigh.test(spec) ? 5 : blastMed.test(spec) ? 3 : 1
+
+    // Irreversibility keywords
+    const irrevHigh = /\b(irreversible|permanent|delete.data|drop.table|non-rollback|cannot.undo|destructive)\b/i
+    const irrevMed = /\b(migration|schema.change|rename|move.data|alter.table)\b/i
+    const irreversibility = irrevHigh.test(spec) ? 'high' : irrevMed.test(spec) ? 'med' : 'low'
+
+    return { files, novelty, blastRadius, irreversibility }
   }
 
   /**

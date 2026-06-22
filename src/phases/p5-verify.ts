@@ -13,6 +13,7 @@ import type { P5Context, P5Output, ReviewFinding } from './phase-output.js'
 import { validateP5Output } from './phase-output.js'
 import type { PhaseResult } from './phase-executor.js'
 import { wrapUntrusted } from './safe-prompt.js'
+import { DEFAULT_SIZING } from '../engine/complexity.js'
 
 const ROLE_DIRECTIVES = `
 ## Role: Verifier Agent (P5)
@@ -29,6 +30,7 @@ function buildP5Instruction(
   deterministicPassed: boolean,
   holdoutPassed: boolean,
   securityClean: boolean,
+  reviewRounds: number,
 ): string {
   const artifactsRaw = ctx.p4.artifacts.join(', ') || '(none listed)'
 
@@ -41,8 +43,9 @@ function buildP5Instruction(
     `Deterministic verify: ${deterministicPassed ? 'PASSED' : 'FAILED'}`,
     `Holdout verify: ${holdoutPassed ? 'PASSED' : 'FAILED'}`,
     `Security scan: ${securityClean ? 'CLEAN' : 'FINDINGS'}`,
+    `Review rounds cap: ${reviewRounds}`,
     '',
-    `## Clean-context reviewer (run as subagent)`,
+    `## Clean-context reviewer (run as subagent, up to ${reviewRounds} review rounds)`,
     'Call the `subagent` tool with:',
     '```json',
     JSON.stringify({
@@ -160,7 +163,8 @@ export class P5Verify {
       // Judge unavailable — continue without backedge
     }
 
-    const instruction = buildP5Instruction(ctx, outputFile, deterministicPassed, holdoutPassed, securityClean)
+    const reviewRounds = (ctx.sizing ?? DEFAULT_SIZING).reviewRounds
+    const instruction = buildP5Instruction(ctx, outputFile, deterministicPassed, holdoutPassed, securityClean, reviewRounds)
 
     let steerResult
     try {

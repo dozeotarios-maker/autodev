@@ -6,6 +6,29 @@ export type Novelty = 'low' | 'med' | 'high'
 export type Irreversibility = 'low' | 'med' | 'high'
 export type ComplexityTier = 'XS' | 'S' | 'M' | 'L' | 'XL'
 
+// ── Sizing (§6 table) ─────────────────────────────────────────────────────────
+
+export interface Sizing {
+  panelPersonas: number
+  laneCap: number
+  reviewRounds: number
+  thinkingLevel: 'low' | 'medium' | 'high' | 'xhigh'
+}
+
+const SIZING_TABLE: Record<ComplexityTier, Sizing> = {
+  XS: { panelPersonas: 0, laneCap: 1, reviewRounds: 1, thinkingLevel: 'low' },
+  S:  { panelPersonas: 2, laneCap: 2, reviewRounds: 1, thinkingLevel: 'medium' },
+  M:  { panelPersonas: 4, laneCap: 3, reviewRounds: 2, thinkingLevel: 'high' },
+  L:  { panelPersonas: 6, laneCap: 5, reviewRounds: 3, thinkingLevel: 'high' },
+  XL: { panelPersonas: 8, laneCap: 5, reviewRounds: 5, thinkingLevel: 'xhigh' },
+}
+
+export function tierSizing(tier: ComplexityTier): Sizing {
+  return { ...SIZING_TABLE[tier] }
+}
+
+export const DEFAULT_SIZING: Sizing = tierSizing('M')
+
 export interface ComplexityInput {
   files: number
   novelty: Novelty

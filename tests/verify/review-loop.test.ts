@@ -116,3 +116,42 @@ describe('M6b: ReviewLoop', () => {
     expect(mockReviewer).toHaveBeenNthCalledWith(2, 'fixed diff')
   })
 })
+
+describe('S2.5: ReviewLoop maxRounds param (sizing.reviewRounds)', () => {
+  it('maxRounds=1 (XS) → caps at 1 round', async () => {
+    const judge: Judge = {
+      isDone: vi.fn().mockResolvedValue(false),
+      isStillRight: vi.fn().mockResolvedValue({ aligned: false }),
+    }
+    const mockReviewer = vi.fn().mockResolvedValue([makeFinding('CRIT', 'persistent')])
+    const loop = new ReviewLoop(judge, mockReviewer, undefined, 1)
+    const result = await loop.run('diff')
+    expect(result.rounds).toBe(1)
+    expect(result.success).toBe(false)
+    expect(mockReviewer).toHaveBeenCalledTimes(1)
+  })
+
+  it('maxRounds=5 (XL) → caps at 5 rounds', async () => {
+    const judge: Judge = {
+      isDone: vi.fn().mockResolvedValue(false),
+      isStillRight: vi.fn().mockResolvedValue({ aligned: false }),
+    }
+    const mockReviewer = vi.fn().mockResolvedValue([makeFinding('CRIT', 'persistent')])
+    const loop = new ReviewLoop(judge, mockReviewer, undefined, 5)
+    const result = await loop.run('diff')
+    expect(result.rounds).toBe(5)
+    expect(result.success).toBe(false)
+    expect(mockReviewer).toHaveBeenCalledTimes(5)
+  })
+
+  it('default (no maxRounds arg) → behaves as 5 rounds', async () => {
+    const judge: Judge = {
+      isDone: vi.fn().mockResolvedValue(false),
+      isStillRight: vi.fn().mockResolvedValue({ aligned: false }),
+    }
+    const mockReviewer = vi.fn().mockResolvedValue([makeFinding('HIGH', 'persistent')])
+    const loop = new ReviewLoop(judge, mockReviewer)
+    const result = await loop.run('diff')
+    expect(result.rounds).toBe(5)
+  })
+})

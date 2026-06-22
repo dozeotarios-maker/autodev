@@ -20,6 +20,7 @@ import type {
   P4Output,
   P5Output,
 } from '../../src/phases/phase-output.js'
+import { tierSizing } from '../../src/engine/complexity.js'
 
 // ── Mock factories ────────────────────────────────────────────────────────────
 
@@ -509,3 +510,128 @@ describe('S2-M3b: P6Release', () => {
     expect(gitOps.scopedCommit).not.toHaveBeenCalled()
   })
 })
+
+// ── Stage-2.5: sizing consumed by P4 (laneCap) and P5 (reviewRounds) ─────────
+
+describe('S2.5: P4 laneCap from sizing', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'p4-sizing-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('XS sizing (laneCap=1) → instruction contains cap=1', async () => {
+    const ctx: P4Context = {
+      phase: 'P4',
+      sizing: tierSizing('XS'),
+      p3: mockP3Output,
+    }
+    const steerPrompts: string[] = []
+    const agent = {
+      steer: vi.fn(async (prompt: string, opts: { expectFile?: string } = {}) => {
+        steerPrompts.push(prompt)
+        if (opts.expectFile) {
+          await fs.mkdir(path.dirname(opts.expectFile), { recursive: true })
+          await fs.writeFile(opts.expectFile, JSON.stringify(mockP4Output))
+        }
+        return { rawText: 'done', toolResults: [], seq: 1 }
+      }),
+    } as unknown as HostAgent
+
+    const p4 = new P4Build(agent, tmpDir)
+    await p4.execute(ctx)
+
+    expect(steerPrompts[0]).toContain('cap=1')
+  })
+
+  it('XL sizing (laneCap=5) → instruction contains cap=5', async () => {
+    const ctx: P4Context = {
+      phase: 'P4',
+      sizing: tierSizing('XL'),
+      p3: mockP3Output,
+    }
+    const steerPrompts: string[] = []
+    const agent = {
+      steer: vi.fn(async (prompt: string, opts: { expectFile?: string } = {}) => {
+        steerPrompts.push(prompt)
+        if (opts.expectFile) {
+          await fs.mkdir(path.dirname(opts.expectFile), { recursive: true })
+          await fs.writeFile(opts.expectFile, JSON.stringify(mockP4Output))
+        }
+        return { rawText: 'done', toolResults: [], seq: 1 }
+      }),
+    } as unknown as HostAgent
+
+    const p4 = new P4Build(agent, tmpDir)
+    await p4.execute(ctx)
+
+    expect(steerPrompts[0]).toContain('cap=5')
+  })
+})
+
+describe('S2.5: P5 reviewRounds from sizing', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'p5-sizing-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('XS sizing (reviewRounds=1) → P5 instruction contains "Review rounds cap: 1"', async () => {
+    const ctx: P5Context = {
+      phase: 'P5',
+      sizing: tierSizing('XS'),
+      p3: mockP3Output,
+      p4: mockP4Output,
+    }
+    const steerPrompts: string[] = []
+    const agent = {
+      steer: vi.fn(async (prompt: string, opts: { expectFile?: string } = {}) => {
+        steerPrompts.push(prompt)
+        if (opts.expectFile) {
+          await fs.mkdir(path.dirname(opts.expectFile), { recursive: true })
+          await fs.writeFile(opts.expectFile, JSON.stringify(mockP5Output))
+        }
+        return { rawText: 'done', toolResults: [], seq: 1 }
+      }),
+    } as unknown as HostAgent
+
+    const p5 = new P5Verify(agent, tmpDir, makeNullVerifier(), makeNullJudge(), tmpDir)
+    await p5.execute(ctx)
+
+    expect(steerPrompts[0]).toContain('Review rounds cap: 1')
+  })
+
+  it('XL sizing (reviewRounds=5) → P5 instruction contains "Review rounds cap: 5"', async () => {
+    const ctx: P5Context = {
+      phase: 'P5',
+      sizing: tierSizing('XL'),
+      p3: mockP3Output,
+      p4: mockP4Output,
+    }
+    const steerPrompts: string[] = []
+    const agent = {
+      steer: vi.fn(async (prompt: string, opts: { expectFile?: string } = {}) => {
+        steerPrompts.push(prompt)
+        if (opts.expectFile) {
+          await fs.mkdir(path.dirname(opts.expectFile), { recursive: true })
+          await fs.writeFile(opts.expectFile, JSON.stringify(mockP5Output))
+        }
+        return { rawText: 'done', toolResults: [], seq: 1 }
+      }),
+    } as unknown as HostAgent
+
+    const p5 = new P5Verify(agent, tmpDir, makeNullVerifier(), makeNullJudge(), tmpDir)
+    await p5.execute(ctx)
+
+    expect(steerPrompts[0]).toContain('Review rounds cap: 5')
+  })
+})
+

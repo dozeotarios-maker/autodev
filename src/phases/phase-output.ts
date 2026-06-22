@@ -3,6 +3,8 @@
 // The controller reads + schema-validates these files; the next phase's PhaseContext
 // is derived from the prior phase's PhaseOutput.
 
+import type { Sizing } from '../engine/complexity.js'
+
 // ── P1 DISCOVER ───────────────────────────────────────────────────────────────
 
 export interface WebResearchEntry {
@@ -21,6 +23,8 @@ export interface P1Output {
 export interface P1Context {
   phase: 'P1'
   idea: string
+  // TODO: make sizing required once test fixtures updated
+  sizing?: Sizing
 }
 
 // ── P2 ELABORATE ─────────────────────────────────────────────────────────────
@@ -40,6 +44,8 @@ export interface P2Output {
 export interface P2Context {
   phase: 'P2'
   p1: P1Output
+  // TODO: make sizing required once test fixtures updated
+  sizing?: Sizing
 }
 
 // ── P3 PLAN ──────────────────────────────────────────────────────────────────
@@ -74,6 +80,8 @@ export interface P3Context {
   phase: 'P3'
   p1: P1Output
   p2: P2Output
+  // TODO: make sizing required once test fixtures updated
+  sizing?: Sizing
 }
 
 // ── P4 BUILD ─────────────────────────────────────────────────────────────────
@@ -94,6 +102,8 @@ export interface P4Output {
 export interface P4Context {
   phase: 'P4'
   p3: P3Output
+  // TODO: make sizing required once test fixtures updated
+  sizing?: Sizing
 }
 
 // ── P5 VERIFY ────────────────────────────────────────────────────────────────
@@ -122,6 +132,8 @@ export interface P5Context {
   phase: 'P5'
   p3: P3Output
   p4: P4Output
+  // TODO: make sizing required once test fixtures updated
+  sizing?: Sizing
 }
 
 // ── P6 RELEASE ───────────────────────────────────────────────────────────────
@@ -135,6 +147,8 @@ export interface P6Output {
 export interface P6Context {
   phase: 'P6'
   p5: P5Output
+  // TODO: make sizing required once test fixtures updated
+  sizing?: Sizing
 }
 
 // ── Discriminated unions ──────────────────────────────────────────────────────

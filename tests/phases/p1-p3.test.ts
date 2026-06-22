@@ -14,6 +14,7 @@ import { P3Plan } from '../../src/phases/p3-plan.js'
 import { wrapUntrusted } from '../../src/phases/safe-prompt.js'
 import type { HostAgent } from '../../src/host/host-agent.js'
 import type { P1Context, P2Context, P3Context } from '../../src/phases/phase-output.js'
+import { tierSizing } from '../../src/engine/complexity.js'
 
 // ── Mock HostAgent factory ────────────────────────────────────────────────────
 
@@ -536,4 +537,172 @@ describe('S2-M3a: P3Plan', () => {
       expect(result.operatorBrief.persistentObjections).toBeTruthy()
     }
   }, 10_000)
+})
+
+// ── Stage-2.5: sizing consumed by P2 and P3 ──────────────────────────────────
+
+describe('S2.5: P2 panel sizing — XS skips panel + gate passes; XL uses 8 personas', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'p2-sizing-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  const makeP2ContextWithSizing = (tier: 'XS' | 'XL'): P2Context => ({
+    phase: 'P2',
+    sizing: tierSizing(tier),
+    p1: {
+      phase: 'P1',
+      spec: 'A REST API for managing todo items with full CRUD support',
+      stackAdr: 'Node.js + Express chosen for its ecosystem and community support',
+      webResearch: [],
+    },
+  })
+
+  it('XS sizing → instruction contains "Panel skipped" and does not include subagent panel call', async () => {
+    const ctx = makeP2ContextWithSizing('XS')
+    const instruction = buildP2Instruction(ctx, '/tmp/p2-domain.json')
+    expect(instruction).toContain('Panel skipped')
+    expect(instruction).not.toContain('"concurrency"')
+  })
+
+  it('XL sizing → instruction contains 5 personas (capped at ALL_PERSONAS.length)', async () => {
+    const ctx = makeP2ContextWithSizing('XL')
+    const instruction = buildP2Instruction(ctx, '/tmp/p2-domain.json')
+    // XL has panelPersonas=8 but we only have 5 personas defined — sliced to 5
+    expect(instruction).toContain('"concurrency"')
+    expect(instruction).toContain('user')
+    expect(instruction).toContain('security')
+  })
+
+  it('XS sizing → gate passes even with empty personaDebate (panel was skipped)', async () => {
+    const { agent } = makeMockHostAgent(async (expectFile) => {
+      await fs.mkdir(path.dirname(expectFile), { recursive: true })
+      await fs.writeFile(expectFile, JSON.stringify({
+        phase: 'P2',
+        domainModel: 'Todo entity with id, title, done. User entity with email and password.',
+        personaDebate: [], // empty — XS skips panel
+      }))
+    })
+
+    const p2 = new P2Elaborate(agent, tmpDir)
+    const result = await p2.execute(makeP2ContextWithSizing('XS'))
+
+    expect(result.ok).toBe(true)
+  })
+
+  it('default (no sizing) → gate fails on empty personaDebate (backwards compat)', async () => {
+    const { agent } = makeMockHostAgent(async (expectFile) => {
+      await fs.mkdir(path.dirname(expectFile), { recursive: true })
+      await fs.writeFile(expectFile, JSON.stringify({
+        phase: 'P2',
+        domainModel: 'Todo entity with id, title, done. User entity with email and password.',
+        personaDebate: [],
+      }))
+    })
+
+    const p2 = new P2Elaborate(agent, tmpDir)
+    // No sizing → DEFAULT_SIZING.panelPersonas = 4 → gate enforces non-empty debate
+    const result = await p2.execute({
+      phase: 'P2',
+      p1: {
+        phase: 'P1',
+        spec: 'A REST API for managing todo items with full CRUD support',
+        stackAdr: 'Node.js',
+        webResearch: [],
+      },
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.reason).toContain('gate')
+  })
+})
+
+describe('S2.5: P3 panel sizing — XS skips panel; XL uses Math.min(8*2,10)=10 personas', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'p3-sizing-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  const makeP3ContextWithSizing = (tier: 'XS' | 'XL'): P3Context => ({
+    phase: 'P3',
+    sizing: tierSizing(tier),
+    p1: {
+      phase: 'P1',
+      spec: 'A REST API for managing todo items with full CRUD support and auth',
+      stackAdr: 'Node.js + Express with PostgreSQL and JWT authentication',
+      webResearch: [],
+    },
+    p2: {
+      phase: 'P2',
+      domainModel: 'Todo entity with title, completed, userId. User with email, password hash.',
+      personaDebate: [{ persona: 'developer', stance: 'positive', objections: [] }],
+    },
+  })
+
+  it('XS sizing → P3 instruction contains "Panel skipped"', async () => {
+    const ctx = makeP3ContextWithSizing('XS')
+    const steerPrompts: string[] = []
+    const agent = {
+      steer: vi.fn(async (prompt: string, opts: { expectFile?: string } = {}) => {
+        steerPrompts.push(prompt)
+        if (opts.expectFile) {
+          await fs.mkdir(path.dirname(opts.expectFile), { recursive: true })
+          await fs.writeFile(opts.expectFile, JSON.stringify({
+            phase: 'P3',
+            fileDAG: [{ file: 'src/index.ts', lane: 0, deps: [] }],
+            panelObjCount: 0,
+            sprintContract: {
+              goal: 'Build a simple constant addition to config file',
+              successCriteria: ['Constant present'],
+              outOfScope: ['Tests'],
+            },
+            examplesTable: [{ scenario: 'add constant', input: 'none', expectedOutput: 'constant defined' }],
+          }))
+        }
+        return { rawText: 'done', toolResults: [], seq: 1 }
+      }),
+    } as unknown as HostAgent
+
+    await new P3Plan(agent, tmpDir).execute(ctx)
+    expect(steerPrompts[0]).toContain('Panel skipped')
+  })
+
+  it('XL sizing → P3 instruction contains concurrency=10', async () => {
+    const ctx = makeP3ContextWithSizing('XL')
+    const steerPrompts: string[] = []
+    const agent = {
+      steer: vi.fn(async (prompt: string, opts: { expectFile?: string } = {}) => {
+        steerPrompts.push(prompt)
+        if (opts.expectFile) {
+          await fs.mkdir(path.dirname(opts.expectFile), { recursive: true })
+          await fs.writeFile(opts.expectFile, JSON.stringify({
+            phase: 'P3',
+            fileDAG: [{ file: 'src/index.ts', lane: 0, deps: [] }],
+            panelObjCount: 0,
+            sprintContract: {
+              goal: 'Build a distributed microservices platform with CQRS event sourcing',
+              successCriteria: ['All services deployed'],
+              outOfScope: ['Mobile'],
+            },
+            examplesTable: [{ scenario: 'deploy', input: 'k8s manifest', expectedOutput: 'services running' }],
+          }))
+        }
+        return { rawText: 'done', toolResults: [], seq: 1 }
+      }),
+    } as unknown as HostAgent
+
+    await new P3Plan(agent, tmpDir).execute(ctx)
+    // XL: Math.min(8*2, 10) = 10 personas
+    expect(steerPrompts[0]).toContain('"concurrency": 10')
+  })
 })

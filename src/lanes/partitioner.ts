@@ -6,8 +6,8 @@ export interface LaneAssignment {
   files: string[]
 }
 
-export function partitionFiles(fileSets: string[][]): LaneAssignment[] {
-  const MAX_LANES = 5
+export function partitionFiles(fileSets: string[][], maxLanes = 5): LaneAssignment[] {
+  const MAX_LANES = maxLanes
 
   // Union-Find to merge conflicting sets that share a file.
   const parent = new Map<number, number>()

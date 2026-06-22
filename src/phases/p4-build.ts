@@ -12,6 +12,8 @@ import type { P4Context, P4Output } from './phase-output.js'
 import { validateP4Output } from './phase-output.js'
 import type { PhaseResult } from './phase-executor.js'
 import { wrapUntrusted } from './safe-prompt.js'
+import { DEFAULT_SIZING } from '../engine/complexity.js'
+import { partitionFiles } from '../lanes/partitioner.js'
 
 const ROLE_DIRECTIVES = `
 ## Role: Build Agent (P4)
@@ -22,17 +24,22 @@ You are the P4 BUILD phase. Your job:
 `.trim()
 
 function buildP4Instruction(ctx: P4Context, outputFile: string): string {
-  // Group file-DAG entries by lane
-  const laneMap = new Map<number, string[]>()
-  for (const entry of ctx.p3.fileDAG) {
-    const existing = laneMap.get(entry.lane) ?? []
-    existing.push(entry.file)
-    laneMap.set(entry.lane, existing)
-  }
+  const sizing = ctx.sizing ?? DEFAULT_SIZING
+  const laneCap = sizing.laneCap
 
-  const laneTasks = Array.from(laneMap.entries()).map(([laneId, files]) => ({
-    agent: `builder-lane-${laneId}`,
-    task: `Implement the following files for lane ${laneId}:\n${files.map((f) => `- ${f}`).join('\n')}\n\n${wrapUntrusted(`Sprint goal: ${ctx.p3.sprintContract.goal}\nSuccess criteria:\n${ctx.p3.sprintContract.successCriteria.map((c) => `- ${c}`).join('\n')}`)}`,
+  // Group file-DAG entries by lane, then partition respecting laneCap
+  const rawSets = new Map<number, string[]>()
+  for (const entry of ctx.p3.fileDAG) {
+    const existing = rawSets.get(entry.lane) ?? []
+    existing.push(entry.file)
+    rawSets.set(entry.lane, existing)
+  }
+  const partitioned = partitionFiles(Array.from(rawSets.values()), laneCap)
+
+  const laneTasks = partitioned.map((lane, i) => ({
+    agent: `builder-${lane.id}`,
+    task: `Implement the following files for ${lane.id}:\n${lane.files.map((f) => `- ${f}`).join('\n')}\n\n${wrapUntrusted(`Sprint goal: ${ctx.p3.sprintContract.goal}\nSuccess criteria:\n${ctx.p3.sprintContract.successCriteria.map((c) => `- ${c}`).join('\n')}`)}`,
+    index: i,
   }))
 
   return [
@@ -40,14 +47,14 @@ function buildP4Instruction(ctx: P4Context, outputFile: string): string {
     '',
     `## Input`,
     `Sprint goal:\n${wrapUntrusted(ctx.p3.sprintContract.goal)}`,
-    `File-DAG: ${ctx.p3.fileDAG.length} files across ${laneMap.size} lanes`,
+    `File-DAG: ${ctx.p3.fileDAG.length} files across ${partitioned.length} lanes (cap=${laneCap})`,
     '',
     `## Build lanes (run as parallel worktree subagents)`,
     'Call the `subagent` tool with:',
     '```json',
     JSON.stringify({
-      tasks: laneTasks.map((t, i) => ({ index: i, ...t })),
-      concurrency: Math.min(laneMap.size, 5),
+      tasks: laneTasks,
+      concurrency: partitioned.length,
       worktree: true,
     }, null, 2),
     '```',

@@ -22,13 +22,14 @@ export interface LoopResult {
   remainingCritHigh: ReviewFinding[]
 }
 
-const MAX_ROUNDS = 5
+const DEFAULT_MAX_ROUNDS = 5
 
 export class ReviewLoop {
   constructor(
     private readonly judge: Judge,
     private readonly reviewer: ReviewerFn,
-    private readonly fixerFn?: FixerFn
+    private readonly fixerFn?: FixerFn,
+    private readonly maxRounds: number = DEFAULT_MAX_ROUNDS
   ) {}
 
   async run(diff: string): Promise<LoopResult> {
@@ -37,7 +38,7 @@ export class ReviewLoop {
     let currentDiff = diff
     let rounds = 0
 
-    for (let i = 0; i < MAX_ROUNDS; i++) {
+    for (let i = 0; i < this.maxRounds; i++) {
       rounds++
       const findings = await this.reviewer(currentDiff)
 

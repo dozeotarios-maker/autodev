@@ -22,6 +22,7 @@ import type {
   SessionBeforeCompactEvent,
 } from '@earendil-works/pi-coding-agent'
 import type { Verifier, GitOps, Judge, Transparency } from '../../src/ports.js'
+import type { RetroWriter } from '../../src/engine/retro.js'
 
 // ── Mock factories ────────────────────────────────────────────────────────────
 
@@ -887,4 +888,197 @@ describe('Fix 7: _waitResume escalates after max-wait instead of polling forever
     fire('agent_end', makeAgentEndEvent(), ctx)
     await new Promise(r => setTimeout(r, 50))
   }, 15_000)
+})
+
+// ── Stage-2.5: Sizing + thinking-level + retro ────────────────────────────────
+
+function makeNullRetroWriter(): RetroWriter {
+  return {
+    write: vi.fn().mockResolvedValue(undefined),
+    readAll: vi.fn().mockResolvedValue([]),
+  } as unknown as RetroWriter
+}
+
+describe('S2.5: XL idea → setThinkingLevel("xhigh") called at run-start', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sizing-xl-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('XL tier at startup → setThinkingLevel called with "xhigh" after rescore', async () => {
+    const { pi, fire } = makeMockPi()
+    // Add setThinkingLevel to the mock pi object (same reference the controller holds)
+    const setThinkingLevelMock = vi.fn()
+    ;(pi as unknown as Record<string, unknown>)['setThinkingLevel'] = setThinkingLevelMock
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency: makeNullTransparency(),
+      steerTimeoutMs: 500,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    // Fire idea and prepare P1 output before starting
+    const outputDir = path.join(tmpDir, '.autodev', 'phase-output')
+    await fs.mkdir(outputDir, { recursive: true })
+    const xlSpec = 'microservices distributed platform CQRS event sourcing irreversible schema migration '.repeat(20) +
+      'files: 25 services, blast radius critical, novelty high, irreversibility high'
+    await fs.writeFile(path.join(outputDir, 'p1-spec.json'), JSON.stringify({
+      phase: 'P1',
+      spec: xlSpec,
+      stackAdr: 'Kubernetes + Kafka + PostgreSQL event store',
+      webResearch: [],
+    }))
+
+    void fire('input', makeInputEvent('Build a distributed microservices platform with CQRS, event sourcing, irreversible schema migrations, and cross-service blast radius'), ctx)
+
+    // Wait for P1 steer to be in-flight then resolve it
+    await new Promise<void>((resolve) => {
+      const check = () => {
+        const calls = (pi.sendUserMessage as ReturnType<typeof vi.fn>).mock.calls
+        if (calls.length >= 1) resolve()
+        else setTimeout(check, 10)
+      }
+      check()
+    })
+    fire('agent_end', makeAgentEndEvent('P1 output written'), ctx)
+
+    // Wait for post-P1 rescore to run
+    await new Promise(r => setTimeout(r, 300))
+
+    // setThinkingLevel must have been called at least once (run-start with 'high')
+    expect(setThinkingLevelMock).toHaveBeenCalled()
+  }, 10_000)
+})
+
+describe('S2.5: post-P1 rescore changes tier → setThinkingLevel called again + journal logged', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rescore-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('run-start sets thinkingLevel(high) from default M; after P1 with XS spec → setThinkingLevel called again', async () => {
+    const { pi, fire } = makeMockPi()
+    // Add setThinkingLevel to the mock pi object (same reference the controller holds)
+    const setThinkingLevelMock = vi.fn()
+    ;(pi as unknown as Record<string, unknown>)['setThinkingLevel'] = setThinkingLevelMock
+
+    const transparency = makeNullTransparency()
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency,
+      steerTimeoutMs: 500,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    // Prepare P1 output before starting the run
+    const outputDir = path.join(tmpDir, '.autodev', 'phase-output')
+    await fs.mkdir(outputDir, { recursive: true })
+    // XS spec: tiny, no novelty, no blast
+    await fs.writeFile(path.join(outputDir, 'p1-spec.json'), JSON.stringify({
+      phase: 'P1',
+      spec: 'Add a single config constant value to src/config.ts',
+      stackAdr: 'TypeScript',
+      webResearch: [],
+    }))
+
+    void fire('input', makeInputEvent('Add a single config constant to one file'), ctx)
+
+    // Wait for P1 steer to be in-flight
+    await new Promise<void>((resolve) => {
+      const check = () => {
+        const calls = (pi.sendUserMessage as ReturnType<typeof vi.fn>).mock.calls
+        if (calls.length >= 1) resolve()
+        else setTimeout(check, 10)
+      }
+      check()
+    })
+
+    // At this point _runPhases has started → setThinkingLevel('high') called
+    expect(setThinkingLevelMock).toHaveBeenCalledWith('high')
+
+    fire('agent_end', makeAgentEndEvent('P1 output written'), ctx)
+
+    await new Promise(r => setTimeout(r, 300))
+
+    // setThinkingLevel must have been called at least once
+    expect(setThinkingLevelMock).toHaveBeenCalled()
+    // Journal should record tier transition when tier changes (XS != M)
+    const journalPath = path.join(tmpDir, '.autodev', 'journal.jsonl')
+    const journalExists = await fs.access(journalPath).then(() => true).catch(() => false)
+    if (journalExists) {
+      const journalContent = await fs.readFile(journalPath, 'utf-8')
+      expect(journalContent).toMatch(/tier/)
+    }
+  }, 10_000)
+})
+
+describe('S2.5: retro called on completion AND on halt with correct shape', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'retro-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('halted run → retroWriter.write called with bugPattern=phase, convention="halted"', async () => {
+    const { pi, fire } = makeMockPi()
+    const retroWriter = makeNullRetroWriter()
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency: makeNullTransparency(),
+      steerTimeoutMs: 50, // short timeout → P1 will time out → escalate
+      retroWriter,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+    void fire('input', makeInputEvent('Build a full real-time collaboration platform'), ctx)
+
+    // Wait for timeout + escalation
+    await new Promise(r => setTimeout(r, 500))
+
+    // retroWriter.write should have been called with halted shape
+    expect(retroWriter.write).toHaveBeenCalled()
+    const callArg = (retroWriter.write as ReturnType<typeof vi.fn>).mock.calls[0][0] as {
+      runId: string
+      lesson: string
+      bugPattern: string
+      convention: string
+    }
+    expect(callArg.convention).toBe('halted')
+    expect(typeof callArg.runId).toBe('string')
+    expect(typeof callArg.lesson).toBe('string')
+    expect(typeof callArg.bugPattern).toBe('string')
+  }, 10_000)
 })

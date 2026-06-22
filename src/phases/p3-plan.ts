@@ -15,8 +15,14 @@ import type { P3Context, P3Output } from './phase-output.js'
 import { validateP3Output } from './phase-output.js'
 import type { PhaseResult } from './phase-executor.js'
 import { wrapUntrusted } from './safe-prompt.js'
+import { DEFAULT_SIZING } from '../engine/complexity.js'
 
 const MAX_REPLAN_ROUNDS = 3
+
+const ALL_PLAN_PERSONAS = [
+  'user', 'developer', 'security', 'ops', 'product-manager',
+  'architect', 'qa', 'legal', 'accessibility', 'performance',
+]
 
 const ROLE_DIRECTIVES = `
 ## Role: Planning Agent (P3)
@@ -24,24 +30,40 @@ You are the P3 PLAN phase. Your job:
 1. Scope: define what is IN and OUT of scope for this sprint.
 2. Slice: break the work into a file-DAG (which files, in which lane, with which dependencies).
 3. Plan: produce a sprint contract (goal, success criteria, out-of-scope) and examples table.
-4. Run a 10-persona panel via the subagent tool to review the plan.
+4. Run a persona panel via the subagent tool to review the plan.
 5. If objections remain, revise and re-plan (this will be indicated in your context).
 `.trim()
 
-const PLAN_PERSONAS = [
-  'user', 'developer', 'security', 'ops', 'product-manager',
-  'architect', 'qa', 'legal', 'accessibility', 'performance',
-]
-
 function buildP3Instruction(ctx: P3Context, outputFile: string, objections?: string): string {
+  const sizing = ctx.sizing ?? DEFAULT_SIZING
+  const panelCount = Math.min((sizing.panelPersonas) * 2, 10)
+  const skipPanel = panelCount === 0
+  const personas = ALL_PLAN_PERSONAS.slice(0, panelCount)
+
   const revisionNote = objections
     ? `\n## Revision context\nPrevious plan had these unresolved objections. Address them:\n${objections}\n`
     : ''
 
-  const personaTasks = PLAN_PERSONAS.map((p) => ({
-    agent: p,
-    task: `Review this sprint plan as a ${p} and list your top objections (or say "no objections").\n${wrapUntrusted(`Spec: ${ctx.p1.spec}\nDomain: ${ctx.p2.domainModel}`)}`,
-  }))
+  const panelSection = skipPanel
+    ? [
+        `## Persona panel`,
+        'Panel skipped (XS tier — panelPersonas=0). Set panelObjCount to 0.',
+      ]
+    : [
+        `## Persona panel (run as parallel subagents, ${panelCount} personas)`,
+        'Call the `subagent` tool with:',
+        '```json',
+        JSON.stringify({
+          tasks: personas.map((p, i) => ({
+            index: i,
+            agent: p,
+            task: `Review this sprint plan as a ${p} and list your top objections (or say "no objections").\n${wrapUntrusted(`Spec: ${ctx.p1.spec}\nDomain: ${ctx.p2.domainModel}`)}`,
+          })),
+          concurrency: panelCount,
+          worktree: false,
+        }, null, 2),
+        '```',
+      ]
 
   return [
     ROLE_DIRECTIVES,
@@ -51,11 +73,7 @@ function buildP3Instruction(ctx: P3Context, outputFile: string, objections?: str
     `Stack ADR:\n${wrapUntrusted(ctx.p1.stackAdr)}`,
     `Domain Model:\n${wrapUntrusted(ctx.p2.domainModel)}`,
     '',
-    `## Persona panel (run as parallel subagents)`,
-    'Call the `subagent` tool with:',
-    '```json',
-    JSON.stringify({ tasks: personaTasks.map((t, i) => ({ index: i, ...t })), concurrency: 10, worktree: false }, null, 2),
-    '```',
+    ...panelSection,
     '',
     `## Required output`,
     `Write your result as valid JSON to: ${outputFile}`,
