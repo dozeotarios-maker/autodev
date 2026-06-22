@@ -618,7 +618,8 @@ export class Controller {
         phase: 'P1',
         action: '_rescoreFromSpec: empty spec — using M-equivalent defaults to prevent silent XS downgrade',
       })
-      return { files: 5, novelty: 'med', blastRadius: 3, irreversibility: 'med' }
+      // files:4 + blast:3*1.5 + novelty:med(2) + irrev:med(2) = 12.5 → tier M (≤13)
+      return { files: 4, novelty: 'med', blastRadius: 3, irreversibility: 'med' }
     }
 
     // Word-count → rough file count proxy (1 file per ~30 words, capped at 20)
