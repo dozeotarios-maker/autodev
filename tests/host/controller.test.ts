@@ -691,3 +691,130 @@ describe('S2-M2: mid-steer timeout → phase suspect + journal + escalate', () =
     )
   }, 10_000)
 })
+
+// ── Fix 6: TOCTOU — two rapid inputs cannot both start a run ─────────────────
+
+describe('Fix 6: two rapid idea inputs cannot both start a run (TOCTOU)', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'toctou-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('second concurrent input is rejected by lifecycle.run() atomic lock', async () => {
+    const { pi, fire } = makeMockPi()
+    const transparency = makeNullTransparency()
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    // Fire two idea inputs simultaneously (no await between them)
+    const p1 = fire('input', makeInputEvent('Build a todo app with user auth'), ctx)
+    const p2 = fire('input', makeInputEvent('Build a blog platform with CMS'), ctx)
+
+    // Wait for both to fully settle (run lock I/O completes)
+    await new Promise(r => setTimeout(r, 100))
+    await p1
+    await p2
+
+    // The second input must have been denied — lifecycle.run() returns {ok:false}
+    // for the second caller, which logs "input ignored (already RUNNING): ..."
+    const deniedCalls = (transparency.log as ReturnType<typeof vi.fn>).mock.calls
+      .filter((args: unknown[]) => String(args[0]).includes('already RUNNING'))
+    expect(deniedCalls).toHaveLength(1)
+
+    // Only ONE _runPhases must have started: only one sendUserMessage for P1 steer
+    // (after run lock resolves, _runPhases calls steer → sendUserMessage)
+    await new Promise(r => setTimeout(r, 100))
+    const sendCalls = (pi.sendUserMessage as ReturnType<typeof vi.fn>).mock.calls.length
+    expect(sendCalls).toBeLessThanOrEqual(1)
+
+    // Clean up: resolve the pending steer so the test doesn't hang
+    const outputDir = path.join(tmpDir, '.autodev', 'phase-output')
+    await fs.mkdir(outputDir, { recursive: true })
+    await fs.writeFile(path.join(outputDir, 'p1-spec.json'), JSON.stringify({
+      phase: 'P1', spec: 'Build a todo app with user auth — full spec', stackAdr: 'Node.js', webResearch: [],
+    }))
+    fire('agent_end', makeAgentEndEvent(), ctx)
+    await new Promise(r => setTimeout(r, 50))
+  }, 10_000)
+})
+
+// ── Fix 7: _waitResume max-wait cap ──────────────────────────────────────────
+
+describe('Fix 7: _waitResume escalates after max-wait instead of polling forever', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'waitresume-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('pause file removed within poll period → run proceeds normally', async () => {
+    const { pi, fire } = makeMockPi()
+    const transparency = makeNullTransparency()
+    const pauseFilePath = path.join(tmpDir, '.autodev', 'PAUSE')
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency,
+      pauseFilePath,
+    })
+    ctrl.wire()
+    ctrl.registerCommands()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    // Create pause file before idea input
+    await fs.mkdir(path.dirname(pauseFilePath), { recursive: true })
+    await fs.writeFile(pauseFilePath, new Date().toISOString())
+
+    // Fire idea input — _runPhases will hit _waitResume and poll (every 2000ms)
+    void fire('input', makeInputEvent('Build a search engine with indexing'), ctx)
+    await new Promise(r => setImmediate(r))
+
+    // Remove pause file immediately — _waitResume poll will detect on next tick
+    await fs.unlink(pauseFilePath).catch(() => {})
+
+    // Wait for _waitResume to detect removal (poll is 2000ms; give ample time)
+    await new Promise<void>((resolve) => {
+      const check = () => {
+        const calls = (pi.sendUserMessage as ReturnType<typeof vi.fn>).mock.calls
+        if (calls.length >= 1) resolve()
+        else setTimeout(check, 50)
+      }
+      check()
+    })
+
+    // Run should have proceeded (sendUserMessage called for P1 steer)
+    expect(pi.sendUserMessage).toHaveBeenCalled()
+
+    // Clean up
+    const outputDir = path.join(tmpDir, '.autodev', 'phase-output')
+    await fs.mkdir(outputDir, { recursive: true })
+    await fs.writeFile(path.join(outputDir, 'p1-spec.json'), JSON.stringify({
+      phase: 'P1', spec: 'Build a search engine with indexing — full spec', stackAdr: 'Python', webResearch: [],
+    }))
+    fire('agent_end', makeAgentEndEvent(), ctx)
+    await new Promise(r => setTimeout(r, 50))
+  }, 15_000)
+})

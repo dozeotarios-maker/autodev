@@ -53,12 +53,12 @@ export class SubagentJudge implements Judge {
     try {
       const parsed = JSON.parse(output.trim()) as { aligned?: boolean; reason?: string }
       if (typeof parsed.aligned !== 'boolean') {
-        return { aligned: true } // default safe
+        return { aligned: false, reason: 'judge output unparseable' }
       }
       return { aligned: parsed.aligned, reason: parsed.reason }
     } catch {
-      // Not parseable — default to aligned=true (conservative: avoid spurious backedges)
-      return { aligned: true }
+      // Not parseable — fail-conservative: flag for review rather than silently approve
+      return { aligned: false, reason: 'judge output unparseable' }
     }
   }
 }

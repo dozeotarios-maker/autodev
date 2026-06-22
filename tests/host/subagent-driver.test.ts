@@ -213,3 +213,119 @@ describe('S2-M1: SubagentDriver dirty-tree stash guard', () => {
     expect(gitExec).not.toHaveBeenCalled()
   })
 })
+
+// ── Fix 4: _stashPop failure does not mask original error ───────────────────
+
+describe('Fix 4: _stashPop failure does not mask original error', () => {
+  it('propagates original steer error even when stash pop also fails', async () => {
+    // steer() will throw the original error
+    const steerError = new Error('steer failed: original error')
+    const agent = {
+      steer: vi.fn().mockRejectedValue(steerError),
+      _onAgentEnd: vi.fn(),
+      _onTurnEnd: vi.fn(),
+    } as unknown as HostAgent
+
+    // git: status → dirty, stash push → ok, stash pop → FAILS
+    const gitExec: GitExec = vi.fn((args: string[]) => {
+      if (args[0] === 'status') return Promise.resolve({ stdout: 'M dirty.ts\n' })
+      if (args[0] === 'stash' && args[1] === 'push') return Promise.resolve({ stdout: '' })
+      if (args[0] === 'stash' && args[1] === 'pop') return Promise.reject(new Error('pop conflict'))
+      return Promise.resolve({ stdout: '' })
+    })
+
+    const driver = new SubagentDriver(agent, { gitExec })
+
+    // Must throw the ORIGINAL steer error, NOT the pop error
+    await expect(
+      driver.invoke([{ agent: 'a', task: 't' }], { worktree: true })
+    ).rejects.toThrow('steer failed: original error')
+  })
+
+  it('propagates steer result and does not throw when stash pop fails (no original error)', async () => {
+    // steer() succeeds
+    const agent = makeMockHostAgent(
+      mockAgentResult([{ toolName: 'subagent', content: [{ text: 'ok' }] }])
+    )
+
+    // git: status → dirty, stash push → ok, stash pop → FAILS
+    const gitExec: GitExec = vi.fn((args: string[]) => {
+      if (args[0] === 'status') return Promise.resolve({ stdout: 'M dirty.ts\n' })
+      if (args[0] === 'stash' && args[1] === 'push') return Promise.resolve({ stdout: '' })
+      if (args[0] === 'stash' && args[1] === 'pop') return Promise.reject(new Error('pop conflict'))
+      return Promise.resolve({ stdout: '' })
+    })
+
+    const driver = new SubagentDriver(agent, { gitExec })
+
+    // Pop failure is swallowed (logged only) — invoke resolves with results
+    const results = await driver.invoke([{ agent: 'a', task: 't' }], { worktree: true })
+    expect(results).toHaveLength(1)
+    expect(results[0].output).toContain('ok')
+  })
+})
+
+// ── Fix 5: fewer results than tasks → missing tasks marked failed ───────────
+
+import { SUBAGENT_MISSING } from '../../src/host/subagent-driver.js'
+
+describe('Fix 5: correlateResults marks missing tasks as failed', () => {
+  it('marks tasks with no corresponding result as SUBAGENT_MISSING', async () => {
+    // Host returns only 1 result but 3 tasks were sent
+    const agent = makeMockHostAgent(
+      mockAgentResult([
+        { toolName: 'subagent', content: [{ text: 'only task 0 done' }] },
+        // tasks 1 and 2 have no result
+      ])
+    )
+    const driver = new SubagentDriver(agent)
+
+    const results = await driver.invoke([
+      { agent: 'a', task: 'task 0' },
+      { agent: 'b', task: 'task 1' },
+      { agent: 'c', task: 'task 2' },
+    ])
+
+    expect(results).toHaveLength(3)
+    expect(results[0].output).toContain('only task 0 done')
+    // Tasks 1 and 2 must be marked as missing, NOT empty string
+    expect(results[1].output).toBe(SUBAGENT_MISSING)
+    expect(results[2].output).toBe(SUBAGENT_MISSING)
+  })
+
+  it('marks ALL tasks as SUBAGENT_MISSING when host returns zero results', async () => {
+    const agent = makeMockHostAgent(
+      mockAgentResult([]) // no subagent results at all
+    )
+    const driver = new SubagentDriver(agent)
+
+    const results = await driver.invoke([
+      { agent: 'x', task: 'task x' },
+      { agent: 'y', task: 'task y' },
+    ])
+
+    expect(results).toHaveLength(2)
+    expect(results[0].output).toBe(SUBAGENT_MISSING)
+    expect(results[1].output).toBe(SUBAGENT_MISSING)
+  })
+
+  it('correct count of results returns normally without SUBAGENT_MISSING', async () => {
+    const agent = makeMockHostAgent(
+      mockAgentResult([
+        { toolName: 'subagent', content: [{ text: 'r0' }] },
+        { toolName: 'subagent', content: [{ text: 'r1' }] },
+      ])
+    )
+    const driver = new SubagentDriver(agent)
+
+    const results = await driver.invoke([
+      { agent: 'a', task: 't0' },
+      { agent: 'b', task: 't1' },
+    ])
+
+    expect(results[0].output).toBe('r0')
+    expect(results[1].output).toBe('r1')
+    expect(results[0].output).not.toBe(SUBAGENT_MISSING)
+    expect(results[1].output).not.toBe(SUBAGENT_MISSING)
+  })
+})

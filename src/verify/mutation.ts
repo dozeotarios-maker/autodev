@@ -2,6 +2,8 @@
 // Missing binary degrades gracefully: skip + log, no crash.
 // Exit-code gate: 0 = parse score; non-zero = failed (score may still be parseable).
 
+import { spawn } from 'child_process'
+
 export interface PiExecResult {
   stdout: string
   stderr: string
@@ -38,7 +40,6 @@ function defaultExec(
   options?: { cwd?: string }
 ): Promise<PiExecResult> {
   return new Promise((resolve) => {
-    const { spawn } = require('child_process') as typeof import('child_process')
     let proc: ReturnType<typeof spawn>
     try {
       proc = spawn(command, args, { cwd: options?.cwd, shell: false })

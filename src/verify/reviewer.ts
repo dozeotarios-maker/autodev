@@ -30,11 +30,11 @@ export class R1Reviewer {
     try {
       const parsed = JSON.parse(output.trim()) as { aligned?: boolean; reason?: string }
       if (typeof parsed.aligned !== 'boolean') {
-        return { clean: true }
+        return { clean: false, reason: 'reviewer output unparseable' }
       }
       return { clean: parsed.aligned, reason: parsed.reason }
     } catch {
-      return { clean: true }
+      return { clean: false, reason: 'reviewer output unparseable' }
     }
   }
 }

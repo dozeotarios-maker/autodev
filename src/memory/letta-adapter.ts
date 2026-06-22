@@ -98,7 +98,11 @@ export class LettaAdapter implements MemoryStore {
   constructor(opts: LettaAdapterOptions = {}) {
     this.mock = opts.mock ?? process.env['LETTA_MOCK'] === '1'
     this.baseUrl = opts.baseUrl ?? 'http://localhost:8283'
-    this.agentId = opts.agentId ?? 'autodev-default'
+    const agentId = opts.agentId ?? 'autodev-default'
+    if (!/^[a-zA-Z0-9_-]+$/.test(agentId)) {
+      throw new Error(`Invalid agentId "${agentId}": must match /^[a-zA-Z0-9_-]+$/`)
+    }
+    this.agentId = agentId
     this.token = opts.token
     if (this.mock) {
       this.mockStore = new MockLettaStore()

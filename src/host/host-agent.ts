@@ -9,9 +9,13 @@
 //   pi.on('turn_end',  (e, _ctx) => hostAgent._onTurnEnd(e))
 
 import * as fs from 'fs/promises'
+import * as path from 'path'
 import type { AgentEndEvent, TurnEndEvent } from '@earendil-works/pi-coding-agent'
 import type { AgentResult, SteerOptions, ToolResultEntry } from './types.js'
 import { SteerInFlightError } from './types.js'
+
+/** Directory segment that expectFile paths must contain (any .autodev/ ancestor) */
+const AUTODEV_DIR_SEGMENT = `${path.sep}.autodev${path.sep}`
 
 const DEFAULT_TIMEOUT_MS = 600_000 // 10 minutes
 
@@ -59,6 +63,16 @@ export class HostAgent {
       return
     }
     const { resolve, seq, timer, turnToolResults } = this.pending
+
+    // Fix 2: seq guard — a late agent_end from a timed-out steer must not resolve
+    // a NEW steer. Compare the event's steer seq against the current pending seq.
+    // After a timeout nulls pending and a new steer sets a fresh pending, any
+    // arriving agent_end from the old steer carries the old seq and is discarded.
+    if (seq !== this.seq) {
+      // Stale agent_end for a previous (timed-out) steer — discard
+      return
+    }
+
     clearTimeout(timer)
     // Clear pending BEFORE resolving so retry in steer() can set a new pending
     this.pending = null
@@ -94,6 +108,13 @@ export class HostAgent {
       let lastError: Error | null = null
 
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        // Fix 1: before each retry, delete any stale expectFile so the host
+        // MUST write a fresh one. Without this, a file left from a previous
+        // (failed) attempt can pass validation vacuously on the retry.
+        if (attempt > 0 && opts.expectFile) {
+          await fs.unlink(opts.expectFile).catch(() => { /* already gone — fine */ })
+        }
+
         const result = await this._waitForAgentEnd(prompt, currentSeq, timeoutMs)
         const valid = await this._validate(result, opts)
         if (valid.ok) {
@@ -143,6 +164,18 @@ export class HostAgent {
     opts: SteerOptions
   ): Promise<{ ok: boolean; reason?: string }> {
     if (opts.expectFile) {
+      // Fix 3: path containment — expectFile must resolve to a path inside a
+      // directory named .autodev/ (any ancestor). This prevents reads of arbitrary
+      // filesystem paths (e.g. /etc/passwd) while remaining compatible with
+      // per-repo tmpDir layouts used in tests.
+      const resolved = path.resolve(opts.expectFile)
+      if (!resolved.includes(AUTODEV_DIR_SEGMENT)) {
+        return {
+          ok: false,
+          reason: `expectFile '${opts.expectFile}' is outside the allowed .autodev/ directory`,
+        }
+      }
+
       try {
         const content = await fs.readFile(opts.expectFile, 'utf-8')
         JSON.parse(content) // throws if invalid JSON

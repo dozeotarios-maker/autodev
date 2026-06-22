@@ -93,12 +93,19 @@ function buildMemoryStore(opts: AutodevExtensionOptions): MemoryStore {
 
 function buildEmbedder(opts: AutodevExtensionOptions): Embedder {
   if (opts.embedder) return opts.embedder
-  const mockGemini = process.env['GEMINI_MOCK'] === '1'
-  const gemini = new GeminiEmbedder({
-    mock: mockGemini,
-    apiKey: process.env['GEMINI_API_KEY'] ?? '',
-  })
+  const geminiApiKey = process.env['GEMINI_API_KEY']
   const ollama = new OllamaEmbedder({ mock: process.env['OLLAMA_MOCK'] === '1' })
+
+  // Skip Gemini entirely when no API key is set — avoids wasteful 401 before fallback.
+  if (!geminiApiKey) {
+    console.warn('[pi-autodev] GEMINI_API_KEY not set — using Ollama embedder directly')
+    return ollama
+  }
+
+  const gemini = new GeminiEmbedder({
+    mock: process.env['GEMINI_MOCK'] === '1',
+    apiKey: geminiApiKey,
+  })
 
   const fallbackEmbedder: Embedder = {
     async embed(texts: string[]): Promise<number[][]> {
@@ -229,11 +236,14 @@ function buildLaneAdapter(id: string, files: string[], runner?: SubagentRunner):
 }
 
 // ── No-op stub judge (fallback when no SubagentDriver is available) ──────────
+// isStillRight returns aligned:false (fail-safe) so H9 is disabled rather than
+// silently bypassed when no real judge is wired.
 function noopJudge(): Judge {
+  console.warn('[pi-autodev] noopJudge active: no real judge wired — H9 alignment checks disabled')
   return {
     async isDone(_goal: string, _evidence: string): Promise<boolean> { return false },
     async isStillRight(_spec: string, _diff: string): Promise<{ aligned: boolean; reason?: string }> {
-      return { aligned: true }
+      return { aligned: false, reason: 'no judge available' }
     },
   }
 }

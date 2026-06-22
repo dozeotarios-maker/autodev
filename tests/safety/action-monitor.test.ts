@@ -64,4 +64,25 @@ describe('M1: G2 action-monitor', () => {
     expect(result.allowed).toBe(false)
     expect(result.reason).toMatch(/not in allowlist/)
   })
+
+  // Split-allowlist: exact-only entries must NOT allow subdomains
+  it('blocks evil.localhost (suffix of allowlisted localhost must not pass)', () => {
+    const m = new ActionMonitor()
+    expect(m.checkEgress('http://evil.localhost/steal').allowed).toBe(false)
+  })
+
+  it('allows localhost exactly', () => {
+    const m = new ActionMonitor()
+    expect(m.checkEgress('http://localhost:8283/v1/agents').allowed).toBe(true)
+  })
+
+  it('allows api.github.com (subdomain suffix of github.com)', () => {
+    const m = new ActionMonitor()
+    expect(m.checkEgress('https://api.github.com/repos').allowed).toBe(true)
+  })
+
+  it('blocks evil.github.com.attacker.com (does not match github.com suffix)', () => {
+    const m = new ActionMonitor()
+    expect(m.checkEgress('https://evil.github.com.attacker.com/').allowed).toBe(false)
+  })
 })

@@ -66,8 +66,16 @@ export class SubagentDriver {
 
       return correlateResults(tasks, result.toolResults)
     } finally {
+      // Fix 4: wrap _stashPop in try/catch so a pop failure does NOT mask the
+      // original error. The stash entry stays for manual recovery; we log the
+      // failure but let the original error (if any) propagate normally.
       if (stashed) {
-        await this._stashPop(cwd)
+        try {
+          await this._stashPop(cwd)
+        } catch (popErr) {
+          // Log to stderr — do not throw so the original error propagates.
+          console.error('[SubagentDriver] git stash pop failed; stash left for manual recovery:', popErr)
+        }
       }
     }
   }
@@ -128,8 +136,14 @@ function buildSubagentInstruction(
 
 /**
  * Filter toolResults for subagent calls and correlate by task index.
- * Correlates positionally (by order of filtered results).
+ *
+ * Fix 5: if the host returns fewer results than tasks, the missing tasks are
+ * marked as failed (output = SUBAGENT_MISSING sentinel) rather than silently
+ * producing empty-string "successes". An empty string is indistinguishable from
+ * a real empty result, so callers cannot detect the missing-task case.
  */
+export const SUBAGENT_MISSING = '__SUBAGENT_RESULT_MISSING__'
+
 function correlateResults(
   tasks: SubagentTask[],
   toolResults: ToolResultEntry[]
@@ -141,7 +155,8 @@ function correlateResults(
 
   return tasks.map((task, i) => {
     const match = subagentResults[i]
-    const output = extractToolResultText(match)
+    // If the host returned fewer results than tasks, mark this task failed.
+    const output = match === undefined ? SUBAGENT_MISSING : extractToolResultText(match)
     return {
       index: i,
       agent: task.agent,

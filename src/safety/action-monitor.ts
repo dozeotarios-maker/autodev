@@ -18,18 +18,26 @@ const DANGEROUS_BASH_PATTERNS = [
 //
 // IMPORTANT: all fetch() calls in this codebase MUST route through checkEgress()
 // before executing. checkEgress() is the sole egress gate (G22/G24).
-const EGRESS_ALLOWLIST = new Set([
-  'github.com',
-  'api.github.com',
-  'registry.npmjs.org',
-  'raw.githubusercontent.com',
-  'npmjs.com',
-  // Gemini LLM API
-  'generativelanguage.googleapis.com',
+//
+// Split allowlist:
+//   EGRESS_EXACT  — non-TLD tokens matched by equality only (localhost, IPs).
+//                   hostname.endsWith('.localhost') must NOT pass.
+//   EGRESS_SUFFIX — real domain roots matched by exact OR subdomain suffix.
+//                   e.g. 'github.com' matches 'github.com' and 'api.github.com'.
+const EGRESS_EXACT = new Set([
   // Local services (Letta :8283, Ollama :11434, codebase-memory :7777)
   'localhost',
   '127.0.0.1',
   '::1',
+])
+
+const EGRESS_SUFFIX = new Set([
+  'github.com',
+  'githubusercontent.com',
+  'npmjs.com',
+  'npmjs.org',
+  // Gemini LLM API
+  'generativelanguage.googleapis.com',
 ])
 
 export class ActionMonitor {
@@ -61,8 +69,11 @@ export class ActionMonitor {
     } catch {
       return { allowed: false, reason: `Invalid URL: ${url}` }
     }
-    for (const allowed of EGRESS_ALLOWLIST) {
-      if (hostname === allowed || hostname.endsWith('.' + allowed)) return { allowed: true }
+    // Exact match for non-TLD entries (localhost, IPs): subdomain suffix NOT allowed.
+    if (EGRESS_EXACT.has(hostname)) return { allowed: true }
+    // Suffix match for real domains: exact or '.<domain>' subdomain.
+    for (const domain of EGRESS_SUFFIX) {
+      if (hostname === domain || hostname.endsWith('.' + domain)) return { allowed: true }
     }
     return { allowed: false, reason: `Egress blocked: ${hostname} not in allowlist` }
   }

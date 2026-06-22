@@ -54,11 +54,20 @@ describe('S2-M4: R1Reviewer (clean-context, subagent-backed)', () => {
     expect(result.reason).toContain('SQL injection')
   })
 
-  it('returns clean=true on unparseable subagent output (conservative)', async () => {
+  it('returns clean=false on unparseable subagent output (fail-conservative)', async () => {
     const driver = makeDriver('not json')
     const reviewer = new R1Reviewer(driver)
     const result = await reviewer.review({ diff: '', spec: '', llmTrace: '' })
-    expect(result.clean).toBe(true)
+    expect(result.clean).toBe(false)
+    expect(result.reason).toBe('reviewer output unparseable')
+  })
+
+  it('returns clean=false with reason on garbage subagent output', async () => {
+    const driver = makeDriver('!@#$%^garbage that is definitely not json')
+    const reviewer = new R1Reviewer(driver)
+    const result = await reviewer.review({ diff: 'some diff', spec: '', llmTrace: '' })
+    expect(result.clean).toBe(false)
+    expect(result.reason).toBe('reviewer output unparseable')
   })
 
   it('reviewer context object has no spec or trace fields', () => {

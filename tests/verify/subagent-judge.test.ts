@@ -71,11 +71,20 @@ describe('S2-M4: SubagentJudge', () => {
     expect(result.reason).toBe('diverges from spec')
   })
 
-  it('isStillRight defaults to aligned=true on unparseable output (no spurious backedge)', async () => {
+  it('isStillRight returns aligned=false on unparseable output (fail-conservative)', async () => {
     const driver = makeDriver(['not json'])
     const judge = new SubagentJudge(driver)
     const result = await judge.isStillRight('spec', 'diff')
-    expect(result.aligned).toBe(true)
+    expect(result.aligned).toBe(false)
+    expect(result.reason).toBe('judge output unparseable')
+  })
+
+  it('isStillRight returns aligned=false with reason on garbage subagent output', async () => {
+    const driver = makeDriver(['!@#$%^&*garbage output that is not valid json or anything'])
+    const judge = new SubagentJudge(driver)
+    const result = await judge.isStillRight('spec', 'diff')
+    expect(result.aligned).toBe(false)
+    expect(result.reason).toBe('judge output unparseable')
   })
 
   it('isStillRight task contains spec + diff — not extra context', async () => {

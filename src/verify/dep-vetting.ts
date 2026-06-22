@@ -2,6 +2,7 @@
 // CLI boundary (osv-scanner / trivy) injected via ExecFn for testability and graceful degradation.
 
 import path from 'path'
+import { spawn } from 'child_process'
 
 export interface PiExecResult {
   stdout: string
@@ -54,7 +55,6 @@ function defaultExec(
   options?: { cwd?: string }
 ): Promise<PiExecResult> {
   return new Promise((resolve) => {
-    const { spawn } = require('child_process') as typeof import('child_process')
     let proc: ReturnType<typeof spawn>
     try {
       proc = spawn(command, args, { cwd: options?.cwd, shell: false })

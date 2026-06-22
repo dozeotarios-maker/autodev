@@ -249,11 +249,6 @@ export class Controller {
   private async _onInput(e: InputEvent, ctx: ExtensionContext): Promise<void> {
     const text = e.text ?? ''
 
-    if (this.lifecycle.getState() === 'RUNNING') {
-      await this.opts.transparency.log(`input ignored (already RUNNING): ${text.slice(0, 40)}`)
-      return
-    }
-
     // Detect idea vs question: ideas are statements, not questions or commands
     const isIdea = text.trim().length > 10 && !text.trim().endsWith('?') && !text.startsWith('/')
     if (!isIdea) {
@@ -261,22 +256,28 @@ export class Controller {
       return
     }
 
-    this.currentIdea = text.trim()
+    const idea = text.trim()
+    this.currentIdea = idea
 
-    // Start the run — lifecycle.run() acquires the file lock (async I/O).
-    // We kick off the lock acquisition and proceed synchronously to set RUNNING status
-    // immediately (so tests can observe the transition after a single tick), then await
-    // the lock result before starting phases.
+    // Fix 6 (TOCTOU): lifecycle.run() is the SINGLE atomic source of truth.
+    // It sets internal state to RUNNING synchronously before any async I/O, so
+    // a second concurrent input() calling run() concurrently will see RUNNING
+    // and get { ok: false } — no racy pre-check needed.
+    //
+    // We kick off run() and set the eager UI status concurrently so tests can
+    // observe the RUNNING transition after a single tick (lifecycle flips state
+    // synchronously inside run() before awaiting I/O).
     const runPromise = this.lifecycle.run(this.currentIdea)
 
-    // Eagerly set RUNNING status (lifecycle sets internal state synchronously before I/O)
+    // Eagerly set RUNNING status (lifecycle already flipped state synchronously)
     await this.opts.transparency.log(`ARMED→RUNNING: idea="${this.currentIdea.slice(0, 60)}"`)
     ctx.ui.setStatus('autodev', 'RUNNING')
     this.opts.transparency.setHudStatus('P1', this.currentIdea.slice(0, 60), 'running', 'opus')
 
     const runResult = await runPromise
     if (!runResult.ok) {
-      await this.opts.transparency.log(`run-lock denied: ${runResult.reason}`)
+      // Lock denied — another instance holds it; roll back UI state
+      await this.opts.transparency.log(`input ignored (already RUNNING): ${text.slice(0, 40)}`)
       ctx.ui.notify(`[pi-autodev] Cannot start: ${runResult.reason}`, 'warning')
       ctx.ui.setStatus('autodev', 'ARMED')
       return
@@ -352,6 +353,12 @@ export class Controller {
    * Main phase execution loop.
    * Runs P1→P6 sequentially; compacts at each phase boundary;
    * handles backedge (P4→P3) and mid-steer timeout.
+   *
+   * Fix 8 (defensive assumption): `ctx` (ExtensionContext) is the context object
+   * passed in from the `input` event handler. It is assumed to remain valid and
+   * reusable across all phases within a single run. The pi runtime guarantees this
+   * for the duration of a session; do not cache ctx across sessions or after
+   * lifecycle.release() returns.
    */
   private async _runPhases(ctx: ExtensionContext): Promise<void> {
     try {
@@ -529,13 +536,29 @@ export class Controller {
     await this.lifecycle.release()
   }
 
-  /** Poll until the pause file is removed. */
+  /**
+   * Poll until the pause file is removed.
+   *
+   * Fix 7: cap the wait at MAX_RESUME_WAIT_MS (default 1 hour) to prevent
+   * infinite polling if the pause file is never removed (e.g. operator forgets,
+   * or the file is accidentally left behind). After the cap, escalate to operator.
+   */
   private _waitResume(): Promise<void> {
-    return new Promise<void>((resolve) => {
+    const MAX_RESUME_WAIT_MS = 60 * 60 * 1000 // 1 hour
+    const POLL_INTERVAL_MS = 2000
+    const deadline = Date.now() + MAX_RESUME_WAIT_MS
+
+    return new Promise<void>((resolve, reject) => {
       const check = () => {
+        if (Date.now() >= deadline) {
+          reject(new Error(
+            `_waitResume: pause file not removed within ${MAX_RESUME_WAIT_MS / 1000}s — escalating to operator`
+          ))
+          return
+        }
         void this._isPaused().then((paused) => {
           if (!paused) resolve()
-          else setTimeout(check, 2000)
+          else setTimeout(check, POLL_INTERVAL_MS)
         })
       }
       check()

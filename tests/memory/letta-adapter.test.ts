@@ -78,6 +78,33 @@ describe('S2-M6: LettaAdapter — mock path (MemoryStore port)', () => {
   })
 })
 
+// ─── agentId validation (path-injection / SSRF guard) ────────────────────────
+
+describe('S2-M6: LettaAdapter — agentId validation', () => {
+  it('accepts a valid alphanumeric agentId', () => {
+    expect(() => new LettaAdapter({ mock: true, agentId: 'agent-test-001' })).not.toThrow()
+    expect(() => new LettaAdapter({ mock: true, agentId: 'autodev_default' })).not.toThrow()
+    expect(() => new LettaAdapter({ mock: true, agentId: 'ABC123' })).not.toThrow()
+  })
+
+  it('rejects agentId containing path traversal (../)', () => {
+    expect(() => new LettaAdapter({ mock: true, agentId: '../etc/passwd' })).toThrow(/Invalid agentId/)
+  })
+
+  it('rejects agentId containing a slash', () => {
+    expect(() => new LettaAdapter({ mock: true, agentId: 'foo/bar' })).toThrow(/Invalid agentId/)
+  })
+
+  it('rejects agentId containing a space', () => {
+    expect(() => new LettaAdapter({ mock: true, agentId: 'bad id' })).toThrow(/Invalid agentId/)
+  })
+
+  it('rejects agentId containing special chars (%20, @)', () => {
+    expect(() => new LettaAdapter({ mock: true, agentId: 'id%20evil' })).toThrow(/Invalid agentId/)
+    expect(() => new LettaAdapter({ mock: true, agentId: 'id@host' })).toThrow(/Invalid agentId/)
+  })
+})
+
 // ─── Contract tests — correct real Letta v1 HTTP endpoints ──────────────────
 //
 // These tests intercept `fetch` to verify the adapter hits EXACTLY the right
