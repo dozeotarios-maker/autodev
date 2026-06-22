@@ -3,3 +3,4 @@ dist/
 .autodev/
 *.log
 *.tsbuildinfo
+.omc/
