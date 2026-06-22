@@ -1,5 +1,7 @@
 // G2: block recursive-delete, out-of-bounds-write, egress (G22/G24)
 
+import * as path from 'path'
+
 export interface ActionCheckResult {
   allowed: boolean
   reason?: string
@@ -40,8 +42,13 @@ const EGRESS_SUFFIX = new Set([
   'generativelanguage.googleapis.com',
 ])
 
+const DEFAULT_PROTECTED_PATHS = ['/root/.openclaw']
+
 export class ActionMonitor {
-  constructor(private allowedPaths: string[] = []) {}
+  constructor(
+    private allowedPaths: string[] = [],
+    private protectedPaths: string[] = DEFAULT_PROTECTED_PATHS,
+  ) {}
 
   checkBashCommand(cmd: string): ActionCheckResult {
     for (const pattern of DANGEROUS_BASH_PATTERNS) {
@@ -49,10 +56,22 @@ export class ActionMonitor {
         return { allowed: false, reason: `Blocked dangerous command: ${cmd.slice(0, 80)}` }
       }
     }
+    for (const p of this.protectedPaths) {
+      if (cmd.includes(p)) {
+        return { allowed: false, reason: `Command touches protected path (main pipeline): ${cmd.slice(0, 80)}` }
+      }
+    }
     return { allowed: true }
   }
 
   checkFileWrite(filePath: string): ActionCheckResult {
+    const r = path.resolve(filePath)
+    for (const p of this.protectedPaths) {
+      const pr = path.resolve(p)
+      if (r === pr || r.startsWith(pr + path.sep)) {
+        return { allowed: false, reason: `Write to protected path (main pipeline) blocked: ${filePath}` }
+      }
+    }
     if (this.allowedPaths.length === 0) return { allowed: true }
     const normalized = filePath.replace(/\\/g, '/')
     const ok = this.allowedPaths.some(p => normalized.startsWith(p.replace(/\\/g, '/')))

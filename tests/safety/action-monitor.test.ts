@@ -85,4 +85,40 @@ describe('M1: G2 action-monitor', () => {
     const m = new ActionMonitor()
     expect(m.checkEgress('https://evil.github.com.attacker.com/').allowed).toBe(false)
   })
+
+  // Pipeline isolation guard — protectedPaths denylist
+  it('blocks write to /root/.openclaw/skills/pipeline/reel.py even with empty allowedPaths', () => {
+    const m = new ActionMonitor()
+    const result = m.checkFileWrite('/root/.openclaw/skills/pipeline/reel.py')
+    expect(result.allowed).toBe(false)
+    expect(result.reason).toMatch(/protected path/)
+  })
+
+  it('allows write to /root/pi-autodev/src/x.ts with empty allowedPaths', () => {
+    const m = new ActionMonitor()
+    expect(m.checkFileWrite('/root/pi-autodev/src/x.ts').allowed).toBe(true)
+  })
+
+  it('blocks traversal path /root/pi-autodev/../.openclaw/x', () => {
+    const m = new ActionMonitor()
+    const result = m.checkFileWrite('/root/pi-autodev/../.openclaw/x')
+    expect(result.allowed).toBe(false)
+    expect(result.reason).toMatch(/protected path/)
+  })
+
+  it('blocks bash command containing /root/.openclaw path', () => {
+    const m = new ActionMonitor()
+    expect(m.checkBashCommand('echo hi > /root/.openclaw/x').allowed).toBe(false)
+    expect(m.checkBashCommand('git -C /root/.openclaw status').allowed).toBe(false)
+  })
+
+  it('allows bash ls /root/pi-autodev', () => {
+    const m = new ActionMonitor()
+    expect(m.checkBashCommand('ls /root/pi-autodev').allowed).toBe(true)
+  })
+
+  it('does not block /root/.openclaw-sibling/x (prefix-but-not-contained)', () => {
+    const m = new ActionMonitor()
+    expect(m.checkFileWrite('/root/.openclaw-sibling/x').allowed).toBe(true)
+  })
 })
