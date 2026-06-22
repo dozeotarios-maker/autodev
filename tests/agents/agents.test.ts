@@ -52,7 +52,7 @@ describe('M8: Role agent files (11 agents)', () => {
     expect(roleFiles.length).toBe(11)
   })
 
-  it('all role agent files parse via gray-matter without error', async () => {
+  it('all role agent files parse via js-yaml frontmatter parser without error', async () => {
     const all = await loadMarkdownFiles(AGENTS_DIR)
     const roles = all.filter(({ file }) => !file.startsWith('persona-'))
     expect(roles.length).toBe(11)
@@ -97,7 +97,7 @@ describe('M8: Persona files (10 personas)', () => {
     expect(personaFiles.length).toBe(10)
   })
 
-  it('all persona files parse via gray-matter without error', async () => {
+  it('all persona files parse via js-yaml frontmatter parser without error', async () => {
     const all = await loadMarkdownFiles(AGENTS_DIR)
     const personas = all.filter(({ file }) => file.startsWith('persona-'))
     for (const { file, parsed } of personas) {
@@ -146,7 +146,7 @@ describe('M8: Phase skill files (6 phases)', () => {
     }
   })
 
-  it('each SKILL.md parses via gray-matter and has name + phase frontmatter', async () => {
+  it('each SKILL.md parses via js-yaml frontmatter parser and has name + phase frontmatter', async () => {
     const phaseDirs = await fs.readdir(SKILLS_DIR)
     const phaseSubdirs = (phaseDirs as string[]).filter(d => d.startsWith('phase'))
     for (const d of phaseSubdirs) {
