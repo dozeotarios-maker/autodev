@@ -42,7 +42,7 @@ import { P5Verify } from '../phases/p5-verify.js'
 import { P6Release } from '../phases/p6-release.js'
 import type { P1Output, P2Output, P3Output, P4Output, P5Output } from '../phases/phase-output.js'
 import { scoreComplexity, tierSizing, DEFAULT_SIZING } from '../engine/complexity.js'
-import type { Sizing, ComplexityInput } from '../engine/complexity.js'
+import type { Sizing, ComplexityInput, ComplexityTier } from '../engine/complexity.js'
 import type { RetroWriter } from '../engine/retro.js'
 
 // ── compactAsync ─────────────────────────────────────────────────────────────
@@ -104,6 +104,7 @@ export class Controller {
   private currentIdea = ''
   private startedAt = Date.now()
   private currentSizing: Sizing = DEFAULT_SIZING
+  private currentTier: ComplexityTier = 'M'
   private currentRunId = ''
 
   constructor(
@@ -377,8 +378,9 @@ export class Controller {
   private async _runPhases(ctx: ExtensionContext): Promise<void> {
     try {
       // ── Run-start: default tier M, set thinking level ─────────────────────
-      this.currentRunId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      this.currentRunId = `run-${crypto.randomUUID()}`
       this.currentSizing = tierSizing('M')
+      this.currentTier = 'M'
       const pi = this.pi as unknown as { setThinkingLevel?: (level: string) => void }
       pi.setThinkingLevel?.(this.currentSizing.thinkingLevel)
 
@@ -399,17 +401,13 @@ export class Controller {
       const rescoreInput = this._rescoreFromSpec(this.phaseStore.p1.spec)
       const rescoreResult = scoreComplexity(rescoreInput)
       const newSizing = tierSizing(rescoreResult.tier)
-      const prevTier = this.currentSizing.thinkingLevel === 'low' ? 'XS'
-        : this.currentSizing.thinkingLevel === 'medium' ? 'S'
-        : this.currentSizing.thinkingLevel === 'high' && this.currentSizing.panelPersonas === 4 ? 'M'
-        : this.currentSizing.thinkingLevel === 'high' ? 'L'
-        : 'XL'
-      if (rescoreResult.tier !== prevTier) {
+      if (rescoreResult.tier !== this.currentTier) {
         await this.journal.write({
           type: 'decision',
           phase: 'P1',
-          action: `tier: ${prevTier} -> ${rescoreResult.tier} (post-P1 rescore)`,
+          action: `tier: ${this.currentTier} -> ${rescoreResult.tier} (post-P1 rescore)`,
         })
+        this.currentTier = rescoreResult.tier
         this.currentSizing = newSizing
         pi.setThinkingLevel?.(this.currentSizing.thinkingLevel)
       }
@@ -554,12 +552,11 @@ export class Controller {
       await this.journal.write({ type: 'completion', phase: 'P6', action: `P6 release: ${p6Result.output.commitSha}` })
 
       // Retro: success (BEFORE lifecycle.release)
-      const tierLabel = rescoreResult.tier
       await this.opts.retroWriter?.write({
         runId: this.currentRunId,
         lesson: `${this.currentIdea.slice(0, 120)} → ${p6Result.output.commitSha}`,
         bugPattern: 'none',
-        convention: tierLabel,
+        convention: this.currentTier,
       })
 
       // All done
@@ -594,6 +591,15 @@ export class Controller {
     await this.journal.write({ type: 'decision', phase, action: `OPERATOR BRIEF: ${brief.slice(0, 200)}` })
     await this.opts.transparency.log(`OPERATOR BRIEF [${phase}]: ${brief.slice(0, 200)}`)
     this.opts.transparency.setHudStatus(phase, 'OPERATOR NEEDED', 'paused', 'none')
+    // Retro: operator-brief path (BEFORE lifecycle.release), mirroring _escalate
+    if (this.currentRunId) {
+      await this.opts.retroWriter?.write({
+        runId: this.currentRunId,
+        lesson: brief.slice(0, 200),
+        bugPattern: phase,
+        convention: 'operator-brief',
+      })
+    }
     await this.lifecycle.release()
   }
 
@@ -602,24 +608,36 @@ export class Controller {
    * Word-count proxies file-estimate; keyword scan drives novelty/blast/irreversibility.
    */
   private _rescoreFromSpec(spec: string): ComplexityInput {
-    const words = spec.split(/\s+/).filter(Boolean).length
+    const words = spec.split(/\s+/).filter(Boolean)
+
+    // Fix 4: guard against empty/degenerate spec — silently scoring XS on empty input
+    // would incorrectly downgrade the tier. Return M-equivalent defaults instead.
+    if (words.length === 0) {
+      void this.journal.write({
+        type: 'decision',
+        phase: 'P1',
+        action: '_rescoreFromSpec: empty spec — using M-equivalent defaults to prevent silent XS downgrade',
+      })
+      return { files: 5, novelty: 'med', blastRadius: 3, irreversibility: 'med' }
+    }
 
     // Word-count → rough file count proxy (1 file per ~30 words, capped at 20)
-    const files = Math.min(Math.max(1, Math.floor(words / 30)), 20)
+    const files = Math.min(Math.max(1, Math.floor(words.length / 30)), 20)
 
+    // Fix 5: dots escaped to prevent wildcard matching (event\.sourcing won't match eventXsourcing)
     // Novelty keywords
-    const noveltyHigh = /\b(distributed|microservice|event.sourcing|CQRS|novel|new architecture|redesign|rethink|blockchain|AI|ML|machine.learning)\b/i
-    const noveltyMed = /\b(integration|migration|refactor|redesign|new.feature|extend|plugin)\b/i
+    const noveltyHigh = /\b(distributed|microservice|event\.sourcing|CQRS|novel|new architecture|redesign|rethink|blockchain|AI|ML|machine\.learning)\b/i
+    const noveltyMed = /\b(integration|migration|refactor|redesign|new\.feature|extend|plugin)\b/i
     const novelty = noveltyHigh.test(spec) ? 'high' : noveltyMed.test(spec) ? 'med' : 'low'
 
     // Blast-radius keywords (1–5)
-    const blastHigh = /\b(cross.service|platform.wide|global|all.users|blast.radius.critical|schema.migration|database.migration|breaking.change)\b/i
-    const blastMed = /\b(multiple.services|shared.library|core.module|api.change|breaking)\b/i
+    const blastHigh = /\b(cross\.service|platform\.wide|global|all\.users|blast\.radius\.critical|schema\.migration|database\.migration|breaking\.change)\b/i
+    const blastMed = /\b(multiple\.services|shared\.library|core\.module|api\.change|breaking)\b/i
     const blastRadius = blastHigh.test(spec) ? 5 : blastMed.test(spec) ? 3 : 1
 
     // Irreversibility keywords
-    const irrevHigh = /\b(irreversible|permanent|delete.data|drop.table|non-rollback|cannot.undo|destructive)\b/i
-    const irrevMed = /\b(migration|schema.change|rename|move.data|alter.table)\b/i
+    const irrevHigh = /\b(irreversible|permanent|delete\.data|drop\.table|non-rollback|cannot\.undo|destructive)\b/i
+    const irrevMed = /\b(migration|schema\.change|rename|move\.data|alter\.table)\b/i
     const irreversibility = irrevHigh.test(spec) ? 'high' : irrevMed.test(spec) ? 'med' : 'low'
 
     return { files, novelty, blastRadius, irreversibility }

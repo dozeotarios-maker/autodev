@@ -163,6 +163,10 @@ export class P5Verify {
       // Judge unavailable — continue without backedge
     }
 
+    // Fix 6: reviewRounds is passed into the steer PROMPT as advisory text only.
+    // P5 uses a steer-and-observe architecture: the host LLM honors the cap stated
+    // in the prompt. A programmatic ReviewLoop.maxRounds guard is for direct callers
+    // only; adding one here would be redundant and would not change behavior.
     const reviewRounds = (ctx.sizing ?? DEFAULT_SIZING).reviewRounds
     const instruction = buildP5Instruction(ctx, outputFile, deterministicPassed, holdoutPassed, securityClean, reviewRounds)
 

@@ -37,7 +37,7 @@ export function buildP2Instruction(ctx: P2Context, outputFile: string): string {
         'Panel skipped (XS tier — panelPersonas=0). Set personaDebate to [].',
       ]
     : [
-        `## Persona panel (run as parallel subagents, ${panelPersonas} personas)`,
+        `## Persona panel (run as parallel subagents, ${Math.min(panelPersonas, ALL_PERSONAS.length)} personas)`,
         'Call the `subagent` tool with:',
         '```json',
         JSON.stringify({
