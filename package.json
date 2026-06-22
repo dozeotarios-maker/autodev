@@ -1,0 +1,25 @@
+{
+  "name": "pi-autodev",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Autonomous pi extension: idea → plan → build → verify → ship",
+  "main": "dist/extension/index.js",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.79.9"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.79.9",
+    "@types/node": "^22.0.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  },
+  "dependencies": {
+    "gray-matter": "^4.0.3"
+  }
+}
