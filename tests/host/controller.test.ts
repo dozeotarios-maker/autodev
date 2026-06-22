@@ -752,6 +752,76 @@ describe('Fix 6: two rapid idea inputs cannot both start a run (TOCTOU)', () => 
   }, 10_000)
 })
 
+// ── Fix (round-2): currentIdea uses WINNER's idea after concurrent inputs ─────
+
+describe('Fix: concurrent inputs — winner idea is stored, loser idea is discarded', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-race-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('two concurrent inputs with different ideas → run uses the WINNER idea', async () => {
+    const { pi, fire } = makeMockPi()
+    const transparency = makeNullTransparency()
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency,
+    })
+    ctrl.wire()
+    ctrl.registerCommands()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    const WINNER_IDEA = 'Build a todo app with user auth for the winner'
+    const LOSER_IDEA  = 'Build a blog platform with CMS for the loser'
+
+    // Fire both simultaneously — the first one wins the in-process lock
+    // (lifecycle sets state=RUNNING synchronously before any I/O).
+    const p1 = fire('input', makeInputEvent(WINNER_IDEA), ctx)
+    const p2 = fire('input', makeInputEvent(LOSER_IDEA), ctx)
+
+    // Let both settle past the lifecycle.run() async lock path
+    await new Promise(r => setTimeout(r, 150))
+    await Promise.all([p1, p2])
+
+    // Exactly one "already RUNNING" denial must have been logged
+    const deniedCalls = (transparency.log as ReturnType<typeof vi.fn>).mock.calls
+      .filter((args: unknown[]) => String(args[0]).includes('already RUNNING'))
+    expect(deniedCalls).toHaveLength(1)
+
+    // /autodev-status reads this.currentIdea — it must equal the WINNER's idea,
+    // not the loser's (before the fix, the loser's idea overwrote the winner's
+    // because this.currentIdea was set before the lock was checked).
+    const registerCalls = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls
+    const statusCall = registerCalls.find((args: unknown[]) => args[0] === '/autodev-status')
+    expect(statusCall).toBeDefined()
+    const handler = statusCall![1].handler as (args: string, ctx: unknown) => Promise<void>
+    const notifyMock = vi.fn()
+    await handler('', { ui: { notify: notifyMock } })
+    const parsed = JSON.parse(notifyMock.mock.calls[0][0] as string) as Record<string, string>
+    expect(parsed.task).toContain(WINNER_IDEA.slice(0, 40))
+    expect(parsed.task).not.toContain(LOSER_IDEA.slice(0, 40))
+
+    // Clean up: resolve the pending P1 steer
+    const outputDir = path.join(tmpDir, '.autodev', 'phase-output')
+    await fs.mkdir(outputDir, { recursive: true })
+    await fs.writeFile(path.join(outputDir, 'p1-spec.json'), JSON.stringify({
+      phase: 'P1', spec: `${WINNER_IDEA} — full spec`, stackAdr: 'Node.js', webResearch: [],
+    }))
+    fire('agent_end', makeAgentEndEvent(), ctx)
+    await new Promise(r => setTimeout(r, 50))
+  }, 10_000)
+})
+
 // ── Fix 7: _waitResume max-wait cap ──────────────────────────────────────────
 
 describe('Fix 7: _waitResume escalates after max-wait instead of polling forever', () => {

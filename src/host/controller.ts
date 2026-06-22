@@ -256,8 +256,11 @@ export class Controller {
       return
     }
 
+    // Capture idea in a local — do NOT write this.currentIdea yet.
+    // Fix: two concurrent _onInput calls must not overwrite each other's idea
+    // before the lock is won. this.currentIdea is only written by the winner,
+    // after lifecycle.run() returns {ok:true}.
     const idea = text.trim()
-    this.currentIdea = idea
 
     // Fix 6 (TOCTOU): lifecycle.run() is the SINGLE atomic source of truth.
     // It sets internal state to RUNNING synchronously before any async I/O, so
@@ -267,12 +270,13 @@ export class Controller {
     // We kick off run() and set the eager UI status concurrently so tests can
     // observe the RUNNING transition after a single tick (lifecycle flips state
     // synchronously inside run() before awaiting I/O).
-    const runPromise = this.lifecycle.run(this.currentIdea)
+    const runPromise = this.lifecycle.run(idea)
 
-    // Eagerly set RUNNING status (lifecycle already flipped state synchronously)
-    await this.opts.transparency.log(`ARMED→RUNNING: idea="${this.currentIdea.slice(0, 60)}"`)
+    // Eagerly set RUNNING status (lifecycle already flipped state synchronously).
+    // Use the local `idea` — this.currentIdea is not set until lock is confirmed.
+    await this.opts.transparency.log(`ARMED→RUNNING: idea="${idea.slice(0, 60)}"`)
     ctx.ui.setStatus('autodev', 'RUNNING')
-    this.opts.transparency.setHudStatus('P1', this.currentIdea.slice(0, 60), 'running', 'opus')
+    this.opts.transparency.setHudStatus('P1', idea.slice(0, 60), 'running', 'opus')
 
     const runResult = await runPromise
     if (!runResult.ok) {
@@ -282,6 +286,9 @@ export class Controller {
       ctx.ui.setStatus('autodev', 'ARMED')
       return
     }
+
+    // Lock won — now safe to update the shared field.
+    this.currentIdea = idea
 
     // Start P1 asynchronously within the extension event loop
     void this._runPhases(ctx)

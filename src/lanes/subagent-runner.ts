@@ -13,6 +13,7 @@
 import type { Lane } from '../ports.js'
 import type { LaneAssignment } from './partitioner.js'
 import type { SubagentDriver } from '../host/subagent-driver.js'
+import { SUBAGENT_MISSING } from '../host/subagent-driver.js'
 import type { SubagentTask, SubagentResult } from '../host/types.js'
 
 // ── Original SubagentRunner (Lane-port-based, backward compat) ────────────────
@@ -133,11 +134,14 @@ function buildLaneTask(lane: LaneAssignment): string {
 }
 
 /**
- * Heuristic: treat output as failed if it contains an error marker.
- * Real subagent errors surface via isError on the tool result, but we
- * also catch common text patterns as a belt-and-suspenders guard.
+ * Heuristic: treat output as failed if it contains an error marker or is the
+ * SUBAGENT_MISSING sentinel (set by SubagentDriver when the host returns fewer
+ * results than tasks — a missing result must not silently look like success).
+ * Real subagent errors surface via isError on the tool result, but we also
+ * catch common text patterns as a belt-and-suspenders guard.
  */
 function isFailedOutput(output: string): boolean {
+  if (output === SUBAGENT_MISSING) return true
   const lower = output.toLowerCase()
   return lower.includes('error:') || lower.includes('fatal:') || lower.startsWith('failed')
 }

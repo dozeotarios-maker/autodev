@@ -12,6 +12,7 @@ import type { Verifier, Judge } from '../ports.js'
 import type { P5Context, P5Output, ReviewFinding } from './phase-output.js'
 import { validateP5Output } from './phase-output.js'
 import type { PhaseResult } from './phase-executor.js'
+import { wrapUntrusted } from './safe-prompt.js'
 
 const ROLE_DIRECTIVES = `
 ## Role: Verifier Agent (P5)
@@ -29,14 +30,14 @@ function buildP5Instruction(
   holdoutPassed: boolean,
   securityClean: boolean,
 ): string {
-  const artifacts = ctx.p4.artifacts.join(', ') || '(none listed)'
+  const artifactsRaw = ctx.p4.artifacts.join(', ') || '(none listed)'
 
   return [
     ROLE_DIRECTIVES,
     '',
     `## Input`,
-    `Sprint goal: ${ctx.p3.sprintContract.goal}`,
-    `Artifacts from P4: ${artifacts}`,
+    `Sprint goal:\n${wrapUntrusted(ctx.p3.sprintContract.goal)}`,
+    `Artifacts from P4:\n${wrapUntrusted(artifactsRaw)}`,
     `Deterministic verify: ${deterministicPassed ? 'PASSED' : 'FAILED'}`,
     `Holdout verify: ${holdoutPassed ? 'PASSED' : 'FAILED'}`,
     `Security scan: ${securityClean ? 'CLEAN' : 'FINDINGS'}`,
@@ -48,7 +49,7 @@ function buildP5Instruction(
       tasks: [{
         index: 0,
         agent: 'reviewer',
-        task: `Review ONLY the following diff. Do NOT reference the spec or builder history.\nArtifacts: ${artifacts}\n\nList any CRITICAL, HIGH, MEDIUM, or LOW findings. Format each as:\n{"severity":"CRITICAL|HIGH|MEDIUM|LOW","file":"<path>","line":<n>,"description":"<text>"}`,
+        task: `Review ONLY the following diff. Do NOT reference the spec or builder history.\nArtifacts:\n${wrapUntrusted(artifactsRaw)}\nFileDAG:\n${wrapUntrusted(ctx.p3.fileDAG.map((e) => e.file).join(', '))}\n\nList any CRITICAL, HIGH, MEDIUM, or LOW findings. Format each as:\n{"severity":"CRITICAL|HIGH|MEDIUM|LOW","file":"<path>","line":<n>,"description":"<text>"}`,
       }],
       concurrency: 1,
       worktree: false,
@@ -121,19 +122,31 @@ export class P5Verify {
 
     // Security scan via Verifier port
     let securityClean = false
+    let securitySkipped = false
     try {
       const secResult = await this.verifier.runSecurityScan(this.repoRoot)
       securityClean = secResult.clean
-    } catch {
-      securityClean = true // degrade gracefully if scanner unavailable
+    } catch (err) {
+      // Distinguish missing binary (ENOENT / scanner unavailable) from real errors.
+      // Missing binary → skip gracefully (securityClean=true, securitySkipped=true).
+      // Any other error → fail-closed (securityClean stays false).
+      const isUnavailable =
+        (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') ||
+        (err instanceof Error && err.message.includes('BackendUnavailableError'))
+      if (isUnavailable) {
+        securityClean = true
+        securitySkipped = true
+      }
+      // else: real error — securityClean remains false (fail-closed)
     }
+    void securitySkipped
 
     // H9: still-right judge — check if diff diverges from original spec
     let backedge = false
     try {
       const stillRight = await this.judge.isStillRight(
-        ctx.p3.sprintContract.goal,
-        ctx.p4.artifacts.join('\n')
+        wrapUntrusted(ctx.p3.sprintContract.goal),
+        wrapUntrusted(ctx.p4.artifacts.join('\n'))
       )
       if (!stillRight.aligned) {
         backedge = true

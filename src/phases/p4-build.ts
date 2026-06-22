@@ -11,6 +11,7 @@ import type { SubagentDriver } from '../host/subagent-driver.js'
 import type { P4Context, P4Output } from './phase-output.js'
 import { validateP4Output } from './phase-output.js'
 import type { PhaseResult } from './phase-executor.js'
+import { wrapUntrusted } from './safe-prompt.js'
 
 const ROLE_DIRECTIVES = `
 ## Role: Build Agent (P4)
@@ -31,14 +32,14 @@ function buildP4Instruction(ctx: P4Context, outputFile: string): string {
 
   const laneTasks = Array.from(laneMap.entries()).map(([laneId, files]) => ({
     agent: `builder-lane-${laneId}`,
-    task: `Implement the following files for lane ${laneId}:\n${files.map((f) => `- ${f}`).join('\n')}\n\nSprint goal: ${ctx.p3.sprintContract.goal}\nSuccess criteria:\n${ctx.p3.sprintContract.successCriteria.map((c) => `- ${c}`).join('\n')}`,
+    task: `Implement the following files for lane ${laneId}:\n${files.map((f) => `- ${f}`).join('\n')}\n\n${wrapUntrusted(`Sprint goal: ${ctx.p3.sprintContract.goal}\nSuccess criteria:\n${ctx.p3.sprintContract.successCriteria.map((c) => `- ${c}`).join('\n')}`)}`,
   }))
 
   return [
     ROLE_DIRECTIVES,
     '',
     `## Input`,
-    `Sprint goal: ${ctx.p3.sprintContract.goal}`,
+    `Sprint goal:\n${wrapUntrusted(ctx.p3.sprintContract.goal)}`,
     `File-DAG: ${ctx.p3.fileDAG.length} files across ${laneMap.size} lanes`,
     '',
     `## Build lanes (run as parallel worktree subagents)`,

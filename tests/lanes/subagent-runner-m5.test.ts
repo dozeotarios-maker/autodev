@@ -274,6 +274,49 @@ describe('S2-M5: Integrator.fromSubagentResults() + reconcile()', () => {
   })
 })
 
+// ── Fix (round-2): SUBAGENT_MISSING sentinel → lane marked failed:true ────────
+
+describe('Fix: SUBAGENT_MISSING sentinel → lane is marked failed', () => {
+  it('a lane whose subagent result is missing (SUBAGENT_MISSING output) is marked failed:true', async () => {
+    // Simulate SubagentDriver returning SUBAGENT_MISSING for a task where the
+    // host returned fewer results than tasks.
+    const { SUBAGENT_MISSING } = await import('../../src/host/subagent-driver.js')
+
+    const lanes: LaneAssignment[] = [
+      { id: 'lane-1', files: ['src/auth.ts'] },
+      { id: 'lane-2', files: ['src/db.ts'] },
+    ]
+
+    // Driver returns only one result — lane-2 is missing → driver sets SUBAGENT_MISSING
+    const driver = makeDriver([
+      makeSubagentResult(0, 'auth done'),
+      makeSubagentResult(1, SUBAGENT_MISSING),  // sentinel for missing result
+    ])
+    const runner = new LaneSubagentRunner(driver)
+
+    const results = await runner.run(lanes)
+
+    expect(results).toHaveLength(2)
+    expect(results[0].failed).toBe(false)  // auth lane succeeded
+    expect(results[1].failed).toBe(true)   // missing result → must be failed
+  })
+
+  it('SUBAGENT_MISSING does not match normal-success heuristics (empty-string guard)', async () => {
+    // Verify that SUBAGENT_MISSING is not treated as success by the lower
+    // heuristics (it doesn't contain 'error:' / 'fatal:' / start with 'failed',
+    // so only the explicit sentinel check catches it).
+    const { SUBAGENT_MISSING } = await import('../../src/host/subagent-driver.js')
+
+    const lanes: LaneAssignment[] = [{ id: 'lane-1', files: ['src/x.ts'] }]
+    const driver = makeDriver([makeSubagentResult(0, SUBAGENT_MISSING)])
+    const runner = new LaneSubagentRunner(driver)
+
+    const results = await runner.run(lanes)
+    expect(results[0].failed).toBe(true)
+    expect(results[0].output).toBe(SUBAGENT_MISSING)
+  })
+})
+
 // ── Tests: backward compat — existing reconcile() signature unchanged ─────────
 
 describe('S2-M5: Integrator.reconcile() backward compatibility', () => {
