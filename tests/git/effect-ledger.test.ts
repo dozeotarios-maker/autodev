@@ -83,4 +83,25 @@ describe('M5: EffectLedger — G20 no-double-fire idempotency', () => {
     expect(await ledger.isRecorded('known')).toBe(true)
     expect(await ledger.isRecorded('unknown')).toBe(false)
   })
+
+  it('G20: two concurrent once() with same effectId run the effect EXACTLY once', async () => {
+    const ledger = new EffectLedger(tmpDir)
+    let callCount = 0
+    const effect = async () => {
+      callCount++
+      // Yield to allow the second concurrent call to interleave
+      await new Promise(r => setTimeout(r, 10))
+      return 'concurrent-result'
+    }
+
+    // Fire both concurrently — neither should await the other before starting
+    const [r1, r2] = await Promise.all([
+      ledger.once('concurrent-effect', effect),
+      ledger.once('concurrent-effect', effect),
+    ])
+
+    expect(callCount).toBe(1)
+    expect(r1).toBe('concurrent-result')
+    expect(r2).toBe('concurrent-result')
+  })
 })

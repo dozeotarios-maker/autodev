@@ -8,7 +8,7 @@ describe('M6a: R1Reviewer (clean-context)', () => {
     vi.clearAllMocks()
   })
 
-  it('calls judge with diff only — no spec or trace present', async () => {
+  it('calls judge with review instruction + diff — no spec or trace present', async () => {
     const judge: Judge = {
       isDone: vi.fn().mockResolvedValue(true),
       isStillRight: vi.fn().mockResolvedValue({ aligned: true }),
@@ -20,14 +20,35 @@ describe('M6a: R1Reviewer (clean-context)', () => {
       llmTrace: 'TRACE: step 1 -> step 2 -> step 3',
     })
 
-    // isStillRight receives (spec, diff) but spec here must be the diff, not the original spec
-    // The reviewer passes diff as both args — it only knows the diff
     expect(judge.isStillRight).toHaveBeenCalledOnce()
     const [firstArg, secondArg] = (judge.isStillRight as ReturnType<typeof vi.fn>).mock.calls[0]
+    // First arg is the review instruction, not the diff and not the secret spec
+    expect(firstArg).toContain('Review this diff')
     expect(firstArg).not.toContain('SECRET SPEC')
     expect(firstArg).not.toContain('TRACE:')
+    // Second arg is the actual diff
+    expect(secondArg).toContain('-old')
+    expect(secondArg).toContain('+new')
     expect(secondArg).not.toContain('SECRET SPEC')
     expect(secondArg).not.toContain('TRACE:')
+  })
+
+  it('flags a planted bad diff — judge returns not aligned', async () => {
+    const judge: Judge = {
+      isDone: vi.fn(),
+      isStillRight: vi.fn().mockResolvedValue({ aligned: false, reason: 'SQL injection vulnerability planted' }),
+    }
+    const reviewer = new R1Reviewer(judge)
+    const result = await reviewer.review({
+      diff: "+const query = `SELECT * FROM users WHERE id = ${userId}`",
+      spec: 'irrelevant',
+      llmTrace: 'irrelevant',
+    })
+    // Judge received the diff (not itself) and correctly flagged it
+    const [, secondArg] = (judge.isStillRight as ReturnType<typeof vi.fn>).mock.calls[0]
+    expect(secondArg).toContain('SELECT * FROM users')
+    expect(result.clean).toBe(false)
+    expect(result.reason).toContain('SQL injection')
   })
 
   it('returns aligned=true when judge says aligned', async () => {

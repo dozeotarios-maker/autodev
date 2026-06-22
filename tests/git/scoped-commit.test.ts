@@ -70,4 +70,27 @@ describe('M5: ScopedCommit — stages only allowlisted paths', () => {
     const sc = new ScopedCommit(tmpDir)
     await sc.commit('msg', ['src/x.ts'])
   })
+
+  it('rejects path traversal (../../etc/passwd)', async () => {
+    const sc = new ScopedCommit(tmpDir)
+    await expect(sc.commit('msg', ['../../etc/passwd'])).rejects.toThrow(/escapes working directory/)
+  })
+
+  it('rejects absolute path outside cwd (/etc/passwd)', async () => {
+    const sc = new ScopedCommit(tmpDir)
+    await expect(sc.commit('msg', ['/etc/passwd'])).rejects.toThrow(/escapes working directory/)
+  })
+
+  it('accepts a valid relative path inside cwd', async () => {
+    mockExecFile
+      .mockImplementationOnce((_cmd: string, _args: string[], _opts: unknown, cb: Function) => cb(null, '', ''))
+      .mockImplementationOnce((_cmd: string, _args: string[], _opts: unknown, cb: Function) => cb(null, '', ''))
+      .mockImplementationOnce((_cmd: string, _args: string[], _opts: unknown, cb: Function) =>
+        cb(null, 'cafebabe\n', '')
+      )
+
+    const sc = new ScopedCommit(tmpDir)
+    const result = await sc.commit('msg', ['src/valid.ts'])
+    expect(result.sha).toBe('cafebabe')
+  })
 })

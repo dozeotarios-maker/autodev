@@ -16,8 +16,12 @@ export class R1Reviewer {
   constructor(private readonly judge: Judge) {}
 
   async review(input: ReviewInput): Promise<ReviewResult> {
-    // Clean-context: pass ONLY the diff — spec and llmTrace never reach the judge
-    const result = await this.judge.isStillRight(input.diff, input.diff)
+    // Clean-context: pass ONLY the diff — spec and llmTrace never reach the judge.
+    // First arg is the review instruction; second arg is the diff to evaluate.
+    const result = await this.judge.isStillRight(
+      'Review this diff for correctness, security, and quality',
+      input.diff
+    )
     return {
       clean: result.aligned,
       reason: result.reason,

@@ -14,6 +14,13 @@ export interface CallerRef {
   symbol?: string
 }
 
+export class BackendUnavailableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'BackendUnavailableError'
+  }
+}
+
 // Seeded mock call graph — represents realistic cross-file caller relationships.
 const MOCK_CALL_GRAPH: Record<string, CallerRef[]> = {
   processPayment: [
@@ -45,22 +52,27 @@ export class CodebaseMemoryAdapter {
     }
     // Production: call the MCP tool via pi-mcp-adapter.
     // Tool: find_callers(symbol) → CallerRef[]
+    // Throws BackendUnavailableError on HTTP error or network failure so callers
+    // can distinguish "backend down" from a legitimate empty-caller result.
+    const url = `${this.baseUrl}/mcp/tools/find_callers`
+    let response: Response
     try {
-      const url = `${this.baseUrl}/mcp/tools/find_callers`
-      const response = await fetch(url, {
+      response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol }),
         signal: AbortSignal.timeout(5000),
       })
-      if (!response.ok) {
-        return []
-      }
-      const data = (await response.json()) as { callers?: CallerRef[] }
-      return data.callers ?? []
-    } catch {
-      return []
+    } catch (err) {
+      throw new BackendUnavailableError(`codebase-memory MCP unreachable: ${String(err)}`)
     }
+    if (!response.ok) {
+      throw new BackendUnavailableError(
+        `codebase-memory MCP returned HTTP ${response.status} for symbol "${symbol}"`
+      )
+    }
+    const data = (await response.json()) as { callers?: CallerRef[] }
+    return data.callers ?? []
   }
 
   async healthCheck(): Promise<{ ok: boolean; details?: string }> {

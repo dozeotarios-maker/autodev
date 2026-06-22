@@ -74,8 +74,45 @@ describe('M6b: ReviewLoop', () => {
       isStillRight: vi.fn().mockResolvedValue({ aligned: false }),
     }
     const mockReviewer = vi.fn().mockResolvedValue([makeFinding('CRIT')])
-    const loop = new ReviewLoop(judge, mockReviewer)
+    // fixer always returns the same diff so reviewer keeps returning CRIT — hits cap
+    const fixerFn = vi.fn().mockResolvedValue('diff')
+    const loop = new ReviewLoop(judge, mockReviewer, fixerFn)
     await loop.run('diff')
     expect(mockReviewer).toHaveBeenCalledTimes(5)
+  })
+
+  it('without fixerFn: runs up to cap when CRIT/HIGH persist', async () => {
+    const judge: Judge = {
+      isDone: vi.fn().mockResolvedValue(false),
+      isStillRight: vi.fn().mockResolvedValue({ aligned: false }),
+    }
+    const mockReviewer = vi.fn().mockResolvedValue([makeFinding('CRIT', 'security issue')])
+    const loop = new ReviewLoop(judge, mockReviewer) // no fixerFn
+    const result = await loop.run('diff')
+    // Without a fixer the diff never changes; a deterministic reviewer hits the cap
+    expect(result.rounds).toBe(5)
+    expect(result.success).toBe(false)
+    expect(mockReviewer).toHaveBeenCalledTimes(5)
+  })
+
+  it('with fixerFn: converges to zero CRIT/HIGH findings', async () => {
+    const judge: Judge = {
+      isDone: vi.fn().mockResolvedValue(true),
+      isStillRight: vi.fn().mockResolvedValue({ aligned: true }),
+    }
+    // Round 1 returns CRIT; fixer clears it; round 2 returns empty → success
+    const mockReviewer = vi.fn()
+      .mockResolvedValueOnce([makeFinding('CRIT', 'injection')])
+      .mockResolvedValueOnce([])
+    const fixerFn = vi.fn().mockResolvedValue('fixed diff')
+    const loop = new ReviewLoop(judge, mockReviewer, fixerFn)
+    const result = await loop.run('original diff')
+    expect(result.success).toBe(true)
+    expect(result.rounds).toBe(2)
+    expect(result.remainingCritHigh).toHaveLength(0)
+    // fixer was called with the CRIT finding and the original diff
+    expect(fixerFn).toHaveBeenCalledWith([makeFinding('CRIT', 'injection')], 'original diff')
+    // second reviewer call gets the fixed diff
+    expect(mockReviewer).toHaveBeenNthCalledWith(2, 'fixed diff')
   })
 })

@@ -5,6 +5,7 @@ import * as fs from 'fs/promises'
 import { Journal, JournalEntry } from '../../src/engine/journal.js'
 import { Checkpoint, CheckpointData } from '../../src/engine/checkpoint.js'
 import { ResurrectionEngine } from '../../src/engine/resurrection.js'
+import { EffectLedger } from '../../src/git/effect-ledger.js'
 import { RetroWriter } from '../../src/engine/retro.js'
 
 describe('M9: journal WAL', () => {
@@ -130,6 +131,33 @@ describe('M9: resurrection engine', () => {
 
     expect(result.resumed).toBe(true)
     expect(result.report).toBeTruthy()
+
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('isIdempotentSafe returns false for a recorded effect (EffectLedger format)', async () => {
+    // G20: a recorded effect must NOT be approved for re-fire.
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-idempotent-'))
+    const ledger = new EffectLedger(tmpDir)
+    // Record an effect via the ledger's once() method
+    await ledger.once('deploy-migration-v3', async () => 'done')
+
+    const engine = new ResurrectionEngine()
+    const safe = await engine.isIdempotentSafe('deploy-migration-v3', tmpDir)
+
+    // A recorded effect is NOT idempotent-safe (would double-fire)
+    expect(safe).toBe(false)
+
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('isIdempotentSafe returns true for an unrecorded effect', async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-idempotent-'))
+
+    const engine = new ResurrectionEngine()
+    const safe = await engine.isIdempotentSafe('never-run-effect', tmpDir)
+
+    expect(safe).toBe(true)
 
     await fs.rm(tmpDir, { recursive: true, force: true })
   })

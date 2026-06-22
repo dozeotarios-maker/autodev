@@ -44,4 +44,24 @@ describe('M1: G2 action-monitor', () => {
     expect(m.checkEgress('https://api.github.com/repos').allowed).toBe(true)
     expect(m.checkEgress('https://registry.npmjs.org/vitest').allowed).toBe(true)
   })
+
+  it('allows egress to Gemini API (legitimate LLM host)', () => {
+    const m = new ActionMonitor()
+    expect(m.checkEgress('https://generativelanguage.googleapis.com/v1/models').allowed).toBe(true)
+  })
+
+  it('allows egress to localhost services (Letta, Ollama, codebase-memory)', () => {
+    const m = new ActionMonitor()
+    expect(m.checkEgress('http://localhost:8283/v1/agents').allowed).toBe(true)
+    expect(m.checkEgress('http://localhost:11434/api/generate').allowed).toBe(true)
+    expect(m.checkEgress('http://localhost:7777/search').allowed).toBe(true)
+    expect(m.checkEgress('http://127.0.0.1:8283/health').allowed).toBe(true)
+  })
+
+  it('blocks egress to disallowed exfil host', () => {
+    const m = new ActionMonitor()
+    const result = m.checkEgress('https://exfil.attacker.com/steal?data=secrets')
+    expect(result.allowed).toBe(false)
+    expect(result.reason).toMatch(/not in allowlist/)
+  })
 })

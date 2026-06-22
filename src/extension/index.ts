@@ -100,7 +100,8 @@ function buildEmbedder(opts: AutodevExtensionOptions): Embedder {
     async embed(texts: string[]): Promise<number[][]> {
       try {
         return await gemini.embed(texts)
-      } catch {
+      } catch (err) {
+        console.warn('[pi-autodev] Gemini embedder unavailable, falling back to Ollama:', err instanceof Error ? err.message : String(err))
         return ollama.embed(texts)
       }
     },
@@ -156,7 +157,6 @@ function buildVerifier(opts: AutodevExtensionOptions): Verifier {
   if (opts.verifier) return opts.verifier
   const cwd = opts.repoRoot ?? process.cwd()
   const det = new DeterministicVerifier()
-  const mut = new MutationGate()
   const judge = opts.judge ?? new LLMJudge()
   const holdout = new HoldoutVerifier(judge)
   const gitleaks = new GitleaksHook(cwd)
@@ -249,17 +249,17 @@ function buildResurrection(opts: AutodevExtensionOptions, fsm: FSM): Resurrectio
  * Build a Lane port adapter from a SubagentRunner.
  * The concrete Lane wraps a task string into a subagent run.
  */
-function buildLaneAdapter(id: string, files: string[]): Lane {
-  // Minimal Lane port implementation using the SubagentRunner.
-  // The run() method is synchronous at the port boundary; actual subagent
-  // invocation would go through PI_SUBAGENT_MAX_DEPTH=1 workers.
+function buildLaneAdapter(id: string, files: string[], runner?: SubagentRunner): Lane {
+  // TODO(M-INT+): replace stub with real pi-subagent worker spawn
   const lanePort: Lane = {
     id,
     files,
     async run(task: string, options?: { workdir?: string }): Promise<{ output: string; exitCode: number }> {
-      // In production: spawn a pi-subagent worker in an isolated worktree.
-      // At M-INT boundary: the runner is injectable — return a placeholder
-      // so the port is wired without spawning real subagents on load.
+      if (runner) {
+        const r = await runner.run(task, { workdir: options?.workdir })
+        return { output: r.output, exitCode: r.exitCode }
+      }
+      // Stub: placeholder until real subagent runner is wired at M-INT.
       void options
       return { output: `[lane ${id}] queued: ${task}`, exitCode: 0 }
     },
@@ -286,7 +286,7 @@ export function buildExtension(opts: AutodevExtensionOptions = {}): {
   registry: ContractRegistry
   integrator: Integrator
   partitionFiles: typeof partitionFiles
-  buildLane: (id: string, files: string[]) => Lane
+  buildLane: (id: string, files: string[], runner?: SubagentRunner) => Lane
   SubagentRunner: typeof SubagentRunner
 } {
   const fsm = new FSM()
@@ -316,8 +316,7 @@ export default function autodevExtension(pi: ExtensionAPI): void {
   const ext = buildExtension()
 
   pi.on('session_start', async (_event: SessionStartEvent, ctx: ExtensionContext) => {
-    console.log('[pi-autodev] ARMED — health check pass, idle-wait')
     ctx.ui.setStatus('autodev', 'ARMED')
-    ext.transparency.log('session_start: ARMED')
+    await ext.transparency.log('session_start: ARMED — health check pass, idle-wait')
   })
 }

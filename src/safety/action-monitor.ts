@@ -11,12 +11,25 @@ const DANGEROUS_BASH_PATTERNS = [
   /rm\s+--no-preserve-root/i,
 ]
 
+// All legitimate outbound hosts for pi-autodev:
+//   - GitHub/npm: VCS + package registry
+//   - generativelanguage.googleapis.com: Gemini LLM API
+//   - localhost variants: Letta (8283), Ollama (11434), codebase-memory (7777)
+//
+// IMPORTANT: all fetch() calls in this codebase MUST route through checkEgress()
+// before executing. checkEgress() is the sole egress gate (G22/G24).
 const EGRESS_ALLOWLIST = new Set([
   'github.com',
   'api.github.com',
   'registry.npmjs.org',
   'raw.githubusercontent.com',
   'npmjs.com',
+  // Gemini LLM API
+  'generativelanguage.googleapis.com',
+  // Local services (Letta :8283, Ollama :11434, codebase-memory :7777)
+  'localhost',
+  '127.0.0.1',
+  '::1',
 ])
 
 export class ActionMonitor {

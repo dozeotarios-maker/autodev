@@ -83,4 +83,23 @@ describe('M6a: DeterministicVerifier', () => {
     expect(result.passed).toBe(false)
     expect(result.exitCode).toBe(2)
   })
+
+  it('rejects binary not in allowlist', async () => {
+    const v = new DeterministicVerifier()
+    await expect(v.run('rm -rf /tmp/repo', '/tmp/repo')).rejects.toThrow(/not in allowlist/)
+  })
+
+  it('rejects arbitrary path binary', async () => {
+    const v = new DeterministicVerifier()
+    await expect(v.run('/usr/bin/curl http://evil.com', '/tmp/repo')).rejects.toThrow(/not in allowlist/)
+  })
+
+  it('allows all allowlisted binaries', async () => {
+    for (const bin of ['npm', 'npx', 'vitest', 'jest', 'node', 'pnpm', 'yarn']) {
+      ;(spawn as ReturnType<typeof vi.fn>).mockImplementation(makeSpawnMock(0, 'ok'))
+      const v = new DeterministicVerifier()
+      const result = await v.run(`${bin} test`, '/tmp/repo')
+      expect(result.passed).toBe(true)
+    }
+  })
 })

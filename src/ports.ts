@@ -48,10 +48,10 @@ export interface MetricEntry {
 }
 
 export interface Transparency {
-  log(action: string): void
-  appendEntry(type: string, data?: unknown): void
+  log(action: string): Promise<void>
+  appendEntry(type: string, data?: unknown): Promise<void>
   setHudStatus(phase: string, task: string, laneStatus: string, model: string): void
-  recordMetric(metric: MetricEntry): void
+  recordMetric(metric: MetricEntry): Promise<void>
 }
 
 export interface Judge {
@@ -61,8 +61,10 @@ export interface Judge {
 
 export interface TokenVault {
   getToken(projectId: string): Promise<string>
+  storeToken(projectId: string, token: string): Promise<void>
   revokeToken(projectId: string): Promise<void>
   hasToken(projectId: string): Promise<boolean>
+  injectIntoEnv(projectId: string, env: Record<string, string>, envKey: string): Promise<void>
 }
 
 export interface SecurityFinding {

@@ -18,7 +18,7 @@ export class Checkpoint {
   async write(data: CheckpointData): Promise<void> {
     await fs.mkdir(path.dirname(this.filePath), { recursive: true })
     // Write as JSON; the .yaml extension is per spec naming convention.
-    await fs.writeFile(this.filePath, JSON.stringify(data, null, 2), 'utf-8')
+    await fs.writeFile(this.filePath, JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: 0o600 })
   }
 
   async read(): Promise<CheckpointData | null> {

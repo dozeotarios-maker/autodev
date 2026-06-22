@@ -1,4 +1,5 @@
 import { execFile } from 'child_process'
+import * as path from 'path'
 import type { GitOps } from '../ports.js'
 
 /**
@@ -16,6 +17,22 @@ function git(args: string[], cwd: string): Promise<string> {
   })
 }
 
+/**
+ * Validates that every path in allowedPaths resolves strictly inside cwd.
+ * Throws if any path escapes via traversal (../../x, /etc/passwd, etc.).
+ */
+function validatePaths(allowedPaths: string[], cwd: string): void {
+  const cwdResolved = path.resolve(cwd)
+  for (const p of allowedPaths) {
+    const resolved = path.resolve(cwd, p)
+    if (!resolved.startsWith(cwdResolved + path.sep) && resolved !== cwdResolved) {
+      throw new Error(
+        `ScopedCommit: path escapes working directory — rejected: ${p}`
+      )
+    }
+  }
+}
+
 export class ScopedCommit implements Pick<GitOps, 'scopedCommit'> {
   constructor(private readonly cwd: string) {}
 
@@ -23,6 +40,9 @@ export class ScopedCommit implements Pick<GitOps, 'scopedCommit'> {
     if (!allowedPaths || allowedPaths.length === 0) {
       throw new Error('allowedPaths must be non-empty — scoped commit requires explicit path list')
     }
+
+    // Reject any path that resolves outside cwd (traversal / absolute escape)
+    validatePaths(allowedPaths, this.cwd)
 
     // Stage ONLY the listed paths — never add '.' or '--all'
     await git(['add', '--', ...allowedPaths], this.cwd)

@@ -7,10 +7,17 @@ export interface DeterministicResult {
   output: string
 }
 
+const ALLOWED_BINARIES = new Set(['npm', 'npx', 'vitest', 'jest', 'node', 'pnpm', 'yarn', 'true'])
+
 export class DeterministicVerifier {
   async run(testCmd: string, cwd: string): Promise<DeterministicResult> {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      // Naive split on spaces — does not handle quoted args; documented limitation.
       const [bin, ...args] = testCmd.split(' ')
+      if (!bin || !ALLOWED_BINARIES.has(bin)) {
+        reject(new Error(`DeterministicVerifier: binary "${bin}" not in allowlist (${[...ALLOWED_BINARIES].join(', ')})`))
+        return
+      }
       const proc = spawn(bin, args, { cwd, shell: false })
 
       let output = ''

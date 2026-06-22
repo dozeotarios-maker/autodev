@@ -1,9 +1,9 @@
-import { execFile } from 'child_process'
+import { spawn } from 'child_process'
 
 /**
  * GitleaksHook — backstop secret scanner that shells out to the `gitleaks` CLI.
  *
- * In tests the `child_process.execFile` boundary is mocked (G12).
+ * In tests the `child_process.spawn` boundary is mocked (G12).
  * In production the real gitleaks binary (8.30.1+) must be on PATH.
  *
  * Exit codes (gitleaks detect):
@@ -34,19 +34,32 @@ function runGitleaks(
   cwd: string
 ): Promise<{ stdout: string; exitCode: number }> {
   return new Promise((resolve, reject) => {
-    execFile(binary, args, { cwd }, (err, stdout, _stderr) => {
-      if (!err) {
+    let proc: ReturnType<typeof spawn>
+    try {
+      proc = spawn(binary, args, { cwd, shell: false })
+    } catch (err) {
+      reject(new Error(`GitleaksHook: failed to spawn gitleaks — ${(err as Error).message}`))
+      return
+    }
+
+    let stdout = ''
+    proc.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString() })
+    // stderr suppressed — gitleaks writes non-JSON diagnostics there
+
+    proc.on('error', (err: NodeJS.ErrnoException) => {
+      // ENOENT = binary not found; other spawn errors
+      reject(new Error(`GitleaksHook: gitleaks scan failed — ${err.message}`))
+    })
+
+    proc.on('close', (exitCode: number | null) => {
+      const code = exitCode ?? -1
+      if (code === 0) {
         resolve({ stdout, exitCode: 0 })
-        return
-      }
-      // execFile sets err.code to the numeric exit code for non-zero exits
-      const rawCode = (err as NodeJS.ErrnoException).code
-      const code = rawCode !== undefined ? Number(rawCode) : undefined
-      if (code === 1) {
+      } else if (code === 1) {
         // gitleaks exit 1 = secrets found; stdout carries the JSON report
         resolve({ stdout, exitCode: 1 })
       } else {
-        reject(new Error(`GitleaksHook: gitleaks scan failed — ${err.message}`))
+        reject(new Error(`GitleaksHook: gitleaks scan failed — exit code ${code}`))
       }
     })
   })
@@ -59,9 +72,12 @@ export class GitleaksHook {
   ) {}
 
   async scan(options: GitleaksScanOptions): Promise<GitleaksScanResult> {
-    const args = ['detect', '--report-format', 'json', '--no-git']
+    // --no-git and --staged are mutually exclusive: --staged implies git mode
+    const args = ['detect', '--report-format', 'json']
     if (options.staged) {
       args.push('--staged')
+    } else {
+      args.push('--no-git')
     }
 
     const result = await runGitleaks(this.binary, args, this.cwd)

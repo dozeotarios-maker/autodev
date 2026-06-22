@@ -1,5 +1,7 @@
 // M0 tests — written FIRST (D1), all should fail before implementation
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { SubagentRunner } from '../../src/lanes/subagent-runner.js'
+import { buildExtension } from '../../src/extension/index.js'
 
 function makeMockPi() {
   return {
@@ -76,7 +78,6 @@ describe('M0: Extension scaffold', () => {
   it('logs ARMED on session_start and sets status', async () => {
     const { default: autodevExtension } = await import('../../src/extension/index.js')
     const mockPi = makeMockPi()
-    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
 
     autodevExtension(mockPi as any)
 
@@ -87,12 +88,9 @@ describe('M0: Extension scaffold', () => {
     const ctx = makeMockCtx()
     await handler({ type: 'session_start', reason: 'startup' }, ctx)
 
-    const armedLog = consoleSpy.mock.calls.some((args: any[]) =>
-      args.some((a: any) => typeof a === 'string' && a.includes('ARMED'))
-    )
-    expect(armedLog).toBe(true)
+    // Transparency port's log() is called instead of console.log (finding 8 fix).
+    // Verify status is set to ARMED — this is the observable side-effect.
     expect(ctx.ui.setStatus).toHaveBeenCalledWith('autodev', 'ARMED')
-    consoleSpy.mockRestore()
   })
 
   it('makes ZERO side-effect pi calls during registration (no writes, exec, or messages)', async () => {
@@ -107,5 +105,37 @@ describe('M0: Extension scaffold', () => {
     expect(mockPi.appendEntry).not.toHaveBeenCalled()
     // on() IS expected (registering handlers) — everything else must be silent
     expect(mockPi.on).toHaveBeenCalled()
+  })
+})
+
+describe('buildLaneAdapter: lane invokes mocked subagent-runner (Finding 7)', () => {
+  it('lane run() delegates to injected SubagentRunner when provided', async () => {
+    const ext = buildExtension()
+
+    // Build a mock Lane to back the SubagentRunner
+    const mockLane = {
+      id: 'mock',
+      files: [],
+      run: vi.fn().mockResolvedValue({ output: 'runner output', exitCode: 0 }),
+      status: () => 'idle' as const,
+    }
+    const runner = new SubagentRunner(mockLane)
+
+    // buildLane accepts an optional runner as the third argument
+    const lane = ext.buildLane('test-lane', ['src/foo.ts'], runner)
+    const result = await lane.run('implement foo', { workdir: '/tmp' })
+
+    expect(mockLane.run).toHaveBeenCalledWith('implement foo', { workdir: '/tmp' })
+    expect(result.output).toBe('runner output')
+    expect(result.exitCode).toBe(0)
+  })
+
+  it('lane run() returns stub output when no runner is provided', async () => {
+    const ext = buildExtension()
+    const lane = ext.buildLane('stub-lane', [])
+    const result = await lane.run('stub task')
+
+    expect(result.output).toContain('stub-lane')
+    expect(result.exitCode).toBe(0)
   })
 })

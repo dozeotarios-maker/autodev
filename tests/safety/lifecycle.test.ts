@@ -65,4 +65,23 @@ describe('M1: Lifecycle armed/running', () => {
     await lc.run('idea')
     expect(called).toBe(true)
   })
+
+  it('concurrent acquireLock() — exactly one succeeds (TOCTOU-safe atomic lock)', async () => {
+    // Two Lifecycle instances racing to acquire the lock simultaneously.
+    // With atomic fs.open('wx') exactly one must win; the other must fail.
+    const lc1 = new Lifecycle({ cwd: tmpDir })
+    const lc2 = new Lifecycle({ cwd: tmpDir })
+
+    const [r1, r2] = await Promise.all([
+      lc1.run('concurrent idea A'),
+      lc2.run('concurrent idea B'),
+    ])
+
+    const successes = [r1, r2].filter((r) => r.ok)
+    const failures = [r1, r2].filter((r) => !r.ok)
+
+    expect(successes).toHaveLength(1)
+    expect(failures).toHaveLength(1)
+    expect(failures[0].reason).toMatch(/another session|already running/i)
+  })
 })

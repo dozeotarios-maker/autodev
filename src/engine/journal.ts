@@ -18,7 +18,7 @@ export class Journal {
   async write(entry: Omit<JournalEntry, 'timestamp'>): Promise<void> {
     await fs.mkdir(path.dirname(this.filePath), { recursive: true })
     const full: JournalEntry = { ...entry, timestamp: new Date().toISOString() }
-    await fs.appendFile(this.filePath, JSON.stringify(full) + '\n', 'utf-8')
+    await fs.appendFile(this.filePath, JSON.stringify(full) + '\n', { encoding: 'utf-8', mode: 0o600 })
   }
 
   async replay(): Promise<JournalEntry[]> {

@@ -4,6 +4,7 @@
 import type { ResurrectionState } from '../ports.js'
 import { Journal } from './journal.js'
 import { Checkpoint } from './checkpoint.js'
+import { EffectLedger } from '../git/effect-ledger.js'
 import type { FSMCheckpoint, Phase } from './fsm.js'
 
 // The minimal FSM interface resurrection needs — avoids importing the concrete FSM class.
@@ -81,12 +82,29 @@ export class ResurrectionEngine {
   }
 
   // G20: check effect ledger to avoid double-firing.
+  // Accepts either a directory path (EffectLedger JSON format) or a file path (Journal JSONL format).
   async isIdempotentSafe(action: string, ledgerPath: string): Promise<boolean> {
-    const journal = new Journal(ledgerPath)
-    const entries = await journal.replay()
-    const alreadyDone = entries.some(
-      (e) => e.type === 'completion' && e.action === action
-    )
-    return !alreadyDone
+    const { stat } = await import('fs/promises')
+    let isDir = false
+    try {
+      const s = await stat(ledgerPath)
+      isDir = s.isDirectory()
+    } catch {
+      // Path doesn't exist yet — treat as Journal file (not yet written = safe)
+      return true
+    }
+
+    if (isDir) {
+      const ledger = new EffectLedger(ledgerPath)
+      const recorded = await ledger.isRecorded(action)
+      return !recorded
+    } else {
+      const journal = new Journal(ledgerPath)
+      const entries = await journal.replay()
+      const alreadyDone = entries.some(
+        (e) => e.type === 'completion' && e.action === action
+      )
+      return !alreadyDone
+    }
   }
 }

@@ -31,11 +31,11 @@ export class Lifecycle {
       return { ok: false, reason: 'Already RUNNING in this instance' }
     }
 
-    if (await this.isLocked()) {
+    const acquired = await this.acquireLockAtomic(idea)
+    if (!acquired) {
       return { ok: false, reason: 'Another session is already running in this repo' }
     }
 
-    await this.acquireLock(idea)
     this.state = 'RUNNING'
     await this.opts.onRunning?.()
     return { ok: true }
@@ -46,21 +46,28 @@ export class Lifecycle {
     await this.releaseLock()
   }
 
-  private async isLocked(): Promise<boolean> {
-    try {
-      await fs.access(this.lockPath)
-      return true
-    } catch {
-      return false
-    }
-  }
-
-  private async acquireLock(idea: string): Promise<void> {
+  /**
+   * Atomically acquire the run-lock using O_EXCL (exclusive create).
+   * Returns true if the lock was acquired, false if already locked (EEXIST).
+   * Replaces the TOCTOU-prone fs.access + fs.writeFile pattern.
+   */
+  private async acquireLockAtomic(idea: string): Promise<boolean> {
     await fs.mkdir(path.dirname(this.lockPath), { recursive: true })
-    await fs.writeFile(
-      this.lockPath,
-      JSON.stringify({ pid: process.pid, idea: idea.slice(0, 200), startedAt: new Date().toISOString() })
-    )
+    let fh: fs.FileHandle | undefined
+    try {
+      fh = await fs.open(this.lockPath, 'wx')
+      await fh.writeFile(
+        JSON.stringify({ pid: process.pid, idea: idea.slice(0, 200), startedAt: new Date().toISOString() })
+      )
+      return true
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+        return false
+      }
+      throw err
+    } finally {
+      await fh?.close()
+    }
   }
 
   private async releaseLock(): Promise<void> {

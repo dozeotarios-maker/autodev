@@ -56,17 +56,20 @@ describe('M6b: ConcurrencyLens (G23)', () => {
   })
 
   it('flags unprotected global state mutation pattern', async () => {
+    // Judge returns aligned=false to signal race — this is the mechanism that catches
+    // patterns the static regexes don't cover (e.g. arbitrary global mutations).
     const judge: Judge = {
       isDone: vi.fn().mockResolvedValue(true),
-      isStillRight: vi.fn().mockResolvedValue({ aligned: true }),
+      isStillRight: vi.fn().mockResolvedValue({ aligned: false, reason: 'unprotected global state mutation' }),
     }
     const lens = new ConcurrencyLens(judge)
-    // Static/global mutation without lock
+    // Diff with an unprotected class-level cache write
     const diff = '+MyClass.globalCache[key] = value // unprotected write'
     const result = await lens.analyze(diff)
-    // Static pattern detection or judge call — either catches it
-    expect(typeof result.hasRace).toBe('boolean')
-    expect(Array.isArray(result.findings)).toBe(true)
+    // Judge is always called and returns aligned=false → hasRace must be true
+    expect(result.hasRace).toBe(true)
+    expect(result.findings.length).toBeGreaterThan(0)
+    expect(result.findings.some(f => f.description.toLowerCase().includes('mutation') || f.description.toLowerCase().includes('race') || f.description.toLowerCase().includes('concurrency'))).toBe(true)
   })
 
   it('returns finding with description', async () => {

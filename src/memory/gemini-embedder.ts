@@ -45,7 +45,8 @@ export class GeminiEmbedder implements Embedder {
       return texts.map(t => mockEmbed(t, this.dimensions))
     }
     // Production: Gemini batchEmbedContents endpoint.
-    const url = `${this.baseUrl}/v1beta/models/${this.model}:batchEmbedContents?key=${this.apiKey}`
+    // API key sent as a request header, not a query param, to avoid leaking it via logs/proxies.
+    const url = `${this.baseUrl}/v1beta/models/${this.model}:batchEmbedContents`
     const body = {
       requests: texts.map(text => ({
         model: `models/${this.model}`,
@@ -54,7 +55,10 @@ export class GeminiEmbedder implements Embedder {
     }
     const response = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': this.apiKey,
+      },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(10000),
     })

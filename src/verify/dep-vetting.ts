@@ -1,6 +1,7 @@
 // M6b: G21 dep-vetting — license + CVE + maintenance check
 // External CLI boundary (osv-scanner / trivy) is injected/mocked in tests (G12)
 import { spawn } from 'child_process'
+import path from 'path'
 
 export interface DepVetOptions {
   allowedLicenses?: string[]
@@ -68,8 +69,16 @@ export class DepVetter {
   }
 
   private runOsvScan(input: DepVetInput): Promise<{ clean: boolean; reason?: string }> {
-    return new Promise((resolve) => {
-      const args = ['scan', '--format', 'json', '--lockfile', `${input.cwd}/package-lock.json`]
+    return new Promise((resolve, reject) => {
+      // Resolve lockfile path and assert it stays inside the project root to prevent
+      // path-traversal attacks from a malicious cwd value.
+      const resolvedCwd = path.resolve(input.cwd)
+      const lockfilePath = path.resolve(resolvedCwd, 'package-lock.json')
+      if (!lockfilePath.startsWith(resolvedCwd + path.sep) && lockfilePath !== resolvedCwd) {
+        reject(new Error(`dep-vetting: lockfile path escapes project root: ${lockfilePath}`))
+        return
+      }
+      const args = ['scan', '--format', 'json', '--lockfile', lockfilePath]
       const proc = spawn('osv-scanner', args, { cwd: input.cwd, shell: false })
 
       let stdout = ''

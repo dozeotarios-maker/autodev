@@ -65,10 +65,10 @@ describe('M1: 10 port interfaces', () => {
 
   it('Transparency no-op stub typechecks', () => {
     const stub: Transparency = {
-      log: () => {},
-      appendEntry: () => {},
+      log: async () => {},
+      appendEntry: async () => {},
       setHudStatus: () => {},
-      recordMetric: () => {},
+      recordMetric: async () => {},
     }
     expect(stub).toBeDefined()
   })
@@ -84,8 +84,10 @@ describe('M1: 10 port interfaces', () => {
   it('TokenVault no-op stub typechecks', () => {
     const stub: TokenVault = {
       getToken: async () => '',
+      storeToken: async () => {},
       revokeToken: async () => {},
       hasToken: async () => false,
+      injectIntoEnv: async () => {},
     }
     expect(stub).toBeDefined()
   })

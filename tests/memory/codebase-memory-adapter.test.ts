@@ -1,7 +1,7 @@
 // M2 Layer-A codebase-memory adapter tests (D1: failing first)
 // G12: real-or-mocked boundary — uses mock MCP client.
 import { describe, it, expect, beforeEach } from 'vitest'
-import { CodebaseMemoryAdapter } from '../../src/memory/codebase-memory-adapter.js'
+import { CodebaseMemoryAdapter, BackendUnavailableError } from '../../src/memory/codebase-memory-adapter.js'
 
 describe('M2: CodebaseMemoryAdapter — Layer-A codebase graph', () => {
   let adapter: CodebaseMemoryAdapter
@@ -43,5 +43,11 @@ describe('M2: CodebaseMemoryAdapter — Layer-A codebase graph', () => {
     // Must NOT throw — must return ok:false with details
     expect(health.ok).toBe(false)
     expect(typeof health.details).toBe('string')
+  })
+
+  it('findCallers throws BackendUnavailableError on network failure (non-mock)', async () => {
+    // Port 19999 is not listening — network error distinguishes backend-down from zero callers.
+    const offline = new CodebaseMemoryAdapter({ mock: false, baseUrl: 'http://localhost:19999' })
+    await expect(offline.findCallers('processPayment')).rejects.toBeInstanceOf(BackendUnavailableError)
   })
 })

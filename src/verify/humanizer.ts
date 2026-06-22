@@ -31,14 +31,13 @@ export class Humanizer {
   async analyze(text: string): Promise<HumanizerResult> {
     const findings: ReviewFinding[] = []
 
-    // Static slop pattern detection
+    // Static slop pattern detection — report ALL matching patterns, not just the first.
     for (const pattern of SLOP_PATTERNS) {
       if (pattern.test(text)) {
         findings.push({
           severity: 'LOW',
           description: `AI-slop pattern detected: "${pattern.source}"`,
         })
-        break // one finding per static check is enough
       }
     }
 
