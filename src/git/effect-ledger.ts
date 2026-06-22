@@ -72,7 +72,7 @@ export class EffectLedger {
         const fh = await fs.open(this.lockPath, 'wx')
         await fh.close()
         return async () => {
-          try { await fs.unlink(this.lockPath) } catch { /* already gone */ }
+          try { await fs.unlink(this.lockPath) } catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err }
         }
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err

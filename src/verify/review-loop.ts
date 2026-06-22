@@ -11,8 +11,8 @@ export interface ReviewFinding {
 export type ReviewerFn = (diff: string) => Promise<ReviewFinding[]>
 
 // fixerFn receives remaining CRIT/HIGH findings and returns an updated diff after applying fixes.
-// Without a fixerFn, the loop reviews the diff once and returns immediately (no re-review of
-// unchanged input since that would trivially loop to cap without ever converging).
+// Without a fixerFn, the same diff is re-reviewed each round up to MAX_ROUNDS. A non-deterministic
+// reviewer (e.g. LLM-backed) may still converge; a deterministic one will hit the cap.
 export type FixerFn = (findings: ReviewFinding[], currentDiff: string) => Promise<string>
 
 export interface LoopResult {

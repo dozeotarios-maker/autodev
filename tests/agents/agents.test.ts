@@ -1,9 +1,9 @@
 // M8 agents + personas + skills + cockpit tests (D1: failing first)
-// Uses a minimal inline frontmatter parser (gray-matter is a real dep in package.json).
+// Uses js-yaml ^4.1.2 directly for frontmatter/YAML parsing (no gray-matter dep).
 import { describe, it, expect } from 'vitest'
 import * as fs from 'fs/promises'
 import * as path from 'path'
-import matter from 'gray-matter'
+import yaml from 'js-yaml'
 
 const AGENTS_DIR = path.resolve(process.cwd(), 'agents')
 const SKILLS_DIR = path.resolve(process.cwd(), 'skills')
@@ -11,24 +11,36 @@ const COCKPIT_DIR = path.resolve(process.cwd(), 'cockpit')
 
 // ---- helpers ---------------------------------------------------------------
 
-async function loadMarkdownFiles(dir: string): Promise<Array<{ file: string; parsed: matter.GrayMatterFile<string> }>> {
+interface ParsedFile {
+  data: Record<string, unknown>
+  content: string
+}
+
+/** Minimal frontmatter splitter: strips a leading ---\n<yaml>\n---\n block. */
+function parseFrontmatter(raw: string): ParsedFile {
+  const FM_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/
+  const match = FM_RE.exec(raw)
+  if (!match) {
+    return { data: {}, content: raw }
+  }
+  const data = (yaml.load(match[1]) ?? {}) as Record<string, unknown>
+  return { data, content: match[2] }
+}
+
+async function loadMarkdownFiles(dir: string): Promise<Array<{ file: string; parsed: ParsedFile }>> {
   const entries = await fs.readdir(dir, { recursive: false })
   const mdFiles = (entries as string[]).filter(f => f.endsWith('.md'))
   return Promise.all(
     mdFiles.map(async f => {
       const content = await fs.readFile(path.join(dir, f), 'utf-8')
-      return { file: f, parsed: matter(content) }
+      return { file: f, parsed: parseFrontmatter(content) }
     })
   )
 }
 
 async function loadYaml(filePath: string): Promise<Record<string, unknown>> {
-  // Parse YAML using gray-matter's engine (it exposes yaml via data on a ---\n...\n--- block)
   const content = await fs.readFile(filePath, 'utf-8')
-  // Wrap as frontmatter so gray-matter parses the YAML body
-  const wrapped = `---\n${content}\n---\n`
-  const parsed = matter(wrapped)
-  return parsed.data as Record<string, unknown>
+  return (yaml.load(content) ?? {}) as Record<string, unknown>
 }
 
 // ---- role agents (11 files) ------------------------------------------------
@@ -139,7 +151,7 @@ describe('M8: Phase skill files (6 phases)', () => {
     const phaseSubdirs = (phaseDirs as string[]).filter(d => d.startsWith('phase'))
     for (const d of phaseSubdirs) {
       const content = await fs.readFile(path.join(SKILLS_DIR, d, 'SKILL.md'), 'utf-8')
-      const parsed = matter(content)
+      const parsed = parseFrontmatter(content)
       expect(parsed.data.name, `${d}/SKILL.md missing name`).toBeTruthy()
       expect(parsed.data.phase, `${d}/SKILL.md missing phase`).toBeTruthy()
     }

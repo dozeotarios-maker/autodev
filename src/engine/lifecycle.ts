@@ -73,8 +73,8 @@ export class Lifecycle {
   private async releaseLock(): Promise<void> {
     try {
       await fs.unlink(this.lockPath)
-    } catch {
-      // already gone — acceptable
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
     }
   }
 }

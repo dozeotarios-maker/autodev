@@ -6,6 +6,7 @@ import { Journal } from './journal.js'
 import { Checkpoint } from './checkpoint.js'
 import { EffectLedger } from '../git/effect-ledger.js'
 import type { FSMCheckpoint, Phase } from './fsm.js'
+import { stat } from 'fs/promises'
 
 // The minimal FSM interface resurrection needs — avoids importing the concrete FSM class.
 export interface FSMHandle {
@@ -84,7 +85,6 @@ export class ResurrectionEngine {
   // G20: check effect ledger to avoid double-firing.
   // Accepts either a directory path (EffectLedger JSON format) or a file path (Journal JSONL format).
   async isIdempotentSafe(action: string, ledgerPath: string): Promise<boolean> {
-    const { stat } = await import('fs/promises')
     let isDir = false
     try {
       const s = await stat(ledgerPath)
