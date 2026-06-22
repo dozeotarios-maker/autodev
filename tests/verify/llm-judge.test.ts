@@ -1,60 +1,35 @@
-// M6a: LLM judge — clean-context, EvilGenie holdout pattern
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { LLMJudge } from '../../src/verify/llm-judge.js'
+// S2-M4: LLMJudge is DELETED — this file now tests that nothing imports it
+// and confirms SubagentJudge is the replacement.
+// The actual SubagentJudge tests live in tests/verify/subagent-judge.test.ts.
+import { describe, it, expect } from 'vitest'
+import * as fs from 'fs'
+import * as path from 'path'
 
-describe('M6a: LLMJudge', () => {
-  beforeEach(() => {
-    vi.clearAllMocks()
+describe('S2-M4: LLMJudge deleted — nothing imports it', () => {
+  it('src/verify/llm-judge.ts does not exist', () => {
+    const p = path.resolve('src/verify/llm-judge.ts')
+    expect(fs.existsSync(p)).toBe(false)
   })
 
-  it('isDone returns true when model call returns true', async () => {
-    const mockCall = vi.fn().mockResolvedValue(true)
-    const judge = new LLMJudge(mockCall)
-    const result = await judge.isDone('build login', 'login works, tests pass')
-    expect(result).toBe(true)
-    expect(mockCall).toHaveBeenCalledOnce()
-  })
-
-  it('isDone returns false when model call returns false', async () => {
-    const mockCall = vi.fn().mockResolvedValue(false)
-    const judge = new LLMJudge(mockCall)
-    const result = await judge.isDone('build login', 'nothing merged yet')
-    expect(result).toBe(false)
-  })
-
-  it('isStillRight returns aligned result from model', async () => {
-    const mockCall = vi.fn().mockResolvedValue({ aligned: true, reason: 'on track' })
-    const judge = new LLMJudge(undefined, mockCall)
-    const result = await judge.isStillRight('spec: feature A', 'diff shows feature A added')
-    expect(result.aligned).toBe(true)
-    expect(result.reason).toBe('on track')
-  })
-
-  it('isStillRight returns not-aligned when drift detected', async () => {
-    const mockCall = vi.fn().mockResolvedValue({ aligned: false, reason: 'diverges from spec' })
-    const judge = new LLMJudge(undefined, mockCall)
-    const result = await judge.isStillRight('spec: feature A', 'diff modifies feature B instead')
-    expect(result.aligned).toBe(false)
-    expect(result.reason).toContain('diverges')
-  })
-
-  it('judge does not include LLM trace in model calls', async () => {
-    const mockCall = vi.fn().mockResolvedValue(true)
-    const judge = new LLMJudge(mockCall)
-    await judge.isDone('goal', 'evidence only — no trace here')
-    const [goalArg, evidenceArg] = mockCall.mock.calls[0]
-    // Evidence passed to model should not be "trace" content
-    expect(goalArg).toBe('goal')
-    expect(evidenceArg).toBe('evidence only — no trace here')
-  })
-
-  it('satisfies the Judge port interface', async () => {
-    const judge = new LLMJudge(
-      vi.fn().mockResolvedValue(true),
-      vi.fn().mockResolvedValue({ aligned: true })
-    )
-    // Port compliance: has isDone and isStillRight
-    expect(typeof judge.isDone).toBe('function')
-    expect(typeof judge.isStillRight).toBe('function')
+  it('no source file imports llm-judge', () => {
+    // Scan src/ for any import of llm-judge
+    function scanDir(dir: string): string[] {
+      const findings: string[] = []
+      if (!fs.existsSync(dir)) return findings
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name)
+        if (entry.isDirectory()) {
+          findings.push(...scanDir(full))
+        } else if (entry.name.endsWith('.ts')) {
+          const content = fs.readFileSync(full, 'utf-8')
+          if (content.includes('llm-judge')) {
+            findings.push(full)
+          }
+        }
+      }
+      return findings
+    }
+    const hits = scanDir(path.resolve('src'))
+    expect(hits).toEqual([])
   })
 })

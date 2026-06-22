@@ -1,4 +1,6 @@
-// M6c: G16 Playwright-MCP browser grounding — MCP boundary injected (G12)
+// S2-M7: G16 Playwright-MCP browser grounding.
+// MCP boundary injected via PlaywrightMCPAdapter (G12 — mock in tests).
+// Missing MCP adapter degrades gracefully: skip + log, no crash.
 
 export interface PlaywrightMCPAdapter {
   navigate(url: string): Promise<{ ok: boolean; error?: string }>
@@ -22,20 +24,42 @@ export interface GroundingResult {
   passed: boolean
   screenshotPath?: string
   error?: string
+  skipped?: boolean
   evidence: GroundingEvidence
 }
 
 export class UIGrounding {
-  constructor(private readonly mcp: PlaywrightMCPAdapter) {}
+  constructor(private readonly mcp: PlaywrightMCPAdapter | null) {}
 
   async verify(input: GroundingInput): Promise<GroundingResult> {
+    // Missing MCP adapter — degrade gracefully
+    if (!this.mcp) {
+      console.log('[UIGrounding] Playwright-MCP adapter not available — skipping UI grounding')
+      return {
+        passed: false,
+        skipped: true,
+        error: 'Playwright-MCP adapter not available',
+        evidence: {
+          screenshotPath: '',
+          url: input.url,
+          assertion: input.assertion,
+          passed: false,
+        },
+      }
+    }
+
     const nav = await this.mcp.navigate(input.url)
     if (!nav.ok) {
       const error = nav.error ?? 'navigation failed'
       return {
         passed: false,
         error,
-        evidence: { screenshotPath: '', url: input.url, assertion: input.assertion, passed: false },
+        evidence: {
+          screenshotPath: '',
+          url: input.url,
+          assertion: input.assertion,
+          passed: false,
+        },
       }
     }
 

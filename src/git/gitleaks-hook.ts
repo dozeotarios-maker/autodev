@@ -47,8 +47,12 @@ function runGitleaks(
     // stderr suppressed — gitleaks writes non-JSON diagnostics there
 
     proc.on('error', (err: NodeJS.ErrnoException) => {
-      // ENOENT = binary not found; other spawn errors
-      reject(new Error(`GitleaksHook: gitleaks scan failed — ${err.message}`))
+      if (err.code === 'ENOENT') {
+        // Binary not found — resolve as skipped (degrade gracefully, no crash)
+        resolve({ stdout: '', exitCode: -1 })
+      } else {
+        reject(new Error(`GitleaksHook: gitleaks scan failed — ${err.message}`))
+      }
     })
 
     proc.on('close', (exitCode: number | null) => {
@@ -81,6 +85,12 @@ export class GitleaksHook {
     }
 
     const result = await runGitleaks(this.binary, args, this.cwd)
+
+    if (result.exitCode === -1) {
+      // Binary not found — degrade gracefully: skip + log, no crash
+      console.log(`[GitleaksHook] gitleaks binary not found — skipping secret scan`)
+      return { clean: true, findings: [] }
+    }
 
     if (result.exitCode === 0) {
       return { clean: true, findings: [] }

@@ -1,8 +1,8 @@
-// M6c: G16 Playwright-MCP browser grounding — MCP boundary mocked (G12)
+// S2-M7: UIGrounding — Playwright-MCP adapter injected; null degrades gracefully
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { UIGrounding } from '../../src/verify/ui-grounding.js'
 
-describe('M6c: UIGrounding (G16)', () => {
+describe('S2-M7: UIGrounding (G16)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
   })
@@ -53,13 +53,11 @@ describe('M6c: UIGrounding (G16)', () => {
   })
 
   it('MCP boundary is injected — not imported directly', () => {
-    // UIGrounding accepts MCP adapter via constructor (G12: mock the boundary)
     const mockMCP = {
       navigate: vi.fn(),
       screenshot: vi.fn(),
       evaluate: vi.fn(),
     }
-    // Should not throw — MCP is injected
     expect(() => new UIGrounding(mockMCP)).not.toThrow()
   })
 
@@ -90,5 +88,16 @@ describe('M6c: UIGrounding (G16)', () => {
     })
     expect(result.evidence.url).toBe('http://localhost:3000/dashboard')
     expect(result.evidence.assertion).toBe('dashboard visible')
+  })
+
+  it('degrades gracefully when MCP adapter is null (skip + log, no crash)', async () => {
+    const grounding = new UIGrounding(null)
+    const result = await grounding.verify({
+      url: 'http://localhost:3000',
+      assertion: 'any',
+    })
+    expect(result.skipped).toBe(true)
+    expect(result.passed).toBe(false)
+    expect(result.error).toMatch(/not available/i)
   })
 })

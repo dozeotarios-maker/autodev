@@ -1,4 +1,5 @@
-// M6a: holdout verifier — clean-context LLM judge (primary) + test-tree edit-detection
+// S2-M4: holdout verifier — SubagentJudge (primary) + test-tree edit-detection.
+// The judge is the Judge port; in production this is a SubagentJudge.
 import type { Judge } from '../ports.js'
 
 export interface HoldoutInput {

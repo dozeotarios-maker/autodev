@@ -8,8 +8,19 @@ import * as os from 'os'
 import * as path from 'path'
 import { FSM, type Phase, type JournalEntry } from '../../src/engine/fsm.js'
 import { LettaAdapter } from '../../src/memory/letta-adapter.js'
-import { LLMJudge } from '../../src/verify/llm-judge.js'
 import { DeterministicVerifier } from '../../src/verify/deterministic.js'
+import type { Judge } from '../../src/ports.js'
+
+// Minimal stub judge for integration tests (replaces deleted LLMJudge)
+function makeStubJudge(overrides: Partial<Judge> = {}): Judge {
+  return {
+    async isDone(_goal: string, _evidence: string): Promise<boolean> { return false },
+    async isStillRight(_spec: string, _diff: string): Promise<{ aligned: boolean; reason?: string }> {
+      return { aligned: true }
+    },
+    ...overrides,
+  }
+}
 
 let tmpDir: string
 
@@ -32,8 +43,8 @@ describe('M-INT: FSM full-cycle P1→P6', () => {
     // Real memory store (mock boundary — no Letta server needed).
     const memory = new LettaAdapter({ mock: true })
 
-    // Real judge (returns false by default — will allow advancement without judge gate).
-    const judge = new LLMJudge()
+    // Stub judge (returns false by default — will allow advancement without judge gate).
+    const judge = makeStubJudge()
 
     // Real deterministic verifier (we won't run an actual test command here).
     const verifier = new DeterministicVerifier()
@@ -88,10 +99,11 @@ describe('M-INT: FSM full-cycle P1→P6', () => {
     expect(fsm.getPhase()).toBe('P4')
 
     // Inject a divergent diff — judge.isStillRight would fire backedge in production.
-    const judge = new LLMJudge(
-      undefined,
-      async (_spec, _diff) => ({ aligned: false, reason: 'diff diverges from spec' })
-    )
+    const judge = makeStubJudge({
+      async isStillRight(_spec: string, _diff: string) {
+        return { aligned: false, reason: 'diff diverges from spec' }
+      },
+    })
     const alignment = await judge.isStillRight('original spec', 'divergent diff content')
     expect(alignment.aligned).toBe(false)
 
