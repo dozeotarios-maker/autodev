@@ -1,5 +1,4 @@
-// M5 gitleaks-hook test — D1 test-first
-// G12: mock CLI boundary (gitleaks binary)
+// S2-M7: GitleaksHook — blocks staged secrets; missing binary degrades gracefully
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { EventEmitter } from 'events'
 
@@ -40,7 +39,7 @@ beforeEach(() => {
   vi.clearAllMocks()
 })
 
-describe('M5: GitleaksHook — blocks staged secrets', () => {
+describe('S2-M7: GitleaksHook — blocks staged secrets', () => {
   it('returns clean=true when gitleaks exits 0 (no secrets found)', async () => {
     mockSpawn.mockReturnValueOnce(makeFakeProc({ exitCode: 0 }))
 
@@ -103,18 +102,43 @@ describe('M5: GitleaksHook — blocks staged secrets', () => {
     await hook.scan({ staged: true })
   })
 
-  it('propagates unexpected errors (binary missing / ENOENT)', async () => {
+  it('degrades gracefully when binary missing (ENOENT) — returns clean=true, no crash', async () => {
     const spawnError = Object.assign(new Error('spawn gitleaks ENOENT'), { code: 'ENOENT' })
     mockSpawn.mockReturnValueOnce(makeFakeProc({ errorEvent: spawnError }))
 
     const hook = new GitleaksHook('/fake/repo')
-    await expect(hook.scan({ staged: true })).rejects.toThrow(/gitleaks/)
+    // Should NOT throw — ENOENT degrades to clean=true (skip + log)
+    const result = await hook.scan({ staged: true })
+    expect(result.clean).toBe(true)
+    expect(result.findings).toHaveLength(0)
   })
 
-  it('rejects on non-zero non-1 exit code', async () => {
+  it('rejects on non-zero non-1 exit code (unexpected gitleaks error)', async () => {
     mockSpawn.mockReturnValueOnce(makeFakeProc({ exitCode: 2 }))
 
     const hook = new GitleaksHook('/fake/repo')
     await expect(hook.scan({ staged: true })).rejects.toThrow(/exit code 2/)
+  })
+
+  it('validates output parsing vs recorded gitleaks sample', async () => {
+    // Recorded sample: gitleaks JSON output shape
+    const recordedSample = JSON.stringify([
+      {
+        Description: 'Generic API Key',
+        StartLine: 12,
+        EndLine: 12,
+        File: 'config/secrets.ts',
+        RuleID: 'generic-api-key',
+        Secret: 'REDACTED',
+      }
+    ])
+    mockSpawn.mockReturnValueOnce(makeFakeProc({ stdout: recordedSample, exitCode: 1 }))
+
+    const hook = new GitleaksHook('/fake/repo')
+    const result = await hook.scan({ staged: true })
+    expect(result.clean).toBe(false)
+    expect(result.findings[0]).toContain('Generic API Key')
+    expect(result.findings[0]).toContain('generic-api-key')
+    expect(result.findings[0]).toContain('config/secrets.ts')
   })
 })
