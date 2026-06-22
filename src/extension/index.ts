@@ -36,10 +36,16 @@ import { TierDGate } from '../git/tier-d-gate.js'
 import { GitleaksHook } from '../git/gitleaks-hook.js'
 import { TokenVaultImpl } from '../git/token-vault.js'
 
-// ── Lane E: Verify (via stub judge — concretes injected by S2-M8 integrator) ──
+// ── Lane E: Verify ────────────────────────────────────────────────────────────
 import { DeterministicVerifier } from '../verify/deterministic.js'
 import { MutationGate } from '../verify/mutation.js'
 import { HoldoutVerifier } from '../verify/holdout.js'
+
+// ── S2-M8: Real concretes wired here ─────────────────────────────────────────
+import { SubagentJudge } from '../verify/subagent-judge.js'
+import { LaneSubagentRunner } from '../lanes/subagent-runner.js'
+import { HostAgent } from '../host/host-agent.js'
+import { SubagentDriver } from '../host/subagent-driver.js'
 
 // ── Lane B: Engine ────────────────────────────────────────────────────────────
 import { FSM } from '../engine/fsm.js'
@@ -222,8 +228,7 @@ function buildLaneAdapter(id: string, files: string[], runner?: SubagentRunner):
   }
 }
 
-// ── No-op stub judge (used when no SubagentDriver is available at boot time) ──
-// In production this is replaced by SubagentJudge injected via opts.judge.
+// ── No-op stub judge (fallback when no SubagentDriver is available) ──────────
 function noopJudge(): Judge {
   return {
     async isDone(_goal: string, _evidence: string): Promise<boolean> { return false },
@@ -231,6 +236,24 @@ function noopJudge(): Judge {
       return { aligned: true }
     },
   }
+}
+
+// ── S2-M8: Build the real SubagentDriver from a HostAgent ───────────────────
+// Both SubagentJudge and LaneSubagentRunner depend on SubagentDriver which
+// depends on HostAgent. HostAgent needs a pi-like object with sendUserMessage.
+// In buildExtension (static composition) we don't have pi yet, so a
+// SubagentDriver + SubagentJudge can only be built at extension entry time
+// (when the real pi is available). buildExtension supports injection via opts.judge.
+// The autodevExtension entry point below wires the real concretes.
+function buildJudge(opts: AutodevExtensionOptions, driver?: SubagentDriver): Judge {
+  if (opts.judge) return opts.judge
+  if (driver) return new SubagentJudge(driver)
+  return noopJudge()
+}
+
+function buildLaneSubagentRunner(driver?: SubagentDriver): LaneSubagentRunner | undefined {
+  if (!driver) return undefined
+  return new LaneSubagentRunner(driver, { concurrency: 5 })
 }
 
 // ── buildExtension — composes all adapters ────────────────────────────────────
@@ -265,6 +288,8 @@ export function buildExtension(opts: AutodevExtensionOptions = {}): {
     tokenVault: buildTokenVault(opts),
     securityLane: buildSecurityLane(opts),
     resurrection: buildResurrection(opts, fsm),
+    // S2-M8: judge is noopJudge here (no pi available at static compose time).
+    // The real SubagentJudge is wired in autodevExtension() where pi is available.
     judge: opts.judge ?? noopJudge(),
     fsm,
     registry,
@@ -275,16 +300,59 @@ export function buildExtension(opts: AutodevExtensionOptions = {}): {
   }
 }
 
-// ── Extension entry point (S2-M2) ─────────────────────────────────────────────
+// ── Extension entry point (S2-M2, wired with real concretes in S2-M8) ────────
+//
+// Wiring map (S2-M8):
+//   HostAgent        ← pi (ExtensionAPI with sendUserMessage)
+//   SubagentDriver   ← HostAgent  (composes steer + git-stash guard)
+//   SubagentJudge    ← SubagentDriver  (Judge port — replaces noopJudge)
+//   LaneSubagentRunner ← SubagentDriver  (build lane — worktree-isolated pi-subagents)
+//   HoldoutVerifier  ← SubagentJudge
+//   Verifier         ← DeterministicVerifier + MutationGate + HoldoutVerifier (SubagentJudge)
+//   LettaAdapter     ← LETTA_MOCK env / real HTTP
+//   CodebaseMemoryAdapter ← CODEBASE_MEMORY_MOCK env / stdio JSON-RPC binary
+//
+// All external boundaries (Letta HTTP, codebase-memory binary, CLIs, pi-hud)
+// remain injectable via AutodevExtensionOptions for test isolation.
 
 export default function autodevExtension(pi: ExtensionAPI): void {
-  const opts: AutodevExtensionOptions = {}
   const repoRoot = process.cwd()
 
-  const transparency = buildTransparency({ ...opts, repoRoot })
-  const gitOps = buildGitOps({ ...opts, repoRoot })
-  const verifier = buildVerifier(opts)
-  const judge = opts.judge ?? noopJudge()
+  // ── Real HostAgent + SubagentDriver (need pi at runtime) ──────────────────
+  const hostAgent = new HostAgent(pi)
+  const subagentDriver = new SubagentDriver(hostAgent)
+
+  // ── Real Judge: SubagentJudge via SubagentDriver ───────────────────────────
+  const judge = buildJudge({}, subagentDriver)
+
+  // ── Real LaneSubagentRunner (build lane, worktree-isolated) ───────────────
+  const _laneRunner = buildLaneSubagentRunner(subagentDriver)
+  void _laneRunner // available for P4Build if wired via opts; currently SubagentDriver is in Controller
+
+  // ── Verifier with real SubagentJudge for holdout ──────────────────────────
+  const det = new DeterministicVerifier()
+  const holdout = new HoldoutVerifier(judge)
+  const gitleaks = new GitleaksHook(repoRoot)
+  const verifier: Verifier = {
+    runDeterministic: (testCmd, wd) => det.run(testCmd, wd),
+    runMutation: (wd, threshold) => new MutationGate({ threshold }).run(wd),
+    runHoldout: async (testCmd, wd) => {
+      const det2 = new DeterministicVerifier()
+      const detResult = await det2.run(testCmd, wd)
+      const holdoutResult = await holdout.run({
+        goal: testCmd,
+        evidence: detResult.output,
+        testFiles: [],
+        testFilesSnapshot: {},
+      })
+      return { passed: holdoutResult.passed, output: holdoutResult.reason ?? detResult.output }
+    },
+    runSecurityScan: (_wd) => gitleaks.scan({ staged: false }),
+  }
+
+  // ── Memory (injectable; real Letta + real codebase-memory) ────────────────
+  const transparency = buildTransparency({ repoRoot })
+  const gitOps = buildGitOps({ repoRoot })
 
   const controller = new Controller(pi, {
     repoRoot,
