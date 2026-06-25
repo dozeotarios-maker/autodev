@@ -35,9 +35,10 @@ export class GeminiEmbedder implements Embedder {
     this.apiKey = opts.apiKey ?? ''
     // Official Gemini REST endpoint (verified June 2026: generativelanguage.googleapis.com/v1beta)
     this.baseUrl = opts.baseUrl ?? 'https://generativelanguage.googleapis.com'
-    this.model = opts.model ?? 'text-embedding-004'
-    // gemini-embedding-001 / text-embedding-004 outputs 768-dimensional vectors.
-    this.dimensions = opts.dimensions ?? 768
+    this.model = opts.model ?? 'gemini-embedding-001'
+    // gemini-embedding-001 outputs 3072-dimensional vectors by default
+    // (text-embedding-004 was 768; it is no longer served on v1beta as of 2026-06).
+    this.dimensions = opts.dimensions ?? 3072
   }
 
   async embed(texts: string[]): Promise<number[][]> {

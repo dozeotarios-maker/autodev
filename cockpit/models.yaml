@@ -27,10 +27,10 @@ embedder:
   default: gemini
   fallback: ollama
   gemini:
-    model: text-embedding-004
-    dimensions: 768
+    model: gemini-embedding-001
+    dimensions: 3072
     note: >
-      gemini-embedding-001 / text-embedding-004 — strong free tier, high limits.
+      gemini-embedding-001 — strong free tier, high limits (3072-dim; text-embedding-004 retired on v1beta 2026-06).
       Verify current free-tier limits at build (web-currency rule D2).
   ollama:
     model: qwen3-embedding:0.6b
