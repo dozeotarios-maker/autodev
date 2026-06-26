@@ -125,6 +125,8 @@ export class LettaAdapter implements MemoryStore {
   private mockStore: MockLettaStore | null = null
   /** Cached resolved agent id (real mode only). */
   private resolvedAgentId: string | null = null
+  /** In-flight ensureAgent promise (prevents double-create race). */
+  private agentPromise: Promise<string> | null = null
 
   constructor(opts: LettaAdapterOptions = {}) {
     this.mock = opts.mock ?? process.env['LETTA_MOCK'] === '1'
@@ -162,6 +164,11 @@ export class LettaAdapter implements MemoryStore {
    *   If found, cache and return its id.
    *   If not found, POST /v1/agents/ to create it, cache and return the new id.
    * Result is cached; subsequent calls are free.
+   * The in-flight promise is also cached to prevent concurrent first-calls from
+   * creating duplicate agents (double-create race condition fix).
+   *
+   * Note: mock mode ignores agentId/ensureAgent entirely — the MockLettaStore
+   * is keyed by key/value directly, not by Letta agent id.
    */
   async ensureAgent(): Promise<string> {
     if (this.staticAgentId !== null) {
@@ -170,35 +177,55 @@ export class LettaAdapter implements MemoryStore {
     if (this.resolvedAgentId !== null) {
       return this.resolvedAgentId
     }
-
-    // List existing agents
-    const listUrl = `${this.baseUrl}/v1/agents/`
-    const listResp = await fetch(listUrl, { headers: this.headers() })
-    if (!listResp.ok) {
-      throw new Error(`Letta ensureAgent list failed: ${listResp.status} ${await listResp.text()}`)
-    }
-    const agents = (await listResp.json()) as LettaAgentState[]
-    const existing = agents.find(a => a.name === this.agentName)
-    if (existing) {
-      this.resolvedAgentId = existing.id
-      return existing.id
+    // Cache the in-flight promise so concurrent callers await the same operation
+    // instead of each issuing their own list+create, which would create duplicate agents.
+    if (this.agentPromise !== null) {
+      return this.agentPromise
     }
 
-    // Create the agent
-    const createUrl = `${this.baseUrl}/v1/agents/`
-    const createResp = await fetch(createUrl, {
-      method: 'POST',
-      headers: this.headers(),
-      body: JSON.stringify({ name: this.agentName, model: 'letta/letta-free' }),
-    })
-    if (!createResp.ok) {
-      throw new Error(
-        `Letta ensureAgent create failed: ${createResp.status} ${await createResp.text()}`
-      )
-    }
-    const created = (await createResp.json()) as LettaAgentState
-    this.resolvedAgentId = created.id
-    return created.id
+    this.agentPromise = (async () => {
+      // List existing agents — use name filter if available, with Array.isArray guard
+      // for servers that wrap the list in { agents: [...] }.
+      const listUrl = `${this.baseUrl}/v1/agents/?name=${encodeURIComponent(this.agentName)}`
+      const listResp = await fetch(listUrl, {
+        headers: this.headers(),
+        signal: AbortSignal.timeout(10_000),
+      })
+      if (!listResp.ok) {
+        throw new Error(`Letta ensureAgent list failed: ${listResp.status} ${await listResp.text()}`)
+      }
+      const rawAgents = await listResp.json()
+      // Handle both bare-array and { agents: [...] } response shapes
+      const agentList: LettaAgentState[] = Array.isArray(rawAgents)
+        ? rawAgents as LettaAgentState[]
+        : Array.isArray((rawAgents as { agents?: unknown }).agents)
+          ? (rawAgents as { agents: LettaAgentState[] }).agents
+          : []
+      const existing = agentList.find(a => a.name === this.agentName)
+      if (existing) {
+        this.resolvedAgentId = existing.id
+        return existing.id
+      }
+
+      // Create the agent
+      const createUrl = `${this.baseUrl}/v1/agents/`
+      const createResp = await fetch(createUrl, {
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify({ name: this.agentName, model: 'letta/letta-free' }),
+        signal: AbortSignal.timeout(10_000),
+      })
+      if (!createResp.ok) {
+        throw new Error(
+          `Letta ensureAgent create failed: ${createResp.status} ${await createResp.text()}`
+        )
+      }
+      const created = (await createResp.json()) as LettaAgentState
+      this.resolvedAgentId = created.id
+      return created.id
+    })()
+
+    return this.agentPromise
   }
 
   /**
@@ -218,6 +245,7 @@ export class LettaAdapter implements MemoryStore {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify({ text: `[${key}] ${value}` }),
+      signal: AbortSignal.timeout(10_000),
     })
     if (!response.ok) {
       throw new Error(`Letta store failed: ${response.status} ${await response.text()}`)
@@ -237,22 +265,32 @@ export class LettaAdapter implements MemoryStore {
       return this.mockStore.recall(query, limit)
     }
     const agentId = await this.ensureAgent()
+    // Clamp limit to a sane max and truncate overly-long queries
+    const clampedLimit = Math.min(limit, 50)
+    const clampedQuery = query.length > 1000 ? query.slice(0, 1000) : query
     const params = new URLSearchParams({
-      query,
-      limit: String(limit),
+      query: clampedQuery,
+      limit: String(clampedLimit),
     })
     const url = `${this.baseUrl}/v1/agents/${agentId}/archival-memory/search?${params.toString()}`
-    const response = await fetch(url, { headers: this.headers() })
+    const response = await fetch(url, {
+      headers: this.headers(),
+      signal: AbortSignal.timeout(10_000),
+    })
     if (!response.ok) {
       throw new Error(`Letta recall failed: ${response.status}`)
     }
     const body = (await response.json()) as LettaArchivalSearchResponse
     const passages = body.results ?? []
-    return passages.map(p => ({
-      key: p.id,
-      value: p.content,
-      score: 0.5,
-    }))
+    return passages
+      .map(p => ({
+        key: p.id,
+        // Passages may carry text or content depending on server version
+        value: (p as unknown as LettaPassage).content ?? (p as unknown as LettaPassage).text ?? '',
+        // Use server-provided score if present; fall back to 0.5
+        score: (p as unknown as LettaPassage).score ?? 0.5,
+      }))
+      .filter(r => r.value !== '')
   }
 
   /**

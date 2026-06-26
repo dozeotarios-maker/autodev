@@ -735,7 +735,9 @@ describe('B3: P1 memory recall — screened hit appears in instruction', () => {
     const instruction = await buildP1Instruction(ctx, '/tmp/p1-spec.json')
     expect(instruction).toContain('Prior memory (screened)')
     expect(instruction).toContain('Use PostgreSQL for structured data')
-    expect(screenContent).toHaveBeenCalledWith('Use PostgreSQL for structured data', 'repo')
+    // Fix #4: screenContent is called with the injected line (including "- " prefix),
+    // not just hit.value, so the screener sees exactly what the model receives.
+    expect(screenContent).toHaveBeenCalledWith('- Use PostgreSQL for structured data', 'repo')
   })
 
   it('recalled hit flagged unsafe by screenContent is dropped from instruction', async () => {
@@ -853,5 +855,83 @@ describe('B5: P1 memory degrade — backend errors do not break P1', () => {
     // Without memoryStore, the return value must be a plain string, not a Promise
     expect(typeof result).toBe('string')
     expect((result as unknown as { then?: unknown }).then).toBeUndefined()
+  })
+})
+
+// ── Fix #6: fail-closed screen — memoryStore present + screenContent absent → no inject ─
+
+describe('Fix #6: fail-closed screen — memoryStore present but screenContent undefined → no injected memory block', () => {
+  it('memoryStore present + screenContent undefined → P1 instruction has NO prior-memory section', async () => {
+    const memoryStore = makeMockMemoryStore([
+      { key: 'k1', value: 'Use Redis for caching', score: 0.9 },
+      { key: 'k2', value: 'Always write integration tests', score: 0.8 },
+    ])
+    // No screenContent provided — the two fields are independent optionals.
+    // Contract: memoryStore-without-screen must inject NOTHING (fail-closed).
+    const ctx: P1Context = {
+      phase: 'P1',
+      idea: 'Build a caching layer',
+      memoryStore,
+      // screenContent deliberately omitted
+    }
+    const instruction = await buildP1Instruction(ctx, '/tmp/p1-spec.json')
+
+    // Must not inject any memory — fail-closed when we cannot screen the hits.
+    expect(instruction).not.toContain('Prior memory (screened)')
+    expect(instruction).not.toContain('Use Redis for caching')
+    expect(instruction).not.toContain('Always write integration tests')
+    // Baseline content still present
+    expect(instruction).toContain('P1 DISCOVER')
+    expect(instruction).toContain('Build a caching layer')
+  })
+})
+
+// ── Fix #5: line-boundary truncation — no partial trailing bullet ─────────────
+
+describe('Fix #5: line-boundary cap — truncated block has no partial trailing bullet', () => {
+  it('block longer than 1500 chars is truncated at a line boundary (no mid-line cut)', async () => {
+    // Build hits whose joined block exceeds MEMORY_CHAR_CAP (1500).
+    // Each line: "- " + value. We make values ~200 chars each so 8 hits ≈ 1600 chars.
+    const longValue = 'A'.repeat(196) // "- " + 196 = 198 chars per line; 8 lines = 1584 > 1500
+    const hits = Array.from({ length: 8 }, (_, i) => ({
+      key: `k${i}`,
+      value: `${longValue}-${i}`,
+      score: 0.9 - i * 0.05,
+    }))
+    const memoryStore = makeMockMemoryStore(hits)
+    const screenContent = vi.fn().mockResolvedValue({ safe: true, threats: [] })
+    const ctx: P1Context = {
+      phase: 'P1',
+      idea: 'Build a service with lots of prior context',
+      memoryStore,
+      screenContent,
+    }
+    const instruction = await buildP1Instruction(ctx, '/tmp/p1-spec.json')
+
+    // Extract the memory block section
+    const memoryIdx = instruction.indexOf('## Prior memory (screened)')
+    expect(memoryIdx).toBeGreaterThan(-1)
+    const memorySection = instruction.slice(memoryIdx)
+
+    // The block must end with '...(truncated)' (because it exceeded the cap)
+    expect(memorySection).toContain('...(truncated)')
+
+    // There must be no partial trailing line: every line before '...(truncated)'
+    // that starts with "- " must be a complete value (not cut mid-character).
+    // Strategy: extract lines between the heading and the truncation marker;
+    // each "- " line must end exactly at the end of a full value (no partial 'A' strings
+    // that are shorter than the full longValue length without the index suffix).
+    const truncMarker = '...(truncated)'
+    const beforeTrunc = memorySection.slice(0, memorySection.indexOf(truncMarker))
+    const lines = beforeTrunc.split('\n').filter(l => l.startsWith('- '))
+
+    // Every bullet line must be one of the complete injected values (no mid-cut).
+    for (const line of lines) {
+      // Each line is "- <longValue>-<i>" — the value part must NOT be truncated in the middle.
+      // A truncated line would not end with "-<digit>" pattern.
+      // Simply assert the line length equals a full injected-line length.
+      const value = line.slice(2) // remove "- "
+      expect(value).toMatch(new RegExp(`^${longValue}-\\d$`))
+    }
   })
 })

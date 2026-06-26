@@ -112,6 +112,8 @@ export class Controller {
   private currentSizing: Sizing = DEFAULT_SIZING
   private currentTier: ComplexityTier = 'M'
   private currentRunId = ''
+  /** Fix #1: set true after the first terminal store so _escalate cannot double-store. */
+  private _terminalStored = false
 
   constructor(
     private readonly pi: ExtensionAPI,
@@ -399,6 +401,7 @@ export class Controller {
       this.currentRunId = `run-${crypto.randomUUID()}`
       this.currentSizing = tierSizing('M')
       this.currentTier = 'M'
+      this._terminalStored = false // Fix #1: reset per-run so consecutive runs don't share state
       const pi = this.pi as unknown as { setThinkingLevel?: (level: string) => void }
       pi.setThinkingLevel?.(this.currentSizing.thinkingLevel)
 
@@ -586,12 +589,15 @@ export class Controller {
         bugPattern: 'none',
         convention: this.currentTier,
       })
+      // Fix #1: guard terminalStored so _escalate (catch below) cannot double-store
+      // if lifecycle.release() or transparency.log() throws after we store here.
+      this._terminalStored = true
       try {
         await this.opts.memoryStore?.store(this.currentRunId, successLesson, {
           tier: this.currentTier,
           outcome: 'success',
         })
-      } catch { /* store failure must not break the run */ }
+      } catch (e) { void this.opts.transparency.log(`memory store failed: ${e}`) } // Fix #3
 
       // All done
       await this.lifecycle.release()
@@ -617,12 +623,16 @@ export class Controller {
         bugPattern: phase,
         convention: 'halted',
       })
-      try {
-        await this.opts.memoryStore?.store(this.currentRunId, reason, {
-          tier: this.currentTier,
-          outcome: 'halted',
-        })
-      } catch { /* store failure must not break the run */ }
+      // Fix #1: skip store if already stored (prevents double-store on success→catch path)
+      if (!this._terminalStored) {
+        this._terminalStored = true
+        try {
+          await this.opts.memoryStore?.store(this.currentRunId, reason, {
+            tier: this.currentTier,
+            outcome: 'halted',
+          })
+        } catch (e) { void this.opts.transparency.log(`memory store failed: ${e}`) } // Fix #3
+      }
     }
     await this.lifecycle.release()
   }
@@ -639,6 +649,17 @@ export class Controller {
         bugPattern: phase,
         convention: 'operator-brief',
       })
+      // Fix #2: store to memoryStore on operator-brief terminal path (symmetric with _escalate)
+      // Fix #1: respect terminalStored to prevent double-store
+      if (!this._terminalStored) {
+        this._terminalStored = true
+        try {
+          await this.opts.memoryStore?.store(this.currentRunId, brief.slice(0, 200), {
+            tier: this.currentTier,
+            outcome: 'operator-brief',
+          })
+        } catch (e) { void this.opts.transparency.log(`memory store failed: ${e}`) } // Fix #3
+      }
     }
     await this.lifecycle.release()
   }

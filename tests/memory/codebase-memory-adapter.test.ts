@@ -263,8 +263,9 @@ describe('S2-M6: CodebaseMemoryAdapter — tools/call envelope', () => {
 
   it('sends tools/call for index_status before index_repository in ensureIndexed', async () => {
     const proc = buildAutoProc([
-      // index_status → not ready (throws → falls through to index_repository)
-      // Actually we test the already-indexed path here:
+      // ensureIndexed now calls list_projects first to discover the real project name
+      { projects: ['root-pi-autodev'] },
+      // then index_status
       { project: 'root-pi-autodev', status: 'ready', nodes: 100, edges: 200 },
     ])
     spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
@@ -280,9 +281,12 @@ describe('S2-M6: CodebaseMemoryAdapter — tools/call envelope', () => {
       .map((l) => { try { return JSON.parse(l.trim()) as Record<string, unknown> } catch { return null } })
       .filter((m) => m?.method === 'tools/call')
 
-    expect(toolCalls[0]).toBeDefined()
-    const params0 = toolCalls[0]?.params as { name: string; arguments: Record<string, unknown> }
-    expect(params0.name).toBe('index_status')
+    // list_projects is now called first; index_status must still appear
+    const toolNames = toolCalls.map((m) => (m?.params as { name: string })?.name)
+    expect(toolNames).toContain('index_status')
+    const idxStatus = toolCalls.find((m) => (m?.params as { name: string })?.name === 'index_status')
+    expect(idxStatus).toBeDefined()
+    const params0 = idxStatus?.params as { name: string; arguments: Record<string, unknown> }
     expect(params0.arguments).toHaveProperty('project', 'root-pi-autodev')
   })
 
@@ -313,7 +317,13 @@ describe('S2-M6: CodebaseMemoryAdapter — tools/call envelope', () => {
           })
         } else if (msg['method'] === 'tools/call') {
           const params = msg['params'] as { name: string }
-          if (params.name === 'index_status') {
+          if (params.name === 'list_projects') {
+            // ensureIndexed now calls list_projects first
+            emitLine(proc, {
+              jsonrpc: '2.0', id: msg['id'],
+              result: { content: [{ type: 'text', text: JSON.stringify({ projects: [] }) }] },
+            })
+          } else if (params.name === 'index_status') {
             // Return a non-ready status to trigger index_repository
             emitLine(proc, {
               jsonrpc: '2.0', id: msg['id'],
@@ -352,6 +362,8 @@ describe('S2-M6: CodebaseMemoryAdapter — findCallers → trace_path', () => {
 
   it('sends trace_path with direction:inbound and depth:2', async () => {
     const proc = buildAutoProc([
+      // list_projects (ensureIndexed step 1)
+      { projects: ['root-pi-autodev'] },
       // index_status
       { project: 'root-pi-autodev', status: 'ready' },
       // trace_path
@@ -393,6 +405,8 @@ describe('S2-M6: CodebaseMemoryAdapter — findCallers → trace_path', () => {
     }
 
     const proc = buildAutoProc([
+      // list_projects (ensureIndexed step 1)
+      { projects: ['root-pi-autodev'] },
       { project: 'root-pi-autodev', status: 'ready' },
       traceResult,
     ])
@@ -405,11 +419,12 @@ describe('S2-M6: CodebaseMemoryAdapter — findCallers → trace_path', () => {
     expect(Array.isArray(callers)).toBe(true)
     expect(callers.length).toBe(2)
 
-    // Each CallerRef must have file, line, symbol
+    // Each CallerRef must have file and symbol; line is optional (hop ≠ line number)
     for (const c of callers) {
       expect(typeof c.file).toBe('string')
-      expect(typeof c.line).toBe('number')
       expect(typeof c.symbol).toBe('string')
+      // line should NOT be set for real MCP results (hop is not a line number)
+      expect(c.line).toBeUndefined()
     }
 
     // Symbol names come from the name field
@@ -423,6 +438,7 @@ describe('S2-M6: CodebaseMemoryAdapter — findCallers → trace_path', () => {
 
   it('returns empty array when trace_path returns no callers', async () => {
     const proc = buildAutoProc([
+      { projects: ['root-pi-autodev'] },
       { project: 'root-pi-autodev', status: 'ready' },
       { function: 'unknown', direction: 'inbound', callers: [] },
     ])
@@ -437,6 +453,7 @@ describe('S2-M6: CodebaseMemoryAdapter — findCallers → trace_path', () => {
 
   it('returns empty array when trace_path result has no callers field', async () => {
     const proc = buildAutoProc([
+      { projects: ['root-pi-autodev'] },
       { project: 'root-pi-autodev', status: 'ready' },
       { function: 'noop', direction: 'inbound' },
     ])
@@ -451,11 +468,12 @@ describe('S2-M6: CodebaseMemoryAdapter — findCallers → trace_path', () => {
 
   it('project is cached after first ensureIndexed — only one index_status call', async () => {
     const proc = buildAutoProc([
-      // First ensureIndexed: index_status
+      // First ensureIndexed: list_projects then index_status
+      { projects: ['root-pi-autodev'] },
       { project: 'root-pi-autodev', status: 'ready' },
       // First findCallers: trace_path
       { function: 'execute', direction: 'inbound', callers: [] },
-      // Second findCallers: trace_path (no index_status again)
+      // Second findCallers: trace_path (no list_projects/index_status again)
       { function: 'execute', direction: 'inbound', callers: [] },
     ])
     spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
@@ -470,6 +488,8 @@ describe('S2-M6: CodebaseMemoryAdapter — findCallers → trace_path', () => {
       .filter((m) => m?.method === 'tools/call')
       .map((m) => (m!.params as { name: string }).name)
 
+    // Only one list_projects call (cached after first ensureIndexed)
+    expect(toolCalls.filter((n) => n === 'list_projects')).toHaveLength(1)
     // Only one index_status call (cached after first)
     expect(toolCalls.filter((n) => n === 'index_status')).toHaveLength(1)
     // Two trace_path calls
@@ -574,6 +594,8 @@ describe('S2-M6: CodebaseMemoryAdapter — getArchitecture', () => {
   it('calls get_architecture tool and returns JSON string', async () => {
     const archPayload = { project: 'root-pi-autodev', total_nodes: 894, packages: [] }
     const proc = buildAutoProc([
+      // list_projects (ensureIndexed step 1)
+      { projects: ['root-pi-autodev'] },
       { project: 'root-pi-autodev', status: 'ready' },
       archPayload,
     ])
@@ -586,6 +608,269 @@ describe('S2-M6: CodebaseMemoryAdapter — getArchitecture', () => {
     const parsed = JSON.parse(arch) as { project: string; total_nodes: number }
     expect(parsed.project).toBe('root-pi-autodev')
     expect(parsed.total_nodes).toBe(894)
+  })
+})
+
+// ─── New tests: previously-untested paths (post-review) ──────────────────────
+
+describe('S2-M6: CodebaseMemoryAdapter — post-init child close resets state', () => {
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('after initialized child closes, next callTool re-spawns a fresh process', async () => {
+    // First proc: fully initializes, then dies
+    const proc1 = buildAutoProc([{ projects: [] }])
+    // Second proc: ready to serve the re-spawned ensureConnected + callTool
+    const proc2 = buildAutoProc([{ projects: [] }])
+
+    spawnMock
+      .mockReturnValueOnce(proc1 as unknown as ReturnType<typeof spawn>)
+      .mockReturnValueOnce(proc2 as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({ mock: false })
+
+    // Drive first healthCheck so proc1 is fully initialized
+    await adapter.healthCheck()
+    expect(spawnMock).toHaveBeenCalledTimes(1)
+
+    // Simulate the child closing AFTER init (post-init close)
+    proc1.emit('close', 0)
+
+    // Next healthCheck must re-spawn (proc2)
+    await adapter.healthCheck()
+    expect(spawnMock).toHaveBeenCalledTimes(2)
+
+    adapter.close()
+  })
+})
+
+describe('S2-M6: CodebaseMemoryAdapter — callTool rejects fast when proc is dead', () => {
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('rejects with BackendUnavailableError immediately if proc is null after connect', async () => {
+    // Proc1: initializes successfully, serves one healthCheck (list_projects), then we kill it.
+    // Proc2: never spawned — the adapter should reject fast, not wait for a new spawn.
+    const proc = buildAutoProc([{ projects: [] }])
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({ mock: false, timeoutMs: 500 })
+
+    // Fully initialize via healthCheck
+    await adapter.healthCheck()
+
+    // Kill the proc so this.proc becomes null and initialized resets
+    proc.emit('close', 1)
+
+    // Allow the close handler to run
+    await new Promise<void>((r) => setImmediate(r))
+
+    // Next healthCheck must re-spawn. But if we don't mock a second proc,
+    // spawn returns undefined which causes a BackendUnavailableError on connect.
+    // The key invariant: we do NOT hang until timeoutMs — the error is immediate.
+    spawnMock.mockImplementation(() => {
+      throw new Error('spawn failed: no binary')
+    })
+
+    const start = Date.now()
+    const health = await adapter.healthCheck()
+    const elapsed = Date.now() - start
+
+    expect(health.ok).toBe(false)
+    // Should fail fast (well under the 500ms timeout) because spawn throws synchronously
+    expect(elapsed).toBeLessThan(400)
+
+    adapter.close()
+  })
+})
+
+describe('S2-M6: CodebaseMemoryAdapter — ensureIndexed validates project name', () => {
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('throws BackendUnavailableError when index_repository returns no project name', async () => {
+    const proc = buildFakeProc()
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({
+      mock: false,
+      repoRoot: '/root/pi-autodev',
+      timeoutMs: 2000,
+    })
+
+    const origWrite = proc.stdin.write.bind(proc.stdin)
+    proc.stdin.write = (data: string, cb?: (err?: Error | null) => void) => {
+      origWrite(data, cb)
+      let msg: Record<string, unknown>
+      try { msg = JSON.parse(data.trim()) } catch { return }
+
+      setImmediate(() => {
+        if (msg['method'] === 'initialize') {
+          emitLine(proc, {
+            jsonrpc: '2.0', id: msg['id'],
+            result: { protocolVersion: '2024-11-05', serverInfo: {}, capabilities: { tools: {} } },
+          })
+        } else if (msg['method'] === 'tools/call') {
+          const params = msg['params'] as { name: string }
+          if (params.name === 'list_projects') {
+            // Return empty project list — forces fall-through to index_repository
+            emitLine(proc, {
+              jsonrpc: '2.0', id: msg['id'],
+              result: { content: [{ type: 'text', text: JSON.stringify({ projects: [] }) }] },
+            })
+          } else if (params.name === 'index_status') {
+            // Not ready
+            emitLine(proc, {
+              jsonrpc: '2.0', id: msg['id'],
+              result: { content: [{ type: 'text', text: JSON.stringify({ project: 'root-pi-autodev', status: 'not_indexed' }) }] },
+            })
+          } else if (params.name === 'index_repository') {
+            // Return no project name — triggers the validation throw
+            emitLine(proc, {
+              jsonrpc: '2.0', id: msg['id'],
+              result: { content: [{ type: 'text', text: JSON.stringify({ project: '', status: 'indexed' }) }] },
+            })
+          }
+        }
+      })
+    }
+
+    await expect(adapter.ensureIndexed()).rejects.toThrow(BackendUnavailableError)
+    await expect(adapter.ensureIndexed()).rejects.toThrow(/no project name/)
+    adapter.close()
+  })
+})
+
+describe('S2-M6: CodebaseMemoryAdapter — _drainLines CRLF handling', () => {
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('parses CRLF-terminated JSON lines correctly', async () => {
+    const proc = buildFakeProc()
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({ mock: false, timeoutMs: 2000 })
+
+    // Intercept writes and respond with CRLF-terminated lines
+    const origWrite = proc.stdin.write.bind(proc.stdin)
+    proc.stdin.write = (data: string, cb?: (err?: Error | null) => void) => {
+      origWrite(data, cb)
+      let msg: Record<string, unknown>
+      try { msg = JSON.parse(data.trim()) } catch { return }
+
+      setImmediate(() => {
+        if (msg['method'] === 'initialize') {
+          // Respond with \r\n line ending — tests that _drainLines strips \r
+          proc.stdout.emit('data', Buffer.from(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: msg['id'],
+              result: { protocolVersion: '2024-11-05', serverInfo: {}, capabilities: { tools: {} } },
+            }) + '\r\n'
+          ))
+        } else if (msg['method'] === 'tools/call') {
+          // Respond to list_projects with \r\n
+          proc.stdout.emit('data', Buffer.from(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: msg['id'],
+              result: { content: [{ type: 'text', text: JSON.stringify({ projects: [] }) }] },
+            }) + '\r\n'
+          ))
+        }
+      })
+    }
+
+    // healthCheck drives init + list_projects — both responses use \r\n
+    const health = await adapter.healthCheck()
+    adapter.close()
+
+    // If _drainLines didn't strip \r, JSON.parse would have thrown and health.ok would be false
+    expect(health.ok).toBe(true)
+  })
+})
+
+describe('S2-M6: CodebaseMemoryAdapter — RPC error includes error.data', () => {
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('includes error.data in the thrown BackendUnavailableError message', async () => {
+    const proc = buildFakeProc()
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({ mock: false, timeoutMs: 2000 })
+
+    const origWrite = proc.stdin.write.bind(proc.stdin)
+    proc.stdin.write = (data: string, cb?: (err?: Error | null) => void) => {
+      origWrite(data, cb)
+      let msg: Record<string, unknown>
+      try { msg = JSON.parse(data.trim()) } catch { return }
+
+      setImmediate(() => {
+        if (msg['method'] === 'initialize') {
+          emitLine(proc, {
+            jsonrpc: '2.0', id: msg['id'],
+            result: { protocolVersion: '2024-11-05', serverInfo: {}, capabilities: { tools: {} } },
+          })
+        } else if (msg['method'] === 'tools/call') {
+          // Return RPC error with error.data
+          emitLine(proc, {
+            jsonrpc: '2.0', id: msg['id'],
+            error: { code: -32603, message: 'Internal error', data: { detail: 'disk full' } },
+          })
+        }
+      })
+    }
+
+    let thrownErr: Error | null = null
+    try {
+      await adapter.healthCheck()
+    } catch (e) {
+      thrownErr = e as Error
+    }
+
+    // healthCheck catches and returns ok:false — check the details string
+    const health = await adapter.healthCheck()
+    // Re-drive: the above healthCheck already connected. Call a tool directly.
+    adapter.close()
+
+    // Drive a fresh adapter to get the raw error
+    const proc2 = buildFakeProc()
+    spawnMock.mockReturnValue(proc2 as unknown as ReturnType<typeof spawn>)
+    const adapter2 = new CodebaseMemoryAdapter({ mock: false, timeoutMs: 2000 })
+
+    const origWrite2 = proc2.stdin.write.bind(proc2.stdin)
+    proc2.stdin.write = (data: string, cb?: (err?: Error | null) => void) => {
+      origWrite2(data, cb)
+      let msg: Record<string, unknown>
+      try { msg = JSON.parse(data.trim()) } catch { return }
+      setImmediate(() => {
+        if (msg['method'] === 'initialize') {
+          emitLine(proc2, {
+            jsonrpc: '2.0', id: msg['id'],
+            result: { protocolVersion: '2024-11-05', serverInfo: {}, capabilities: { tools: {} } },
+          })
+        } else if (msg['method'] === 'tools/call') {
+          emitLine(proc2, {
+            jsonrpc: '2.0', id: msg['id'],
+            error: { code: -32603, message: 'Internal error', data: { detail: 'disk full' } },
+          })
+        }
+      })
+    }
+
+    const health2 = await adapter2.healthCheck()
+    adapter2.close()
+
+    expect(health2.ok).toBe(false)
+    expect(health2.details).toContain('disk full')
+    void thrownErr
+    void health
   })
 })
 

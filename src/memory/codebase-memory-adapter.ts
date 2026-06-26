@@ -15,7 +15,9 @@ import { spawn, type ChildProcess } from 'child_process'
 
 export interface CallerRef {
   file: string
-  line: number
+  /** Source line number. Present in mock data; omitted for real MCP results
+   *  where the server returns graph hop-distance, not a line number. */
+  line?: number
   symbol?: string
 }
 
@@ -147,7 +149,7 @@ class McpClient {
 
       try {
         proc = spawn(this.binaryPath, [], {
-          stdio: ['pipe', 'pipe', 'pipe'],
+          stdio: ['pipe', 'pipe', 'ignore'],
           shell: false,
         })
       } catch (err) {
@@ -174,6 +176,10 @@ class McpClient {
         if (!this.initialized) {
           this.initPromise = null
           reject(bErr)
+        } else {
+          // Post-init error: reset so next ensureConnected() re-spawns
+          this.initialized = false
+          this.initPromise = null
         }
         // Reject all pending calls
         for (const [, p] of this.pending) {
@@ -181,6 +187,7 @@ class McpClient {
           p.reject(bErr)
         }
         this.pending.clear()
+        this.proc = null
       })
 
       proc.on('close', (exitCode: number | null) => {
@@ -190,6 +197,10 @@ class McpClient {
         if (!this.initialized) {
           this.initPromise = null
           reject(bErr)
+        } else {
+          // Post-init close: reset so next ensureConnected() re-spawns
+          this.initialized = false
+          this.initPromise = null
         }
         for (const [, p] of this.pending) {
           clearTimeout(p.timer)
@@ -214,6 +225,8 @@ class McpClient {
 
       // Register resolver for the initialize response
       const initTimer = setTimeout(() => {
+        // Remove the pending resolver so a late response doesn't run the success path
+        this.pending.delete(initId)
         this.initPromise = null
         reject(new BackendUnavailableError(
           `codebase-memory-mcp initialize timed out after ${this.timeoutMs}ms`
@@ -252,6 +265,13 @@ class McpClient {
    */
   async callTool<T>(name: string, args: Record<string, unknown>): Promise<T> {
     await this.ensureConnected()
+
+    // Liveness check: if the proc died between ensureConnected() and here, fail fast
+    if (!this.proc) {
+      return Promise.reject(new BackendUnavailableError(
+        `codebase-memory-mcp process is not running (died after initialization)`
+      ))
+    }
 
     return new Promise<T>((resolve, reject) => {
       const id = ++this.idCounter
@@ -337,7 +357,8 @@ class McpClient {
     this.stdoutBuf = lines.pop() ?? ''
 
     for (const line of lines) {
-      const trimmed = line.trim()
+      // Strip \r so CRLF-terminated lines don't break JSON.parse
+      const trimmed = line.replace(/\r$/, '').trim()
       if (!trimmed) continue
       this._dispatch(trimmed)
     }
@@ -360,8 +381,11 @@ class McpClient {
     this.pending.delete(msg.id)
 
     if (isRpcError(msg)) {
+      const dataStr = msg.error.data !== undefined
+        ? ` data=${JSON.stringify(msg.error.data)}`
+        : ''
       pending.reject(new BackendUnavailableError(
-        `codebase-memory-mcp RPC error ${msg.error.code}: ${msg.error.message}`
+        `codebase-memory-mcp RPC error ${msg.error.code}: ${msg.error.message}${dataStr}`
       ))
     } else {
       pending.resolve((msg as JsonRpcSuccess<unknown>).result)
@@ -418,25 +442,40 @@ export class CodebaseMemoryAdapter {
   }
 
   /**
-   * Ensure the repo is indexed. Calls index_status; if not ready, calls
-   * index_repository. Caches the project name on the adapter.
+   * Ensure the repo is indexed. Calls list_projects to discover the real server
+   * project name (avoiding slug-reconstruction mismatches), then index_status,
+   * then index_repository if needed. Caches the project name on the adapter.
    */
   async ensureIndexed(): Promise<void> {
     if (this.mock) return
     if (this.projectName) return
 
-    // Derive a candidate project name from the repo path (matches server convention)
+    // Derive a candidate project name from the repo path (fallback convention)
     // e.g. /root/pi-autodev → root-pi-autodev
     const segments = this.repoRoot.replace(/^\//, '').split('/')
     const candidateProject = segments.join('-')
 
+    // Prefer list_projects to discover the real server-assigned project name
+    // (avoids slug-reconstruction mismatches between client and server).
+    let resolvedProject = candidateProject
+    try {
+      const listed = await this.client!.callTool<ListProjectsResult>('list_projects', {})
+      const found = listed.projects?.find((p) => p === candidateProject)
+      if (found) {
+        resolvedProject = found
+      }
+      // If not in the list, fall through to index_status / index_repository
+    } catch {
+      // list_projects failed — proceed with reconstructed name
+    }
+
     // Try index_status first
     try {
       const status = await this.client!.callTool<IndexStatusResult>('index_status', {
-        project: candidateProject,
+        project: resolvedProject,
       })
       if (status.status === 'ready') {
-        this.projectName = candidateProject
+        this.projectName = resolvedProject
         return
       }
     } catch {
@@ -447,6 +486,11 @@ export class CodebaseMemoryAdapter {
     const indexed = await this.client!.callTool<IndexRepositoryResult>('index_repository', {
       repo_path: this.repoRoot,
     })
+    if (!indexed.project) {
+      throw new BackendUnavailableError(
+        'codebase-memory-mcp index_repository returned no project name'
+      )
+    }
     this.projectName = indexed.project
   }
 
@@ -488,7 +532,8 @@ export class CodebaseMemoryAdapter {
     const callers = result.callers ?? []
     return callers.map((c) => {
       const file = qualifiedNameToFile(c.qualified_name, this.projectName!)
-      return { file, line: c.hop, symbol: c.name }
+      // hop is graph traversal distance, not a source line number — omit line
+      return { file, symbol: c.name }
     })
   }
 

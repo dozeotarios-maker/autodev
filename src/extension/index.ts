@@ -5,7 +5,7 @@
 // Port interfaces only for Verifier, GitOps, Judge — no concrete imports from
 // src/verify or src/git (those belong to Lane β). Concretes are injected via opts.
 
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
+import type { ExtensionAPI, SessionShutdownEvent } from '@earendil-works/pi-coding-agent'
 import type {
   MemoryStore,
   Embedder,
@@ -385,4 +385,14 @@ export default function autodevExtension(pi: ExtensionAPI): void {
 
   controller.wire()
   controller.registerCommands()
+
+  // Fix #8: dispose the long-lived codebaseMemory child process on session teardown.
+  // pi provides `session_shutdown` which fires on /quit, SIGINT, SIGTERM, and session
+  // replacement — the correct hook for releasing long-lived resources.
+  // Process signal handlers are NOT registered here: pi already emits session_shutdown
+  // on SIGINT/SIGTERM (confirmed in CHANGELOG: "session_shutdown fires on SIGTERM/SIGHUP
+  // in interactive, print, and RPC modes so extensions can run shutdown cleanup").
+  pi.on('session_shutdown', (_e: SessionShutdownEvent, _ctx) => {
+    try { codebaseMemory.dispose() } catch { /* idempotent — swallow if already closed */ }
+  })
 }

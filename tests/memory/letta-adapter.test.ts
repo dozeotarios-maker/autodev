@@ -334,9 +334,9 @@ describe('S2-M6: LettaAdapter — ensureAgent (stubbed fetch)', () => {
     const adapter = new LettaAdapter({ baseUrl: BASE })
     await adapter.recall('anything')
 
-    // First call: list agents
+    // First call: list agents (may include ?name= filter)
     const [listUrl] = fetchMock.mock.calls[0] as [string, RequestInit]
-    expect(listUrl).toBe(`${BASE}/v1/agents/`)
+    expect(listUrl).toContain(`${BASE}/v1/agents/`)
 
     // Second call: search uses the resolved id
     const [searchUrl] = fetchMock.mock.calls[1] as [string, RequestInit]
@@ -429,5 +429,271 @@ describe('S2-M6: LettaAdapter — ensureAgent (stubbed fetch)', () => {
     // Must go straight to archival-memory, not to the agent list/create endpoint
     expect(url).toContain('/archival-memory')
     expect(url).not.toBe(`${BASE}/v1/agents/`)
+  })
+})
+
+// ─── New tests: previously-untested paths (post-review) ──────────────────────
+
+describe('S2-M6: LettaAdapter — concurrent ensureAgent yields exactly ONE create', () => {
+  const BASE = 'http://localhost:8283'
+
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('concurrent first calls create exactly one agent, not two', async () => {
+    // Both concurrent calls will race ensureAgent. The promise-cache fix ensures
+    // only one list+create sequence is executed.
+    let listCallCount = 0
+    let createCallCount = 0
+
+    fetchMock.mockImplementation(async (url: string, opts?: RequestInit) => {
+      const u = url as string
+      if (u.includes('/v1/agents/') && (!opts || opts.method !== 'POST')) {
+        listCallCount++
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [], // no existing agents
+          text: async () => '[]',
+        }
+      }
+      if (u.includes('/v1/agents/') && opts?.method === 'POST') {
+        createCallCount++
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: 'agent-created-once', name: 'pi-autodev-memory' }),
+          text: async () => '',
+        }
+      }
+      // archival-memory store
+      return { ok: true, status: 200, json: async () => [], text: async () => '' }
+    })
+
+    const adapter = new LettaAdapter({ baseUrl: BASE })
+
+    // Fire two concurrent ensureAgent calls
+    const [id1, id2] = await Promise.all([adapter.ensureAgent(), adapter.ensureAgent()])
+
+    expect(id1).toBe('agent-created-once')
+    expect(id2).toBe('agent-created-once')
+    // Only one list and one create despite two concurrent calls
+    expect(listCallCount).toBe(1)
+    expect(createCallCount).toBe(1)
+  })
+})
+
+describe('S2-M6: LettaAdapter — recall maps missing content to empty string and filters', () => {
+  const BASE = 'http://localhost:8283'
+  const AGENT_ID = 'agent-test-001'
+
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('passage with only text field maps to value and is included', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        results: [
+          { id: 'p1', text: 'value from text field' },   // text not content
+          { id: 'p2', content: 'value from content field' },
+        ],
+        count: 2,
+      }),
+    })
+    const adapter = new LettaAdapter({ baseUrl: BASE, agentId: AGENT_ID })
+    const results = await adapter.recall('query')
+    expect(results).toHaveLength(2)
+    expect(results[0]!.value).toBe('value from text field')
+    expect(results[1]!.value).toBe('value from content field')
+  })
+
+  it('passage with neither content nor text is filtered out', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        results: [
+          { id: 'p1', content: 'good passage' },
+          { id: 'p2' },  // no content, no text — should be filtered
+        ],
+        count: 2,
+      }),
+    })
+    const adapter = new LettaAdapter({ baseUrl: BASE, agentId: AGENT_ID })
+    const results = await adapter.recall('query')
+    expect(results).toHaveLength(1)
+    expect(results[0]!.key).toBe('p1')
+  })
+
+  it('uses server score when present instead of hardcoded 0.5', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        results: [
+          { id: 'p1', content: 'high score passage', score: 0.92 },
+          { id: 'p2', content: 'no score passage' },
+        ],
+        count: 2,
+      }),
+    })
+    const adapter = new LettaAdapter({ baseUrl: BASE, agentId: AGENT_ID })
+    const results = await adapter.recall('query')
+    expect(results[0]!.score).toBe(0.92)
+    expect(results[1]!.score).toBe(0.5)  // fallback when no score
+  })
+
+  it('clamps limit to 50 max', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ results: [], count: 0 }),
+    })
+    const adapter = new LettaAdapter({ baseUrl: BASE, agentId: AGENT_ID })
+    await adapter.recall('query', 999)
+    const [url] = fetchMock.mock.calls[0] as [string]
+    expect(url).toContain('limit=50')
+    expect(url).not.toContain('limit=999')
+  })
+
+  it('truncates query to 1000 chars', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ results: [], count: 0 }),
+    })
+    const adapter = new LettaAdapter({ baseUrl: BASE, agentId: AGENT_ID })
+    const longQuery = 'x'.repeat(2000)
+    await adapter.recall(longQuery)
+    const [url] = fetchMock.mock.calls[0] as [string]
+    // Decoded query param length must be <= 1000
+    const params = new URL(url).searchParams
+    expect(params.get('query')!.length).toBeLessThanOrEqual(1000)
+  })
+})
+
+describe('S2-M6: LettaAdapter — agent list pagination/non-array shape', () => {
+  const BASE = 'http://localhost:8283'
+
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('handles { agents: [...] } wrapped response shape', async () => {
+    // Server returns { agents: [...] } instead of bare array
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ agents: [{ id: 'wrapped-agent-id', name: 'pi-autodev-memory' }] }),
+    })
+    // store call
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [],
+      text: async () => '',
+    })
+
+    const adapter = new LettaAdapter({ baseUrl: BASE })
+    await adapter.store('k', 'v')
+
+    const [storeUrl] = fetchMock.mock.calls[1] as [string]
+    expect(storeUrl).toContain('wrapped-agent-id')
+  })
+
+  it('handles empty non-array body gracefully (creates new agent)', async () => {
+    // Server returns unexpected shape — treated as empty list → create
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ unexpected: 'shape' }),
+    })
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: 'fallback-agent-id', name: 'pi-autodev-memory' }),
+    })
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [],
+      text: async () => '',
+    })
+
+    const adapter = new LettaAdapter({ baseUrl: BASE })
+    await adapter.store('k', 'v')
+
+    const [storeUrl] = fetchMock.mock.calls[2] as [string]
+    expect(storeUrl).toContain('fallback-agent-id')
+  })
+})
+
+describe('S2-M6: LettaAdapter — fetch timeout wired on store/recall/ensureAgent', () => {
+  const BASE = 'http://localhost:8283'
+  const AGENT_ID = 'agent-test-001'
+
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('store passes an AbortSignal to fetch', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [],
+      text: async () => '',
+    })
+    const adapter = new LettaAdapter({ baseUrl: BASE, agentId: AGENT_ID })
+    await adapter.store('k', 'v')
+
+    const [, opts] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(opts.signal).toBeDefined()
+    expect(opts.signal).not.toBeNull()
+  })
+
+  it('recall passes an AbortSignal to fetch', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ results: [], count: 0 }),
+    })
+    const adapter = new LettaAdapter({ baseUrl: BASE, agentId: AGENT_ID })
+    await adapter.recall('q')
+
+    const [, opts] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(opts.signal).toBeDefined()
+    expect(opts.signal).not.toBeNull()
   })
 })

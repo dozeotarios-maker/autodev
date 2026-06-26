@@ -29,27 +29,34 @@ const MEMORY_CHAR_CAP = 1500
  */
 async function recallMemoryBlock(ctx: P1Context): Promise<string | undefined> {
   if (!ctx.memoryStore) return undefined
+  // Fix #6: fail-closed — if memoryStore is present but screenContent is absent,
+  // we cannot safely screen recalled hits → drop all hits rather than inject unscreened content.
+  if (!ctx.screenContent) return undefined
   try {
     const hits = await ctx.memoryStore.recall(ctx.idea, 3)
     const safeLines: string[] = []
     for (const hit of hits) {
+      // Fix #4: screen the exact string that will be injected (the full "- value" line),
+      // not just hit.value, so the screener sees what the model actually receives.
+      const injectedLine = `- ${hit.value}`
       let safe = true
-      if (ctx.screenContent) {
-        try {
-          const result = await ctx.screenContent(hit.value, 'repo')
-          if (!result.safe) { safe = false }
-        } catch {
-          // screening error → drop the hit (fail-safe)
-          safe = false
-        }
+      try {
+        const result = await ctx.screenContent(injectedLine, 'repo')
+        if (!result.safe) { safe = false }
+      } catch {
+        // screening error → drop the hit (fail-safe)
+        safe = false
       }
       if (safe) {
-        safeLines.push(`- ${hit.value}`)
+        safeLines.push(injectedLine)
       }
     }
     if (safeLines.length === 0) return undefined
     const block = safeLines.join('\n')
-    const capped = block.length > MEMORY_CHAR_CAP ? block.slice(0, MEMORY_CHAR_CAP) + '\n...(truncated)' : block
+    // Fix #5: truncate at a line boundary to avoid partial/malformed trailing bullets.
+    const capped = block.length > MEMORY_CHAR_CAP
+      ? block.slice(0, MEMORY_CHAR_CAP).replace(/\n[^\n]*$/, '') + '\n...(truncated)'
+      : block
     return capped
   } catch {
     // backend error → degrade silently
@@ -57,8 +64,8 @@ async function recallMemoryBlock(ctx: P1Context): Promise<string | undefined> {
   }
 }
 
-export async function buildP1Instruction(ctx: P1Context, outputFile: string): Promise<string>
-export function buildP1Instruction(ctx: P1Context, outputFile: string): string | Promise<string>
+// Fix #7: collapsed to a single overload — the async path only activates when memoryStore
+// is present; callers that don't need to await can check ctx.memoryStore themselves.
 export function buildP1Instruction(ctx: P1Context, outputFile: string): string | Promise<string> {
   const base = [
     ROLE_DIRECTIVES,
