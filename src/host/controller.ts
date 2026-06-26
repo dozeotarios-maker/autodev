@@ -58,7 +58,9 @@ export function compactAsync(ctx: ExtensionContext): Promise<void> {
       onComplete: () => resolve(),
       onError: (err: Error) => {
         // "Nothing to compact" on a small session at a phase boundary is benign — skip it.
-        if (/nothing to compact|too small/i.test(err.message)) {
+        // "Already compacted" fires on back-to-back zero-work compaction at phase boundaries
+        // (the session hasn't grown since the last compaction). Also benign — skip it.
+        if (/nothing to compact|too small|already compacted/i.test(err.message)) {
           resolve()
         } else {
           reject(err)

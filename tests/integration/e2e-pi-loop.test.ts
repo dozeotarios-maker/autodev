@@ -99,8 +99,11 @@ function makeTurnEndEvent(): TurnEndEvent {
   } as unknown as TurnEndEvent
 }
 
-function makeInputEvent(text: string): InputEvent {
-  return { type: 'input', text, source: 'user' } as unknown as InputEvent
+function makeInputEvent(text: string, source: 'interactive' | 'rpc' | 'extension' = 'interactive'): InputEvent {
+  // Default 'interactive' — the realistic source for human-typed ideas.
+  // (The old default 'user' is not a real InputSource value; real values are
+  // interactive | rpc | extension per the pi SDK InputSource type.)
+  return { type: 'input', text, source } as unknown as InputEvent
 }
 
 function makeSessionStartEvent(): SessionStartEvent {
@@ -951,5 +954,56 @@ describe('S2-M8: tool_call H1 gate in e2e wiring', () => {
 
     const result = fire('tool_call', toolCallEvent) as { block?: boolean } | undefined
     expect(result?.block).toBeFalsy()
+  })
+})
+
+// ── source=extension input is ignored (self-steer filter, realistic source) ───
+//
+// Fix #3 (LOW): makeInputEvent previously used source:'user' which is not a real
+// InputSource value. All inputs now use realistic sources (interactive | rpc | extension).
+// This test verifies source='extension' is filtered and does NOT start a run.
+
+describe('S2-M8: source=extension input is ignored by the controller (realistic source e2e)', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'e2e-extsrc-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('input with source=extension does NOT start a run (controller self-steer filter)', async () => {
+    const { pi, fire } = makeMockPi()
+    const transparency = makeNullTransparency()
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeCapturingGitOps(),
+      judge: makeNullJudge(),
+      transparency,
+      steerTimeoutMs: 5_000,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    // Fire a realistic self-steer message (the kind sendUserMessage({ deliverAs: 'followUp' })
+    // echoes back through the input event with source='extension').
+    const extensionInput = makeInputEvent(
+      '## Role: Discovery Agent (P1) You are the P1 DISCOVER phase — analyse the idea.',
+      'extension'
+    )
+    await fire('input', extensionInput, ctx)
+    await new Promise(r => setImmediate(r))
+
+    // The controller must filter it — no run starts.
+    expect(transparency.log).toHaveBeenCalledWith('input ignored (self-steer, source=extension)')
+    expect(transparency.log).not.toHaveBeenCalledWith(expect.stringContaining('RUNNING'))
+    expect(ctx.ui.setStatus).not.toHaveBeenCalledWith('autodev', 'RUNNING')
+    // No P1 steer fired (sendUserMessage not called).
+    expect(pi.sendUserMessage).not.toHaveBeenCalled()
   })
 })
