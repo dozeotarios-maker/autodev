@@ -4,9 +4,20 @@
 // Base directory is injectable via the constructor for tests.
 // Atomic write: write to a temp file then rename.
 
+import * as crypto from 'crypto'
 import * as fs from 'fs/promises'
+import * as fsSync from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+
+/** Resolve a path to its real target, falling back to path.resolve on error (fix 4). */
+function realpathSafe(p: string): string {
+  try {
+    return fsSync.realpathSync(p)
+  } catch {
+    return path.resolve(p)
+  }
+}
 
 export interface ProjectMeta {
   dir: string
@@ -23,6 +34,10 @@ export class ProjectRegistry {
   private readonly filePath: string
   private data: RegistryData = { projects: {} }
   private loaded = false
+  /** Fix 5: memoize in-flight load promise so concurrent first-loads don't read empty. */
+  private loadPromise: Promise<void> | undefined = undefined
+  /** Fix 5: serialize saves so concurrent register() calls don't interleave writes. */
+  private saveQueue: Promise<void> = Promise.resolve()
 
   constructor(baseDir?: string) {
     const base = baseDir ?? path.join(os.homedir(), '.pi', 'autodev', 'global')
@@ -32,8 +47,16 @@ export class ProjectRegistry {
   // ── private ──────────────────────────────────────────────────────────────────
 
   private async load(): Promise<void> {
+    // Fix 5: memoize in-flight load promise so concurrent first-loads share one read.
+    // Check loadPromise BEFORE loaded so concurrent callers see the pending promise
+    // even before _doLoad sets loaded=true.
+    if (this.loadPromise) return this.loadPromise
     if (this.loaded) return
-    this.loaded = true
+    this.loadPromise = this._doLoad()
+    return this.loadPromise
+  }
+
+  private async _doLoad(): Promise<void> {
     try {
       const raw = await fs.readFile(this.filePath, 'utf-8')
       const parsed = JSON.parse(raw) as RegistryData
@@ -46,14 +69,44 @@ export class ProjectRegistry {
       // Missing or corrupt file — start empty, never throw
       this.data = { projects: {} }
     }
+    this.loaded = true
   }
 
-  private async save(): Promise<void> {
+  private save(): Promise<void> {
+    // Fix 5: chain onto saveQueue to serialize concurrent saves within this instance.
+    // Each save reads the latest this.data (captured in closure after mutations are applied).
+    this.saveQueue = this.saveQueue.then(() => this._doSave())
+    return this.saveQueue
+  }
+
+  private async _doSave(): Promise<void> {
     const dir = path.dirname(this.filePath)
     await fs.mkdir(dir, { recursive: true })
-    const tmp = this.filePath + '.tmp.' + process.pid
-    await fs.writeFile(tmp, JSON.stringify(this.data, null, 2), { encoding: 'utf-8', mode: 0o600 })
+    // Fix 5: re-read on-disk file and merge before writing so a concurrent
+    // register() from another instance doesn't get clobbered.
+    let onDisk: RegistryData = { projects: {} }
+    try {
+      const raw = await fs.readFile(this.filePath, 'utf-8')
+      const parsed = JSON.parse(raw) as RegistryData
+      onDisk = {
+        projects: parsed.projects && typeof parsed.projects === 'object' ? parsed.projects : {},
+        active: typeof parsed.active === 'string' ? parsed.active : undefined,
+      }
+    } catch {
+      // Missing or corrupt — start from empty (our in-memory state wins)
+    }
+    // Merge: on-disk projects first, then our in-memory projects override.
+    // active: our in-memory value takes precedence (we just setActive'd it).
+    const merged: RegistryData = {
+      projects: { ...onDisk.projects, ...this.data.projects },
+      active: this.data.active ?? onDisk.active,
+    }
+    // Use random suffix so concurrent saves from the same process don't collide on the tmp path.
+    const tmp = this.filePath + '.tmp.' + crypto.randomBytes(6).toString('hex')
+    await fs.writeFile(tmp, JSON.stringify(merged, null, 2), { encoding: 'utf-8', mode: 0o600 })
     await fs.rename(tmp, this.filePath)
+    // Sync in-memory to merged state so subsequent reads are consistent.
+    this.data = merged
   }
 
   // ── public API ────────────────────────────────────────────────────────────────
@@ -87,12 +140,13 @@ export class ProjectRegistry {
   /**
    * Returns the name of the project whose dir matches the given dir,
    * normalizing paths (resolve + trailing-sep strip). Returns undefined if none.
+   * Fix 4: uses realpathSafe so symlinked dirs don't shadow-register.
    */
   async findByDir(dir: string): Promise<string | undefined> {
     await this.load()
-    const normalized = path.resolve(dir)
+    const normalized = realpathSafe(dir)
     for (const [name, meta] of Object.entries(this.data.projects)) {
-      if (path.resolve(meta.dir) === normalized) return name
+      if (realpathSafe(meta.dir) === normalized) return name
     }
     return undefined
   }

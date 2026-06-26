@@ -847,3 +847,274 @@ describe('Lane W: SubagentDriver uses injected repoRoot for git ops', () => {
     expect(true).toBe(true) // construction + setRepoRoot succeeded
   })
 })
+
+// ── Fix 2: fail-closed path extraction ────────────────────────────────────────
+
+describe('Fix 2: fail-closed write-tool path extraction', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fix2-test-'))
+  })
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('write tool with completely unknown path shape → blocked (fail closed)', () => {
+    const { pi, fire } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir })
+    ctrl.wire()
+
+    const event = {
+      type: 'tool_call',
+      toolCallId: 'tc-unknown',
+      toolName: 'write',
+      input: { unknown_key: '/some/path' }, // no file_path/path/target_file/filename/notebook_path/dst
+    } as unknown as ToolCallEvent
+
+    const result = fire('tool_call', event) as { block?: boolean; reason?: string }
+    expect(result?.block).toBe(true)
+    expect(result?.reason).toMatch(/unrecognized path shape/)
+  })
+
+  it('write tool with empty input object → blocked (fail closed)', () => {
+    const { pi, fire } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir })
+    ctrl.wire()
+
+    const event = {
+      type: 'tool_call',
+      toolCallId: 'tc-empty',
+      toolName: 'edit',
+      input: {},
+    } as unknown as ToolCallEvent
+
+    const result = fire('tool_call', event) as { block?: boolean; reason?: string }
+    expect(result?.block).toBe(true)
+    expect(result?.reason).toMatch(/unrecognized path shape/)
+  })
+
+  it('write tool with filename key → accepted and checked', () => {
+    const { pi, fire } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir })
+    ctrl.wire()
+
+    const event = {
+      type: 'tool_call',
+      toolCallId: 'tc-filename',
+      toolName: 'write',
+      input: { filename: path.join(tmpDir, 'out.ts') }, // inside repoRoot → allowed
+    } as unknown as ToolCallEvent
+
+    const result = fire('tool_call', event) as { block?: boolean }
+    expect(result?.block).toBeFalsy()
+  })
+
+  it('write tool with dst key pointing outside repoRoot → blocked', () => {
+    const { pi, fire } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir })
+    ctrl.wire()
+
+    const event = {
+      type: 'tool_call',
+      toolCallId: 'tc-dst',
+      toolName: 'write',
+      input: { dst: '/etc/evil' },
+    } as unknown as ToolCallEvent
+
+    const result = fire('tool_call', event) as { block?: boolean }
+    expect(result?.block).toBe(true)
+  })
+
+  it('write tool with edits array of {path} — each path is checked', () => {
+    const { pi, fire } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir })
+    ctrl.wire()
+
+    // One inside repoRoot, one outside — should be blocked
+    const event = {
+      type: 'tool_call',
+      toolCallId: 'tc-edits',
+      toolName: 'str_replace_editor',
+      input: {
+        edits: [
+          { path: path.join(tmpDir, 'src/ok.ts') },
+          { path: '/etc/shadow' },
+        ],
+      },
+    } as unknown as ToolCallEvent
+
+    const result = fire('tool_call', event) as { block?: boolean }
+    expect(result?.block).toBe(true)
+  })
+
+  it('write tool with files array of {file_path} all inside repoRoot → allowed', () => {
+    const { pi, fire } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir })
+    ctrl.wire()
+
+    const event = {
+      type: 'tool_call',
+      toolCallId: 'tc-files',
+      toolName: 'write',
+      input: {
+        files: [
+          { file_path: path.join(tmpDir, 'a.ts') },
+          { file_path: path.join(tmpDir, 'b.ts') },
+        ],
+      },
+    } as unknown as ToolCallEvent
+
+    const result = fire('tool_call', event) as { block?: boolean }
+    expect(result?.block).toBeFalsy()
+  })
+
+  it('notebook_path key inside repoRoot → allowed', () => {
+    const { pi, fire } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir })
+    ctrl.wire()
+
+    const event = {
+      type: 'tool_call',
+      toolCallId: 'tc-notebook',
+      toolName: 'write',
+      input: { notebook_path: path.join(tmpDir, 'analysis.ipynb') },
+    } as unknown as ToolCallEvent
+
+    const result = fire('tool_call', event) as { block?: boolean }
+    expect(result?.block).toBeFalsy()
+  })
+})
+
+// ── Fix 3: /autodev-project validation ────────────────────────────────────────
+
+describe('Fix 3: /autodev-project command validation', () => {
+  let tmpDir: string
+  let registryDir: string
+  let projectDir: string // a dir with .git so it passes the hasDotGit check
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fix3-test-'))
+    registryDir = path.join(tmpDir, 'registry')
+    projectDir = path.join(tmpDir, 'my-project')
+    await fs.mkdir(path.join(projectDir, '.git'), { recursive: true })
+  })
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  async function getProjectHandler(pi: ExtensionAPI) {
+    const calls = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls
+    const call = calls.find((args: unknown[]) => args[0] === '/autodev-project')
+    return call?.[1]?.handler as ((args: string, ctx: unknown) => Promise<void>) | undefined
+  }
+
+  it('repointing an existing name to a different dir is refused with warning', async () => {
+    const registry = new ProjectRegistry(registryDir)
+    // Register 'my-proj' pointing to some other dir
+    await registry.register('my-proj', '/some/other/dir')
+
+    const origCwd = process.cwd()
+    process.chdir(projectDir)
+    const { pi } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir, registry })
+    ctrl.wire()
+    ctrl.registerCommands()
+
+    const handler = await getProjectHandler(pi)
+    const notifyMock = vi.fn()
+    await handler!('my-proj', { ui: { notify: notifyMock } })
+    process.chdir(origCwd)
+
+    // Should warn about repointing
+    expect(notifyMock).toHaveBeenCalledWith(
+      expect.stringContaining('refusing to repoint'),
+      'warning'
+    )
+  })
+
+  it('junk/home cwd (lacks .git and package.json) is refused with warning', async () => {
+    const registry = new ProjectRegistry(registryDir)
+    const junkDir = path.join(tmpDir, 'junk-no-git-no-pkg')
+    await fs.mkdir(junkDir, { recursive: true })
+
+    const origCwd = process.cwd()
+    process.chdir(junkDir)
+    const { pi } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir, registry })
+    ctrl.wire()
+    ctrl.registerCommands()
+
+    const handler = await getProjectHandler(pi)
+    const notifyMock = vi.fn()
+    await handler!('valid-name', { ui: { notify: notifyMock } })
+    process.chdir(origCwd)
+
+    expect(notifyMock).toHaveBeenCalledWith(
+      expect.stringContaining('lacks both .git and package.json'),
+      'warning'
+    )
+  })
+
+  it('invalid name charset (spaces/special chars) is refused', async () => {
+    const registry = new ProjectRegistry(registryDir)
+    const origCwd = process.cwd()
+    process.chdir(projectDir)
+    const { pi } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir, registry })
+    ctrl.wire()
+    ctrl.registerCommands()
+
+    const handler = await getProjectHandler(pi)
+    const notifyMock = vi.fn()
+    await handler!('bad name with spaces!', { ui: { notify: notifyMock } })
+    process.chdir(origCwd)
+
+    expect(notifyMock).toHaveBeenCalledWith(
+      expect.stringContaining('Invalid project name'),
+      'warning'
+    )
+  })
+
+  it('name >64 chars is refused', async () => {
+    const registry = new ProjectRegistry(registryDir)
+    const origCwd = process.cwd()
+    process.chdir(projectDir)
+    const { pi } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir, registry })
+    ctrl.wire()
+    ctrl.registerCommands()
+
+    const handler = await getProjectHandler(pi)
+    const notifyMock = vi.fn()
+    await handler!('a'.repeat(65), { ui: { notify: notifyMock } })
+    process.chdir(origCwd)
+
+    expect(notifyMock).toHaveBeenCalledWith(
+      expect.stringContaining('Invalid project name'),
+      'warning'
+    )
+  })
+
+  it('valid name with .git dir → registers successfully', async () => {
+    const registry = new ProjectRegistry(registryDir)
+    const origCwd = process.cwd()
+    process.chdir(projectDir)
+    const { pi } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir, registry })
+    ctrl.wire()
+    ctrl.registerCommands()
+
+    const handler = await getProjectHandler(pi)
+    const notifyMock = vi.fn()
+    await handler!('valid-project', { ui: { notify: notifyMock } })
+    process.chdir(origCwd)
+
+    expect(notifyMock).toHaveBeenCalledWith(
+      expect.stringContaining('valid-project'),
+      'info'
+    )
+    const active = await registry.getActive()
+    expect(active).toBe('valid-project')
+  })
+})

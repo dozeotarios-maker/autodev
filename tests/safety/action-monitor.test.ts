@@ -1,5 +1,8 @@
 // M1 action-monitor test — written FIRST (D1)
 import { describe, it, expect } from 'vitest'
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
 import { ActionMonitor } from '../../src/safety/action-monitor.js'
 
 describe('M1: G2 action-monitor', () => {
@@ -120,5 +123,115 @@ describe('M1: G2 action-monitor', () => {
   it('does not block /root/.openclaw-sibling/x (prefix-but-not-contained)', () => {
     const m = new ActionMonitor()
     expect(m.checkFileWrite('/root/.openclaw-sibling/x').allowed).toBe(true)
+  })
+})
+
+// ── Fix 1: bash absolute-path write escape ────────────────────────────────────
+
+describe('Fix 1: bash absolute-path write escape blocked when allowedPaths set', () => {
+  it('blocks echo x > /root/f (redirect to absolute path outside allowedPaths)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    const result = m.checkBashCommand('echo x > /root/f')
+    expect(result.allowed).toBe(false)
+    expect(result.reason).toMatch(/absolute-path write escape/)
+  })
+
+  it('blocks echo x >> /root/f (append redirect outside allowedPaths)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x >> /root/f').allowed).toBe(false)
+  })
+
+  it('allows echo x > out.txt (relative path — not blocked)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x > out.txt').allowed).toBe(true)
+  })
+
+  it('allows npm install (no write target)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('npm install').allowed).toBe(true)
+  })
+
+  it('allows cat /root/f (read, not a write)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('cat /root/f').allowed).toBe(true)
+  })
+
+  it('blocks tee /etc/x (tee to absolute outside allowedPaths)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo data | tee /etc/x').allowed).toBe(false)
+  })
+
+  it('blocks dd of=/root/disk.img', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('dd if=/dev/zero of=/root/disk.img bs=1M count=1').allowed).toBe(false)
+  })
+
+  it('blocks curl -o /root/f URL', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('curl -o /root/f https://example.com/file').allowed).toBe(false)
+  })
+
+  it('blocks cp src /root/b (cp destination outside allowedPaths)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('cp src/a.txt /root/b').allowed).toBe(false)
+  })
+
+  it('blocks mv a /root/b (mv destination outside allowedPaths)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('mv a.txt /root/b').allowed).toBe(false)
+  })
+
+  it('blocks mkdir /root/x (absolute path outside allowedPaths)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('mkdir /root/x').allowed).toBe(false)
+  })
+
+  it('allows echo x > /tmp/proj/out.txt (inside allowedPaths)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x > /tmp/proj/out.txt').allowed).toBe(true)
+  })
+
+  it('does NOT block when allowedPaths is empty (confinement not active)', () => {
+    const m = new ActionMonitor()
+    // No allowedPaths → confinement not active → bash absolute writes allowed
+    expect(m.checkBashCommand('echo x > /root/f').allowed).toBe(true)
+  })
+
+  it('blocks redirect without space: echo x>/root/f', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x>/root/f').allowed).toBe(false)
+  })
+})
+
+// ── Fix 4: symlink escape ─────────────────────────────────────────────────────
+
+describe('Fix 4: symlink escape — symlink resolving to protected/home caught', () => {
+  it('blocks write to a symlink whose real target is /root/.openclaw', () => {
+    // Create a temp symlink pointing at /root/.openclaw
+    const tmpLink = path.join(os.tmpdir(), `test-symlink-openclaw-${process.pid}`)
+    try { fs.unlinkSync(tmpLink) } catch { /* not present */ }
+    try {
+      fs.symlinkSync('/root/.openclaw', tmpLink)
+      const m = new ActionMonitor()
+      const result = m.checkFileWrite(tmpLink)
+      expect(result.allowed).toBe(false)
+      expect(result.reason).toMatch(/protected path/)
+    } finally {
+      try { fs.unlinkSync(tmpLink) } catch { /* cleanup */ }
+    }
+  })
+
+  it('blocks write to a symlink outside allowedPaths when allowedPaths set', () => {
+    const tmpLink = path.join(os.tmpdir(), `test-symlink-outside-${process.pid}`)
+    const target = '/root'
+    try { fs.unlinkSync(tmpLink) } catch { /* not present */ }
+    try {
+      fs.symlinkSync(target, tmpLink)
+      const m = new ActionMonitor(['/tmp/proj'])
+      const result = m.checkFileWrite(tmpLink)
+      expect(result.allowed).toBe(false)
+    } finally {
+      try { fs.unlinkSync(tmpLink) } catch { /* cleanup */ }
+    }
   })
 })

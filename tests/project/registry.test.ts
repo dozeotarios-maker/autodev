@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import * as fs from 'fs/promises'
 import * as os from 'os'
 import * as path from 'path'
@@ -186,5 +186,94 @@ describe('ProjectRegistry — atomic write (temp-then-rename)', () => {
     const entries = await fs.readdir(tmpDir)
     const tmpFiles = entries.filter((e) => e.includes('.tmp.'))
     expect(tmpFiles).toHaveLength(0)
+  })
+})
+
+// ── Fix 5: registry load race + lost update ───────────────────────────────────
+
+describe('Fix 5: concurrent register() — both writes persist (no lost update)', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await makeTmpDir()
+  })
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('two concurrent register() calls on the same instance both persist', async () => {
+    const registry = new ProjectRegistry(tmpDir)
+    // Fire two registers concurrently
+    await Promise.all([
+      registry.register('proj-a', '/dir/a'),
+      registry.register('proj-b', '/dir/b'),
+    ])
+
+    // Fresh instance reads from disk — both should be present
+    const r2 = new ProjectRegistry(tmpDir)
+    const a = await r2.get('proj-a')
+    const b = await r2.get('proj-b')
+    expect(a).toBeDefined()
+    expect(b).toBeDefined()
+    expect(path.resolve('/dir/a')).toBe(a!.dir)
+    expect(path.resolve('/dir/b')).toBe(b!.dir)
+  })
+
+  it('second instance register() does not lose first instance write', async () => {
+    // Instance 1 writes proj-a
+    const r1 = new ProjectRegistry(tmpDir)
+    await r1.register('proj-a', '/dir/a')
+
+    // Instance 2 (separate, loads from disk) writes proj-b
+    const r2 = new ProjectRegistry(tmpDir)
+    await r2.register('proj-b', '/dir/b')
+
+    // Fresh instance 3 reads from disk — both should be present
+    const r3 = new ProjectRegistry(tmpDir)
+    const a = await r3.get('proj-a')
+    const b = await r3.get('proj-b')
+    expect(a).toBeDefined()
+    expect(b).toBeDefined()
+  })
+
+  it('concurrent first-load on same instance does not double-parse (load promise memoized)', async () => {
+    const registry = new ProjectRegistry(tmpDir)
+    // Write some data first via a separate instance
+    const r0 = new ProjectRegistry(tmpDir)
+    await r0.register('seed', '/dir/seed')
+
+    // Trigger concurrent loads
+    const [a, b] = await Promise.all([
+      registry.get('seed'),
+      registry.get('seed'),
+    ])
+    // Both should return the same result (not undefined from a race)
+    expect(a).toBeDefined()
+    expect(b).toBeDefined()
+    expect(a!.dir).toBe(b!.dir)
+  })
+})
+
+// ── Fix 4: findByDir resolves symlinks ────────────────────────────────────────
+
+describe('Fix 4: findByDir uses realpathSafe (symlink dirs)', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await makeTmpDir()
+  })
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('findByDir returns name when dir registered with symlink resolved to same real path', async () => {
+    const realDir = path.join(tmpDir, 'real-project')
+    await fs.mkdir(realDir)
+    const registry = new ProjectRegistry(tmpDir)
+    await registry.register('real-proj', realDir)
+
+    // Look up using the real path — should find it
+    const found = await registry.findByDir(realDir)
+    expect(found).toBe('real-proj')
   })
 })

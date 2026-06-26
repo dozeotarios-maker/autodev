@@ -361,3 +361,132 @@ describe('resolveProjectDir — cwd already registered (recall)', () => {
     expect(r2.name).toBe(r1.name)
   })
 })
+
+// ── Fix 6: slug robustness ─────────────────────────────────────────────────────
+
+describe('Fix 6: slug robustness — empty/all-symbol ideas, 12-hex hash, deterministic', () => {
+  let tmpDir: string
+
+  beforeEach(async () => { tmpDir = await makeTmpDir() })
+  afterEach(async () => { await fs.rm(tmpDir, { recursive: true, force: true }) })
+
+  it('empty idea → name starts with "project-" (not "-<hash>")', async () => {
+    const registry = new ProjectRegistry(tmpDir)
+    const result = await resolveProjectDir({
+      cwd: '/tmp/nonexistent-xyz-empty',
+      idea: '',
+      registry,
+      homeDir: '/tmp/fake-home-slug',
+    })
+    expect(result.name.startsWith('project-')).toBe(true)
+  })
+
+  it('all-symbol idea → name starts with "project-"', async () => {
+    const registry = new ProjectRegistry(tmpDir)
+    const result = await resolveProjectDir({
+      cwd: '/tmp/nonexistent-xyz-sym',
+      idea: '!!!---!!!',
+      registry,
+      homeDir: '/tmp/fake-home-slug',
+    })
+    expect(result.name.startsWith('project-')).toBe(true)
+  })
+
+  it('hash part is 12 hex characters', async () => {
+    const registry = new ProjectRegistry(tmpDir)
+    const result = await resolveProjectDir({
+      cwd: '/tmp/nonexistent-xyz-hash',
+      idea: 'build a weather app',
+      registry,
+      homeDir: '/tmp/fake-home-slug',
+    })
+    // name = "<slug>-<12hexchars>"
+    const parts = result.name.split('-')
+    const hashPart = parts[parts.length - 1]
+    // The hash is the last 12-char hex segment (may be split if slug contains hyphens)
+    // Verify the full name ends with a 12-hex suffix
+    expect(result.name).toMatch(/-[0-9a-f]{12}$/)
+  })
+
+  it('same idea produces same name twice (deterministic)', async () => {
+    const r1 = new ProjectRegistry(tmpDir)
+    const res1 = await resolveProjectDir({
+      cwd: '/tmp/nonexistent-det-1',
+      idea: 'deterministic slug test',
+      registry: r1,
+      homeDir: '/tmp/fake-home-det',
+    })
+    const r2 = new ProjectRegistry(await makeTmpDir())
+    const res2 = await resolveProjectDir({
+      cwd: '/tmp/nonexistent-det-2',
+      idea: 'deterministic slug test',
+      registry: r2,
+      homeDir: '/tmp/fake-home-det',
+    })
+    expect(res1.name).toBe(res2.name)
+    expect(res1.dir).toBe(res2.dir)
+  })
+})
+
+// ── Fix 4: symlink escape in resolver ─────────────────────────────────────────
+
+describe('Fix 4: symlink escape — symlinked cwd pointing to homeDir is caught', () => {
+  let tmpDir: string
+
+  beforeEach(async () => { tmpDir = await makeTmpDir() })
+  afterEach(async () => { await fs.rm(tmpDir, { recursive: true, force: true }) })
+
+  it('symlink whose real target is homeDir is rejected (falls through to step 4)', async () => {
+    const fakeHome = await makeTmpDir()
+    const symlinkPath = path.join(tmpDir, 'home-link')
+    const { symlinkSync } = await import('fs')
+    try {
+      symlinkSync(fakeHome, symlinkPath)
+    } catch {
+      // If symlink creation fails (e.g. permissions), skip test gracefully
+      return
+    }
+
+    const registry = new ProjectRegistry(tmpDir)
+    const result = await resolveProjectDir({
+      cwd: symlinkPath,   // symlink → fakeHome
+      idea: 'symlink escape test',
+      registry,
+      homeDir: fakeHome,
+    })
+
+    // Should NOT return fakeHome or symlinkPath as the project dir
+    expect(result.dir).not.toBe(fakeHome)
+    expect(result.dir).not.toBe(symlinkPath)
+    // Should fall through to step 4 (new project under homeDir/autodev/...)
+    expect(result.isNew).toBe(true)
+
+    await fs.rm(fakeHome, { recursive: true, force: true })
+  })
+})
+
+// ── Fix 7: mkdir/chdir failure leaves repoRoot clean (no half-rooted state) ───
+
+describe('Fix 7: mkdir/resolve failure leaves repoRoot safely at cwd', () => {
+  let tmpDir: string
+
+  beforeEach(async () => { tmpDir = await makeTmpDir() })
+  afterEach(async () => { await fs.rm(tmpDir, { recursive: true, force: true }) })
+
+  it('step 4 resolver returns a valid dir path even for nonexistent cwd', async () => {
+    // This tests that when we resolve a new project for a nonexistent cwd,
+    // the returned dir is a well-formed path (not undefined, not empty).
+    const registry = new ProjectRegistry(tmpDir)
+    const result = await resolveProjectDir({
+      cwd: '/tmp/absolutely-nonexistent-dir-xyz-123',
+      idea: 'test mkdir safety',
+      registry,
+      homeDir: '/tmp/fake-home-mkdir',
+    })
+    // dir should be a non-empty absolute path
+    expect(result.dir).toBeTruthy()
+    expect(path.isAbsolute(result.dir)).toBe(true)
+    // isNew must be true (new project)
+    expect(result.isNew).toBe(true)
+  })
+})

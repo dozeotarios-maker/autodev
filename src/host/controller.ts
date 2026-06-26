@@ -251,14 +251,57 @@ export class Controller {
           return
         }
         if (name) {
-          // Set active project; register cwd under that name if new
+          // Fix 3: validate name charset/length
+          if (name.length > 64 || !/^[a-zA-Z0-9_\-\.]+$/.test(name)) {
+            ctx.ui.notify(
+              `[pi-autodev] Invalid project name "${name.slice(0, 40)}": must be ≤64 chars, [a-zA-Z0-9_\\-.] only`,
+              'warning'
+            )
+            return
+          }
+
+          const cwd = process.cwd()
+
+          // Fix 3: reject if cwd is $HOME or an ancestor of $HOME
+          const home = os.homedir()
+          const cwdReal = (() => { try { return path.resolve(cwd) } catch { return cwd } })()
+          const homeReal = (() => { try { return path.resolve(home) } catch { return home } })()
+          const cwdIsHome = cwdReal === homeReal || homeReal.startsWith(cwdReal + path.sep)
+          // Fix 3: reject if cwd lacks both .git and package.json
+          const hasDotGit = await fs.access(path.join(cwd, '.git')).then(() => true).catch(() => false)
+          const hasPkgJson = await fs.access(path.join(cwd, 'package.json')).then(() => true).catch(() => false)
+
+          if (cwdIsHome) {
+            ctx.ui.notify(
+              `[pi-autodev] Cannot register project at $HOME or an ancestor — navigate to a project dir first`,
+              'warning'
+            )
+            return
+          }
+          if (!hasDotGit && !hasPkgJson) {
+            ctx.ui.notify(
+              `[pi-autodev] cwd "${cwd}" lacks both .git and package.json — navigate to a project dir first`,
+              'warning'
+            )
+            return
+          }
+
+          // Fix 3: if name already maps to a DIFFERENT dir, refuse to silently repoint
           const existing = await this.opts.registry.get(name)
+          if (existing && path.resolve(existing.dir) !== path.resolve(cwd)) {
+            ctx.ui.notify(
+              `[pi-autodev] Project "${name}" already registered at "${existing.dir}" — refusing to repoint to "${cwd}". Use a different name.`,
+              'warning'
+            )
+            return
+          }
+
           if (!existing) {
-            await this.opts.registry.register(name, process.cwd())
+            await this.opts.registry.register(name, cwd)
           }
           await this.opts.registry.setActive(name)
           const meta = await this.opts.registry.get(name)
-          ctx.ui.notify(`[pi-autodev] Active project: ${name} -> ${meta?.dir ?? process.cwd()}`, 'info')
+          ctx.ui.notify(`[pi-autodev] Active project: ${name} -> ${meta?.dir ?? cwd}`, 'info')
         } else {
           // List all registered projects + active
           const projects = await this.opts.registry.list()
@@ -421,12 +464,53 @@ export class Controller {
 
       const WRITE_TOOLS = new Set(['write', 'create_file', 'write_file', 'edit', 'str_replace', 'str_replace_editor', 'str_replace_based_edit_tool'])
       if (WRITE_TOOLS.has(toolName) && input) {
-        const filePath = (
+        // Fix 2: fail-closed path extraction — add more keys and handle array shapes.
+        // If the tool is a known write tool but no path resolves, BLOCK (fail closed).
+        const filePaths: string[] = []
+
+        // Single-path keys
+        const singlePath = (
           input['file_path'] as string | undefined ??
           input['path'] as string | undefined ??
-          input['target_file'] as string | undefined
+          input['target_file'] as string | undefined ??
+          input['filename'] as string | undefined ??
+          input['notebook_path'] as string | undefined ??
+          input['dst'] as string | undefined
         )
-        if (filePath) {
+        if (singlePath) filePaths.push(singlePath)
+
+        // Array shapes: edits/files arrays of {path} or {file_path}
+        const editsArr = input['edits']
+        if (Array.isArray(editsArr)) {
+          for (const item of editsArr) {
+            if (item && typeof item === 'object') {
+              const p = (item as Record<string, unknown>)['path'] ?? (item as Record<string, unknown>)['file_path']
+              if (typeof p === 'string') filePaths.push(p)
+            }
+          }
+        }
+        const filesArr = input['files']
+        if (Array.isArray(filesArr)) {
+          for (const item of filesArr) {
+            if (item && typeof item === 'object') {
+              const p = (item as Record<string, unknown>)['path'] ?? (item as Record<string, unknown>)['file_path']
+              if (typeof p === 'string') filePaths.push(p)
+            }
+          }
+        }
+
+        // Fix 2: fail closed — if no path found, block the write tool
+        if (filePaths.length === 0) {
+          void this.journal.write({
+            type: 'decision',
+            phase: this.fsm.getPhase(),
+            action: `BLOCKED write tool ${toolName}: unrecognized path shape`,
+          })
+          return { block: true, reason: 'write tool, unrecognized path shape' }
+        }
+
+        // Check each resolved path
+        for (const filePath of filePaths) {
           const absPath = path.resolve(filePath)
           const check = this.actionMonitor.checkFileWrite(absPath)
           if (!check.allowed) {

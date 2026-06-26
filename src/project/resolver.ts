@@ -6,6 +6,15 @@ import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 
+/** Resolve a path to its real target, falling back to path.resolve on error (fix 4). */
+function realpathSafe(p: string): string {
+  try {
+    return fs.realpathSync(p)
+  } catch {
+    return path.resolve(p)
+  }
+}
+
 import { ProjectRegistry } from './registry.js'
 
 export interface ResolveResult {
@@ -57,9 +66,9 @@ export function slugify(text: string): string {
     .replace(/-+$/, '')
 }
 
-/** 6-character hex hash of the given text (deterministic). */
+/** 12-character hex hash of the given text (deterministic). Fix 6: wider hash. */
 function hexHash(text: string): string {
-  return crypto.createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 6)
+  return crypto.createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 12)
 }
 
 /** Read `package.json` name field from a directory, or undefined on failure. */
@@ -78,10 +87,11 @@ function readPackageName(dir: string): string | undefined {
 /**
  * Returns true if `dir` equals homeDir or is an ancestor of homeDir.
  * These dirs must never be returned as the resolved project dir.
+ * Fix 4: uses realpathSafe so a symlink pointing to $HOME is caught.
  */
 function isHomeOrAncestor(dir: string, homeDir: string): boolean {
-  const resolved = path.resolve(dir)
-  const home = path.resolve(homeDir)
+  const resolved = realpathSafe(dir)
+  const home = realpathSafe(homeDir)
   // equal
   if (resolved === home) return true
   // dir is a parent of home: home starts with dir + sep
@@ -127,8 +137,11 @@ export async function resolveProjectDir(opts: ResolveOpts): Promise<ResolveResul
     }
   }
 
-  // Step 4: new project — slug + 6-char hash, scoped under ~/autodev/<slug>
-  const slug = slugify(idea)
+  // Step 4: new project — slug + 12-char hash, scoped under ~/autodev/<slug>
+  // Fix 6: fall back to 'project' when slug is empty (all-symbol idea) to avoid
+  // leading-hyphen dir names like `-abc`.
+  const rawSlug = slugify(idea)
+  const slug = rawSlug.length > 0 ? rawSlug : 'project'
   const hash = hexHash(idea)
   const name = `${slug}-${hash}`
   const dir = path.join(homeDir, 'autodev', name)
