@@ -111,6 +111,8 @@ export interface P4Context {
   p3: P3Output
   // TODO: make sizing required once test fixtures updated
   sizing?: Sizing
+  /** Resolved project root — absolute path; when set, instructs build to write here. */
+  repoRoot?: string
 }
 
 // ── P5 VERIFY ────────────────────────────────────────────────────────────────
@@ -141,6 +143,8 @@ export interface P5Context {
   p4: P4Output
   // TODO: make sizing required once test fixtures updated
   sizing?: Sizing
+  /** Resolved project root — absolute path; when set, instructs verify to run tests here. */
+  repoRoot?: string
 }
 
 // ── P6 RELEASE ───────────────────────────────────────────────────────────────
@@ -156,6 +160,8 @@ export interface P6Context {
   p5: P5Output
   // TODO: make sizing required once test fixtures updated
   sizing?: Sizing
+  /** Resolved project root — absolute path; when set, instructs release to commit from here. */
+  repoRoot?: string
 }
 
 // ── Discriminated unions ──────────────────────────────────────────────────────

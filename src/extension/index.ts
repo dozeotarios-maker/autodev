@@ -60,6 +60,7 @@ import { SubagentRunner } from '../lanes/subagent-runner.js'
 
 // ── S2-M2: Controller ────────────────────────────────────────────────────────
 import { Controller } from '../host/controller.js'
+import { ProjectRegistry } from '../project/registry.js'
 
 // ── Extension options (all external boundaries injectable for test isolation) ──
 export interface AutodevExtensionOptions {
@@ -82,6 +83,8 @@ export interface AutodevExtensionOptions {
   resurrection?: Resurrection
   // Judge
   judge?: Judge
+  // Project registry (injectable for test isolation)
+  registry?: ProjectRegistry
 }
 
 // ── Composed concrete adapters ─────────────────────────────────────────────────
@@ -371,6 +374,8 @@ export default function autodevExtension(pi: ExtensionAPI): void {
 
   const securityLane = buildSecurityLane({})
 
+  const registry = new ProjectRegistry()
+
   const controller = new Controller(pi, {
     repoRoot,
     verifier,
@@ -381,6 +386,7 @@ export default function autodevExtension(pi: ExtensionAPI): void {
     embedder,
     codebaseMemory,
     securityLane,
+    registry,
   })
 
   controller.wire()

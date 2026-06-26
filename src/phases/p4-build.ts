@@ -42,12 +42,22 @@ function buildP4Instruction(ctx: P4Context, outputFile: string): string {
     index: i,
   }))
 
+  const repoRootLines = ctx.repoRoot
+    ? [
+        '',
+        `## Project root (MANDATORY)`,
+        `Write ALL files under: ${ctx.repoRoot}`,
+        `Prefix every shell command with: cd ${ctx.repoRoot} &&`,
+      ]
+    : []
+
   return [
     ROLE_DIRECTIVES,
     '',
     `## Input`,
     `Sprint goal:\n${wrapUntrusted(ctx.p3.sprintContract.goal)}`,
     `File-DAG: ${ctx.p3.fileDAG.length} files across ${partitioned.length} lanes (cap=${laneCap})`,
+    ...repoRootLines,
     '',
     `## Build lanes (run as parallel worktree subagents)`,
     'Call the `subagent` tool with:',

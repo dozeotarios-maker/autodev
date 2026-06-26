@@ -11,6 +11,7 @@
 // Port interfaces only for Verifier, GitOps, Judge — no concrete imports from src/verify, src/git.
 
 import * as fs from 'fs/promises'
+import * as os from 'os'
 import * as path from 'path'
 import type {
   ExtensionAPI,
@@ -44,6 +45,8 @@ import type { P1Output, P2Output, P3Output, P4Output, P5Output } from '../phases
 import { scoreComplexity, tierSizing, DEFAULT_SIZING } from '../engine/complexity.js'
 import type { Sizing, ComplexityInput, ComplexityTier } from '../engine/complexity.js'
 import type { RetroWriter } from '../engine/retro.js'
+import { resolveProjectDir } from '../project/resolver.js'
+import type { ProjectRegistry } from '../project/registry.js'
 
 // ── compactAsync ─────────────────────────────────────────────────────────────
 
@@ -97,9 +100,11 @@ export interface ControllerOptions {
   /** Optional memory backends — wired at entry; consumed by P1 and retro. */
   memoryStore?: MemoryStore
   embedder?: Embedder
-  codebaseMemory?: { healthCheck(): Promise<{ ok: boolean; details?: string }> }
+  codebaseMemory?: { healthCheck(): Promise<{ ok: boolean; details?: string }>; ensureIndexed?(): Promise<void> }
   /** Optional security lane — used to screen recalled memory before injecting into instructions. */
   securityLane?: SecurityLane
+  /** Optional project registry — when injected, _resolveRepoRoot re-roots the build dir from the idea. */
+  registry?: ProjectRegistry
 }
 
 // ── Controller ────────────────────────────────────────────────────────────────
@@ -109,11 +114,12 @@ export class Controller {
   private readonly subagentDriver: SubagentDriver
   private readonly fsm: FSM
   private readonly lifecycle: Lifecycle
-  private readonly journal: Journal
-  private readonly actionMonitor: ActionMonitor
+  private journal: Journal
+  private actionMonitor: ActionMonitor
   private readonly masker: ObservationMasker
-  private readonly outputDir: string
-  private readonly pauseFilePath: string
+  private outputDir: string
+  private pauseFilePath: string
+  private repoRoot: string
 
   private phaseStore: PhaseStore = {}
   private currentIdea = ''
@@ -128,6 +134,7 @@ export class Controller {
     private readonly pi: ExtensionAPI,
     private readonly opts: ControllerOptions
   ) {
+    this.repoRoot = opts.repoRoot
     this.hostAgent = new HostAgent(pi)
     this.subagentDriver = new SubagentDriver(this.hostAgent)
     this.fsm = new FSM({
@@ -199,12 +206,18 @@ export class Controller {
       description: 'Show current autodev phase, task, and uptime',
       handler: async (_args: string, ctx: ExtensionCommandContext) => {
         const uptime = Math.floor((Date.now() - this.startedAt) / 1000)
+        let activeProject: string | undefined
+        if (this.opts.registry) {
+          try { activeProject = await this.opts.registry.getActive() } catch { /* degrade */ }
+        }
         const status = {
           phase: this.fsm.getPhase(),
           task: this.currentIdea.slice(0, 80),
           laneStatus: this.lifecycle.getState(),
           model: 'opus',
           uptime: `${uptime}s`,
+          repoRoot: this.repoRoot,
+          activeProject: activeProject ?? '(none)',
         }
         ctx.ui.notify(JSON.stringify(status, null, 2), 'info')
       },
@@ -213,7 +226,37 @@ export class Controller {
     this.pi.registerCommand('/autodev-config', {
       description: 'Show autodev configuration',
       handler: async (_args: string, ctx: ExtensionCommandContext) => {
-        ctx.ui.notify(`[pi-autodev] repoRoot=${this.opts.repoRoot}`, 'info')
+        ctx.ui.notify(`[pi-autodev] repoRoot=${this.repoRoot}`, 'info')
+      },
+    })
+
+    this.pi.registerCommand('/autodev-project', {
+      description: 'Set or list registered projects. Usage: /autodev-project [name]',
+      handler: async (args: string, ctx: ExtensionCommandContext) => {
+        const name = args.trim()
+        if (!this.opts.registry) {
+          ctx.ui.notify('[pi-autodev] No registry configured', 'warning')
+          return
+        }
+        if (name) {
+          // Set active project; register cwd under that name if new
+          const existing = await this.opts.registry.get(name)
+          if (!existing) {
+            await this.opts.registry.register(name, process.cwd())
+          }
+          await this.opts.registry.setActive(name)
+          const meta = await this.opts.registry.get(name)
+          ctx.ui.notify(`[pi-autodev] Active project: ${name} -> ${meta?.dir ?? process.cwd()}`, 'info')
+        } else {
+          // List all registered projects + active
+          const projects = await this.opts.registry.list()
+          const active = await this.opts.registry.getActive()
+          const lines = projects.map(p => `${p.name === active ? '* ' : '  '}${p.name} -> ${p.dir}`)
+          const msg = lines.length > 0
+            ? `[pi-autodev] Projects (active=*):\n${lines.join('\n')}`
+            : '[pi-autodev] No projects registered'
+          ctx.ui.notify(msg, 'info')
+        }
       },
     })
 
@@ -335,6 +378,10 @@ export class Controller {
     // Lock won — now safe to update the shared field.
     this.currentIdea = idea
 
+    // Re-root repoRoot to the resolved project dir (async, before _runPhases).
+    // _resolveRepoRoot is a no-op when no registry is injected (preserves current behavior).
+    await this._resolveRepoRoot(idea)
+
     // Start P1 asynchronously within the extension event loop
     void this._runPhases(ctx)
   }
@@ -360,10 +407,16 @@ export class Controller {
         }
       }
 
-      if ((toolName === 'write' || toolName === 'create_file') && input) {
-        const filePath = input['file_path'] as string | undefined ?? input['path'] as string | undefined
+      const WRITE_TOOLS = new Set(['write', 'create_file', 'write_file', 'edit', 'str_replace', 'str_replace_editor', 'str_replace_based_edit_tool'])
+      if (WRITE_TOOLS.has(toolName) && input) {
+        const filePath = (
+          input['file_path'] as string | undefined ??
+          input['path'] as string | undefined ??
+          input['target_file'] as string | undefined
+        )
         if (filePath) {
-          const check = this.actionMonitor.checkFileWrite(filePath)
+          const absPath = path.resolve(filePath)
+          const check = this.actionMonitor.checkFileWrite(absPath)
           if (!check.allowed) {
             void this.journal.write({
               type: 'decision',
@@ -516,7 +569,7 @@ export class Controller {
       if (await this._isPaused()) { await this._waitResume() }
 
       const p4 = new P4Build(this.hostAgent, this.outputDir, this.subagentDriver, this.opts.steerTimeoutMs)
-      const p4Result = await p4.execute({ phase: 'P4', p3: this.phaseStore.p3, sizing: this.currentSizing })
+      const p4Result = await p4.execute({ phase: 'P4', p3: this.phaseStore.p3, sizing: this.currentSizing, repoRoot: this.repoRoot })
       if (!p4Result.ok || !p4Result.output) {
         await this._escalate('P4', p4Result.reason ?? 'P4 failed')
         return
@@ -537,7 +590,7 @@ export class Controller {
         this.outputDir,
         this.opts.verifier,
         this.opts.judge,
-        this.opts.repoRoot,
+        this.repoRoot,
         this.opts.steerTimeoutMs
       )
       const p5Result = await p5.execute({
@@ -545,6 +598,7 @@ export class Controller {
         p3: this.phaseStore.p3,
         p4: this.phaseStore.p4,
         sizing: this.currentSizing,
+        repoRoot: this.repoRoot,
       })
 
       // H9 backedge: P4→P3 on divergent diff
@@ -591,7 +645,7 @@ export class Controller {
       if (await this._isPaused()) { await this._waitResume() }
 
       const p6 = new P6Release(this.hostAgent, this.outputDir, this.opts.gitOps, undefined, this.opts.steerTimeoutMs)
-      const p6Result = await p6.execute({ phase: 'P6', p5: this.phaseStore.p5, sizing: this.currentSizing })
+      const p6Result = await p6.execute({ phase: 'P6', p5: this.phaseStore.p5, sizing: this.currentSizing, repoRoot: this.repoRoot })
       if (!p6Result.ok || !p6Result.output) {
         await this._escalate('P6', p6Result.reason ?? 'P6 failed')
         return
@@ -627,6 +681,71 @@ export class Controller {
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
+
+  /**
+   * Re-roots repoRoot, outputDir, journal, actionMonitor, pauseFilePath from
+   * the resolved project dir. No-op if no registry is injected (preserves
+   * existing behavior: repoRoot stays process.cwd()).
+   */
+  private async _resolveRepoRoot(idea: string): Promise<void> {
+    if (!this.opts.registry) return
+
+    let r
+    try {
+      r = await resolveProjectDir({
+        cwd: process.cwd(),
+        idea,
+        registry: this.opts.registry,
+        homeDir: os.homedir(),
+      })
+    } catch (e) {
+      void this.journal.write({
+        type: 'decision',
+        phase: 'P1',
+        action: `_resolveRepoRoot: failed (${String(e)}), keeping cwd`,
+      })
+      return
+    }
+
+    this.repoRoot = r.dir
+    this.subagentDriver.setRepoRoot(r.dir)
+
+    // mkdir -p the resolved dir if new
+    if (r.isNew) {
+      await fs.mkdir(r.dir, { recursive: true })
+    }
+
+    // Re-derive all repoRoot-dependent fields
+    this.outputDir = path.join(r.dir, '.autodev', 'phase-output')
+    this.pauseFilePath = path.join(r.dir, '.autodev', 'PAUSE')
+    this.journal = new Journal(path.join(r.dir, '.autodev', 'journal.jsonl'))
+    this.actionMonitor = new ActionMonitor([r.dir])
+
+    // Register in registry
+    await this.opts.registry.register(r.name, r.dir, { lastRun: new Date().toISOString() })
+    if (!r.isNew) {
+      await this.opts.registry.setActive(r.name)
+    }
+
+    // Index existing codebase (degrade gracefully on failure)
+    if (r.isExisting && this.opts.codebaseMemory?.ensureIndexed) {
+      try {
+        await this.opts.codebaseMemory.ensureIndexed()
+      } catch (e) {
+        void this.journal.write({
+          type: 'decision',
+          phase: 'P1',
+          action: `_resolveRepoRoot: ensureIndexed failed (${String(e)}), continuing`,
+        })
+      }
+    }
+
+    void this.journal.write({
+      type: 'decision',
+      phase: 'P1',
+      action: `resolved project '${r.name}' -> ${r.dir} (${r.isNew ? 'new' : 'existing'})`,
+    })
+  }
 
   private async _escalate(phase: string, reason: string): Promise<void> {
     await this.journal.write({ type: 'decision', phase, action: `HARD BLOCK: ${reason}`, suspect: true })

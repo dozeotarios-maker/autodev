@@ -28,12 +28,19 @@ function defaultGitExec(args: string[], cwd: string): Promise<{ stdout: string }
 
 export class SubagentDriver {
   private gitExec: GitExec
+  private repoRoot: string | undefined
 
   constructor(
     private hostAgent: HostAgent,
-    opts?: { gitExec?: GitExec }
+    opts?: { gitExec?: GitExec; repoRoot?: string }
   ) {
     this.gitExec = opts?.gitExec ?? defaultGitExec
+    this.repoRoot = opts?.repoRoot
+  }
+
+  /** Update the working dir used for git ops — called by controller after re-rooting. */
+  setRepoRoot(dir: string): void {
+    this.repoRoot = dir
   }
 
   /**
@@ -52,7 +59,7 @@ export class SubagentDriver {
     const { worktree = false, concurrency } = opts
 
     let stashed = false
-    const cwd = process.cwd()
+    const cwd = this.repoRoot ?? process.cwd()
 
     if (worktree) {
       stashed = await this._stashIfDirty(cwd)

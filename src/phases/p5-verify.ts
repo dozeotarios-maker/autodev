@@ -34,6 +34,15 @@ function buildP5Instruction(
 ): string {
   const artifactsRaw = ctx.p4.artifacts.join(', ') || '(none listed)'
 
+  const repoRootLines = ctx.repoRoot
+    ? [
+        '',
+        `## Project root (MANDATORY)`,
+        `Run ALL verification commands under: ${ctx.repoRoot}`,
+        `Prefix every shell command with: cd ${ctx.repoRoot} &&`,
+      ]
+    : []
+
   return [
     ROLE_DIRECTIVES,
     '',
@@ -44,6 +53,7 @@ function buildP5Instruction(
     `Holdout verify: ${holdoutPassed ? 'PASSED' : 'FAILED'}`,
     `Security scan: ${securityClean ? 'CLEAN' : 'FINDINGS'}`,
     `Review rounds cap: ${reviewRounds}`,
+    ...repoRootLines,
     '',
     `## Clean-context reviewer (run as subagent, up to ${reviewRounds} review rounds)`,
     'Call the `subagent` tool with:',

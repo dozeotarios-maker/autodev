@@ -73,8 +73,11 @@ export class ActionMonitor {
       }
     }
     if (this.allowedPaths.length === 0) return { allowed: true }
-    const normalized = filePath.replace(/\\/g, '/')
-    const ok = this.allowedPaths.some(p => normalized.startsWith(p.replace(/\\/g, '/')))
+    // Resolve allowedPaths to absolute before comparing so repoRoot-relative confinement works
+    const ok = this.allowedPaths.some(p => {
+      const ap = path.resolve(p)
+      return r === ap || r.startsWith(ap + path.sep)
+    })
     if (!ok) {
       return { allowed: false, reason: `Write to out-of-bounds path blocked: ${filePath}` }
     }

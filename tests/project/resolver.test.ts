@@ -1,0 +1,363 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import * as fs from 'fs/promises'
+import * as os from 'os'
+import * as path from 'path'
+import { ProjectRegistry } from '../../src/project/registry.js'
+import { resolveProjectDir, isGitRepo, hasPackageJson, slugify } from '../../src/project/resolver.js'
+
+async function makeTmpDir(): Promise<string> {
+  return fs.mkdtemp(path.join(os.tmpdir(), 'pi-resolver-test-'))
+}
+
+// ── Helper: fixture git repo (just needs a .git dir) ─────────────────────────
+
+async function makeGitRepo(base: string): Promise<string> {
+  const repo = path.join(base, 'git-repo')
+  await fs.mkdir(path.join(repo, '.git'), { recursive: true })
+  return repo
+}
+
+async function makePackageJsonDir(base: string, name?: string): Promise<string> {
+  const dir = path.join(base, 'pkg-dir')
+  await fs.mkdir(dir, { recursive: true })
+  const pkg: { name?: string } = name ? { name } : {}
+  await fs.writeFile(path.join(dir, 'package.json'), JSON.stringify(pkg), 'utf-8')
+  return dir
+}
+
+// ── isGitRepo / hasPackageJson / slugify unit tests ───────────────────────────
+
+describe('helpers — isGitRepo', () => {
+  let tmpDir: string
+  beforeEach(async () => { tmpDir = await makeTmpDir() })
+  afterEach(async () => { await fs.rm(tmpDir, { recursive: true, force: true }) })
+
+  it('returns true for a dir with .git directory', async () => {
+    const repo = await makeGitRepo(tmpDir)
+    expect(isGitRepo(repo)).toBe(true)
+  })
+
+  it('returns false for a plain dir', async () => {
+    const plain = path.join(tmpDir, 'plain')
+    await fs.mkdir(plain)
+    expect(isGitRepo(plain)).toBe(false)
+  })
+
+  it('returns false for a nonexistent path', () => {
+    expect(isGitRepo('/nonexistent/path/xyz')).toBe(false)
+  })
+})
+
+describe('helpers — hasPackageJson', () => {
+  let tmpDir: string
+  beforeEach(async () => { tmpDir = await makeTmpDir() })
+  afterEach(async () => { await fs.rm(tmpDir, { recursive: true, force: true }) })
+
+  it('returns true when package.json exists', async () => {
+    const dir = await makePackageJsonDir(tmpDir, 'my-pkg')
+    expect(hasPackageJson(dir)).toBe(true)
+  })
+
+  it('returns false when package.json is absent', async () => {
+    const plain = path.join(tmpDir, 'no-pkg')
+    await fs.mkdir(plain)
+    expect(hasPackageJson(plain)).toBe(false)
+  })
+})
+
+describe('helpers — slugify', () => {
+  it('lowercases and replaces non-alnum with hyphens', () => {
+    expect(slugify('Hello World!')).toBe('hello-world')
+  })
+
+  it('strips leading and trailing hyphens', () => {
+    expect(slugify('  --hello--  ')).toBe('hello')
+  })
+
+  it('caps at 40 chars', () => {
+    const long = 'a'.repeat(50)
+    expect(slugify(long).length).toBeLessThanOrEqual(40)
+  })
+
+  it('collapses consecutive non-alnum runs to a single hyphen', () => {
+    expect(slugify('foo   !!!   bar')).toBe('foo-bar')
+  })
+
+  it('handles empty string', () => {
+    expect(slugify('')).toBe('')
+  })
+})
+
+// ── resolveProjectDir tests ───────────────────────────────────────────────────
+
+describe('resolveProjectDir — step 1: cwd is registered', () => {
+  let tmpDir: string
+  let regDir: string
+
+  beforeEach(async () => {
+    tmpDir = await makeTmpDir()
+    regDir = await makeTmpDir()
+  })
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+    await fs.rm(regDir, { recursive: true, force: true })
+  })
+
+  it('returns the registered project when cwd matches', async () => {
+    const registry = new ProjectRegistry(tmpDir)
+    const projectDir = path.join(regDir, 'my-registered-project')
+    await fs.mkdir(projectDir)
+    await registry.register('my-registered-project', projectDir)
+
+    const result = await resolveProjectDir({
+      cwd: projectDir,
+      idea: 'some idea',
+      registry,
+      homeDir: '/tmp/fake-home',
+    })
+
+    expect(result.isExisting).toBe(true)
+    expect(result.isNew).toBe(false)
+    expect(result.name).toBe('my-registered-project')
+    expect(result.dir).toBe(path.resolve(projectDir))
+  })
+})
+
+describe('resolveProjectDir — step 2: cwd is a git repo', () => {
+  let tmpDir: string
+  let repoBase: string
+
+  beforeEach(async () => {
+    tmpDir = await makeTmpDir()
+    repoBase = await makeTmpDir()
+  })
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+    await fs.rm(repoBase, { recursive: true, force: true })
+  })
+
+  it('git repo cwd → isExisting=true, dir=cwd, registers it', async () => {
+    const repo = await makeGitRepo(repoBase)
+    const registry = new ProjectRegistry(tmpDir)
+
+    const result = await resolveProjectDir({
+      cwd: repo,
+      idea: 'irrelevant',
+      registry,
+      homeDir: '/tmp/fake-home',
+    })
+
+    expect(result.isExisting).toBe(true)
+    expect(result.isNew).toBe(false)
+    expect(result.dir).toBe(path.resolve(repo))
+    // Should be registered now
+    const found = await registry.findByDir(repo)
+    expect(found).toBe(result.name)
+  })
+
+  it('uses package.json name when available', async () => {
+    const dir = await makePackageJsonDir(repoBase, 'my-special-pkg')
+    const registry = new ProjectRegistry(tmpDir)
+
+    const result = await resolveProjectDir({
+      cwd: dir,
+      idea: 'irrelevant',
+      registry,
+      homeDir: '/tmp/fake-home',
+    })
+
+    expect(result.name).toBe('my-special-pkg')
+    expect(result.isExisting).toBe(true)
+  })
+
+  it('falls back to basename when package.json has no name', async () => {
+    const dir = path.join(repoBase, 'my-basename-dir')
+    await fs.mkdir(dir)
+    await fs.writeFile(path.join(dir, 'package.json'), '{}', 'utf-8')
+    const registry = new ProjectRegistry(tmpDir)
+
+    const result = await resolveProjectDir({
+      cwd: dir,
+      idea: 'irrelevant',
+      registry,
+      homeDir: '/tmp/fake-home',
+    })
+
+    expect(result.name).toBe('my-basename-dir')
+  })
+})
+
+describe('resolveProjectDir — step 3: active project', () => {
+  let tmpDir: string
+
+  beforeEach(async () => { tmpDir = await makeTmpDir() })
+  afterEach(async () => { await fs.rm(tmpDir, { recursive: true, force: true }) })
+
+  it('junk cwd + active set → returns active project dir', async () => {
+    const registry = new ProjectRegistry(tmpDir)
+    await registry.register('active-proj', '/projects/active-proj')
+    await registry.setActive('active-proj')
+
+    const result = await resolveProjectDir({
+      cwd: '/tmp/junk-cwd-that-does-not-exist',
+      idea: 'something',
+      registry,
+      homeDir: '/tmp/fake-home',
+    })
+
+    expect(result.isExisting).toBe(true)
+    expect(result.isNew).toBe(false)
+    expect(result.name).toBe('active-proj')
+    expect(result.dir).toBe('/projects/active-proj')
+  })
+})
+
+describe('resolveProjectDir — step 4: new project', () => {
+  let tmpDir: string
+
+  beforeEach(async () => { tmpDir = await makeTmpDir() })
+  afterEach(async () => { await fs.rm(tmpDir, { recursive: true, force: true }) })
+
+  it('junk cwd + no active → isNew=true, dir under homeDir/autodev/<slug>', async () => {
+    const registry = new ProjectRegistry(tmpDir)
+    const fakeHome = '/tmp/fake-home-xyz'
+
+    const result = await resolveProjectDir({
+      cwd: '/tmp/no-such-dir-abc',
+      idea: 'build a weather app',
+      registry,
+      homeDir: fakeHome,
+    })
+
+    expect(result.isNew).toBe(true)
+    expect(result.isExisting).toBe(false)
+    expect(result.dir).not.toBe(fakeHome)
+    expect(result.dir.startsWith(path.join(fakeHome, 'autodev') + path.sep)).toBe(true)
+  })
+
+  it('same idea twice → same slug+hash (deterministic)', async () => {
+    const registry = new ProjectRegistry(tmpDir)
+    const fakeHome = '/tmp/fake-home-det'
+
+    const r1 = await resolveProjectDir({
+      cwd: '/tmp/no-such-1',
+      idea: 'deterministic idea',
+      registry,
+      homeDir: fakeHome,
+    })
+
+    // Fresh registry, same idea
+    const registry2 = new ProjectRegistry(tmpDir)
+    // Already registered from r1, but with a different cwd that is junk
+    // We need a fresh registry that doesn't know about r1 to test determinism
+    const registry3 = new ProjectRegistry(await makeTmpDir())
+    const r2 = await resolveProjectDir({
+      cwd: '/tmp/no-such-2',
+      idea: 'deterministic idea',
+      registry: registry3,
+      homeDir: fakeHome,
+    })
+
+    expect(r1.name).toBe(r2.name)
+    expect(r1.dir).toBe(r2.dir)
+    void registry2
+  })
+})
+
+describe('resolveProjectDir — guardrail: never return homeDir', () => {
+  let tmpDir: string
+
+  beforeEach(async () => { tmpDir = await makeTmpDir() })
+  afterEach(async () => { await fs.rm(tmpDir, { recursive: true, force: true }) })
+
+  it('cwd === homeDir → falls through to step 4 (scoped subdir)', async () => {
+    const fakeHome = await makeTmpDir()
+    const registry = new ProjectRegistry(tmpDir)
+
+    const result = await resolveProjectDir({
+      cwd: fakeHome,
+      idea: 'some cool project',
+      registry,
+      homeDir: fakeHome,
+    })
+
+    expect(result.isNew).toBe(true)
+    expect(result.dir).not.toBe(fakeHome)
+    expect(result.dir.startsWith(path.join(fakeHome, 'autodev') + path.sep)).toBe(true)
+    await fs.rm(fakeHome, { recursive: true, force: true })
+  })
+
+  it('registered project whose dir IS homeDir is NOT returned (guardrail)', async () => {
+    const fakeHome = '/tmp/guardrail-home-test'
+    const registry = new ProjectRegistry(tmpDir)
+    // Register a project pointing to homeDir
+    await registry.register('bad-proj', fakeHome)
+
+    const result = await resolveProjectDir({
+      cwd: fakeHome,
+      idea: 'guarded idea',
+      registry,
+      homeDir: fakeHome,
+    })
+
+    expect(result.dir).not.toBe(fakeHome)
+    expect(result.isNew).toBe(true)
+  })
+
+  it('active project whose dir is homeDir falls through to step 4', async () => {
+    const fakeHome = '/tmp/active-home-guardrail'
+    const registry = new ProjectRegistry(tmpDir)
+    await registry.register('home-active', fakeHome)
+    await registry.setActive('home-active')
+
+    const result = await resolveProjectDir({
+      cwd: '/tmp/junk-cwd-guardrail',
+      idea: 'guarded active',
+      registry,
+      homeDir: fakeHome,
+    })
+
+    expect(result.dir).not.toBe(fakeHome)
+    expect(result.isNew).toBe(true)
+  })
+})
+
+describe('resolveProjectDir — cwd already registered (recall)', () => {
+  let tmpDir: string
+  let projectDir: string
+
+  beforeEach(async () => {
+    tmpDir = await makeTmpDir()
+    projectDir = await makeTmpDir()
+  })
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+    await fs.rm(projectDir, { recursive: true, force: true })
+  })
+
+  it('resolving same cwd twice returns consistent result (isExisting on second call)', async () => {
+    const registry = new ProjectRegistry(tmpDir)
+    // First call: cwd is a real dir but not yet registered
+    // Make it look like a git repo
+    await fs.mkdir(path.join(projectDir, '.git'))
+
+    const r1 = await resolveProjectDir({
+      cwd: projectDir,
+      idea: 'my project',
+      registry,
+      homeDir: '/tmp/fake-home',
+    })
+    expect(r1.isExisting).toBe(true)
+
+    // Second call with same cwd — now registered
+    const r2 = await resolveProjectDir({
+      cwd: projectDir,
+      idea: 'my project',
+      registry,
+      homeDir: '/tmp/fake-home',
+    })
+    expect(r2.isExisting).toBe(true)
+    expect(r2.dir).toBe(r1.dir)
+    expect(r2.name).toBe(r1.name)
+  })
+})

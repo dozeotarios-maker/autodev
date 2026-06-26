@@ -21,12 +21,22 @@ You are the P6 RELEASE phase. Your job:
 `.trim()
 
 function buildP6Instruction(ctx: P6Context, outputFile: string, commitSha: string, pushResult: string): string {
+  const repoRootLines = ctx.repoRoot
+    ? [
+        '',
+        `## Project root (MANDATORY)`,
+        `All release operations under: ${ctx.repoRoot}`,
+        `Prefix every shell command with: cd ${ctx.repoRoot} &&`,
+      ]
+    : []
+
   return [
     ROLE_DIRECTIVES,
     '',
     `## Completed actions`,
     `Scoped commit SHA: ${commitSha}`,
     `Push result: ${pushResult}`,
+    ...repoRootLines,
     '',
     `## Required output`,
     `Write your result as valid JSON to: ${outputFile}`,
