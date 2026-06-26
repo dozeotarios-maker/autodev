@@ -183,7 +183,7 @@ export class LettaAdapter implements MemoryStore {
       return this.agentPromise
     }
 
-    this.agentPromise = (async () => {
+    const p = (async () => {
       // List existing agents — use name filter if available, with Array.isArray guard
       // for servers that wrap the list in { agents: [...] }.
       const listUrl = `${this.baseUrl}/v1/agents/?name=${encodeURIComponent(this.agentName)}`
@@ -224,8 +224,11 @@ export class LettaAdapter implements MemoryStore {
       this.resolvedAgentId = created.id
       return created.id
     })()
-
-    return this.agentPromise
+    // Fix: clear the cached promise on rejection so the next call retries fresh.
+    // On success, leave it cached (resolvedAgentId also short-circuits future calls).
+    p.catch(() => { this.agentPromise = null })
+    this.agentPromise = p
+    return p
   }
 
   /**

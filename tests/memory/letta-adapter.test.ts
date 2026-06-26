@@ -653,6 +653,59 @@ describe('S2-M6: LettaAdapter — agent list pagination/non-array shape', () => 
   })
 })
 
+// ─── Regression: rejected agentPromise is cleared so next call retries ──────
+
+describe('S2-M6: LettaAdapter — ensureAgent rejected promise is cleared (regression Fix #1)', () => {
+  const BASE = 'http://localhost:8283'
+
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('first store() fails (non-ok list response) then second store() with healthy mock succeeds and retries fetch', async () => {
+    // First call: list returns non-ok → ensureAgent rejects
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      text: async () => 'Service Unavailable',
+    })
+
+    const adapter = new LettaAdapter({ baseUrl: BASE })
+
+    // First store must reject
+    await expect(adapter.store('k', 'v')).rejects.toThrow('Letta ensureAgent list failed')
+
+    const callCountAfterFailure = fetchMock.mock.calls.length
+    expect(callCountAfterFailure).toBe(1)
+
+    // Now swap mock to healthy: list returns agent, then archival-memory store succeeds
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [{ id: 'agent-recovered-001', name: 'pi-autodev-memory' }],
+    })
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [],
+      text: async () => '',
+    })
+
+    // Second store must resolve (retried, not returning cached rejection)
+    await expect(adapter.store('k2', 'v2')).resolves.toBeUndefined()
+
+    // fetch must have been called again (new list + store = 2 more calls)
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(callCountAfterFailure)
+  })
+})
+
 describe('S2-M6: LettaAdapter — fetch timeout wired on store/recall/ensureAgent', () => {
   const BASE = 'http://localhost:8283'
   const AGENT_ID = 'agent-test-001'

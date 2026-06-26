@@ -54,9 +54,17 @@ async function recallMemoryBlock(ctx: P1Context): Promise<string | undefined> {
     if (safeLines.length === 0) return undefined
     const block = safeLines.join('\n')
     // Fix #5: truncate at a line boundary to avoid partial/malformed trailing bullets.
-    const capped = block.length > MEMORY_CHAR_CAP
-      ? block.slice(0, MEMORY_CHAR_CAP).replace(/\n[^\n]*$/, '') + '\n...(truncated)'
-      : block
+    // When the cap falls inside the only (or first) bullet — no '\n' in the sliced head —
+    // the regex matches nothing and a partial mid-token line would be emitted.
+    // In that case drop the partial bullet entirely and emit the omission marker.
+    let capped: string
+    if (block.length > MEMORY_CHAR_CAP) {
+      const head = block.slice(0, MEMORY_CHAR_CAP)
+      const trimmed = head.includes('\n') ? head.replace(/\n[^\n]*$/, '') : ''
+      capped = (trimmed || '(prior memory omitted: single entry exceeded cap)') + '\n...(truncated)'
+    } else {
+      capped = block
+    }
     return capped
   } catch {
     // backend error → degrade silently

@@ -886,6 +886,45 @@ describe('Fix #6: fail-closed screen — memoryStore present but screenContent u
   })
 })
 
+// ── Fix #5 regression: single bullet ≥ 1500 chars → omission marker, no partial emit ──
+
+describe('Fix #5 regression: single recalled bullet ≥ 1500 chars → omission marker, not partial emit', () => {
+  it('single hit whose value exceeds 1500 chars → P1 instruction contains omission marker, no partial bullet', async () => {
+    // Craft a value that when formatted as "- <value>" exceeds MEMORY_CHAR_CAP (1500).
+    // This is the case where block.includes('\n') is false after slicing.
+    const overlongValue = 'X'.repeat(1600) // "- " + 1600 > 1500
+    const memoryStore = makeMockMemoryStore([
+      { key: 'k1', value: overlongValue, score: 0.9 },
+    ])
+    const screenContent = vi.fn().mockResolvedValue({ safe: true, threats: [] })
+    const ctx: P1Context = {
+      phase: 'P1',
+      idea: 'Build a service with an overlong prior memory entry',
+      memoryStore,
+      screenContent,
+    }
+    const instruction = await buildP1Instruction(ctx, '/tmp/p1-spec.json')
+
+    // The memory section must be present (at least the heading)
+    expect(instruction).toContain('Prior memory (screened)')
+
+    // Must NOT contain any partial slice of the overlong value
+    // (i.e. no string that starts with 'X' and is < full length — a mid-cut would appear)
+    const memoryIdx = instruction.indexOf('## Prior memory (screened)')
+    const memorySection = instruction.slice(memoryIdx)
+
+    // The section must contain the truncated marker
+    expect(memorySection).toContain('...(truncated)')
+
+    // Must NOT contain a partial bullet starting with "- X" (which would be the garbled partial)
+    // The omission marker replaces any partial content when there's no newline in the sliced head.
+    expect(memorySection).not.toMatch(/^- X/m)
+
+    // The omission marker must be present
+    expect(memorySection).toContain('(prior memory omitted: single entry exceeded cap)')
+  })
+})
+
 // ── Fix #5: line-boundary truncation — no partial trailing bullet ─────────────
 
 describe('Fix #5: line-boundary cap — truncated block has no partial trailing bullet', () => {

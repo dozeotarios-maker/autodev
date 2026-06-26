@@ -1477,6 +1477,145 @@ describe('Fix #1: exactly-once terminal store — success-path store then lifecy
   }, 10_000)
 })
 
+// ── Fix (round-2): success store fires exactly once even if post-store step throws ──
+
+describe('Fix (round-2): success→post-store throw → _escalate does NOT store a second time', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'success-release-throw-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('successful P6 stores outcome=success exactly once; transparency.log("ALL DONE") throws → _escalate skips second store', async () => {
+    const { pi, fire } = makeMockPi()
+    const memoryStore = makeMockMemoryStore()
+
+    const outputDir = path.join(tmpDir, '.autodev', 'phase-output')
+    let steerCallCount = 0
+
+    // Drive all 6 phases through sendUserMessage intercept
+    ;(pi as unknown as Record<string, unknown>).sendUserMessage = vi.fn(async () => {
+      steerCallCount++
+      await fs.mkdir(outputDir, { recursive: true })
+      if (steerCallCount === 1) {
+        // P1
+        await fs.writeFile(path.join(outputDir, 'p1-spec.json'), JSON.stringify({
+          phase: 'P1',
+          spec: 'Build a REST API for todos with full authentication support and CRUD operations',
+          stackAdr: 'Node.js + Express + PostgreSQL stack',
+          webResearch: [],
+        }))
+      } else if (steerCallCount === 2) {
+        // P2
+        await fs.writeFile(path.join(outputDir, 'p2-domain.json'), JSON.stringify({
+          phase: 'P2',
+          domainModel: 'Todo entity with title, completed, userId. User with email, password hash.',
+          personaDebate: [{ persona: 'user', stance: 'positive', objections: [] }],
+        }))
+      } else if (steerCallCount === 3) {
+        // P3
+        await fs.writeFile(path.join(outputDir, 'p3-plan.json'), JSON.stringify({
+          phase: 'P3',
+          fileDAG: [{ file: 'src/index.ts', lane: 0, deps: [] }],
+          panelObjCount: 0,
+          sprintContract: {
+            goal: 'Build a REST API for todos with full authentication support',
+            successCriteria: ['All endpoints return correct status codes'],
+            outOfScope: ['Frontend'],
+          },
+          examplesTable: [{ scenario: 'create', input: 'POST /todos', expectedOutput: '201' }],
+        }))
+      } else if (steerCallCount === 4) {
+        // P4
+        await fs.writeFile(path.join(outputDir, 'p4-build.json'), JSON.stringify({
+          phase: 'P4',
+          laneResults: [{ laneId: 0, status: 'success', output: 'ok' }],
+          artifacts: ['src/index.ts'],
+        }))
+      } else if (steerCallCount === 5) {
+        // P5
+        await fs.writeFile(path.join(outputDir, 'p5-verify.json'), JSON.stringify({
+          phase: 'P5',
+          verifyReport: { deterministicPassed: true, holdoutPassed: true, securityClean: true },
+          reviewFindings: [],
+        }))
+      } else if (steerCallCount === 6) {
+        // P6
+        await fs.writeFile(path.join(outputDir, 'p6-release.json'), JSON.stringify({
+          phase: 'P6',
+          commitSha: 'abc123def456',
+          pushResult: 'pushed',
+        }))
+      }
+    })
+
+    // Make transparency.log throw on the "ALL DONE" message (called after lifecycle.release,
+    // within the try block — so catch fires _escalate which must skip the second store
+    // because _terminalStored is already true from the success path).
+    const transparencyLogMock = vi.fn(async (msg: string) => {
+      if (typeof msg === 'string' && msg.includes('ALL DONE')) {
+        throw new Error('simulated post-release failure')
+      }
+    })
+    const transparency: Transparency = {
+      log: transparencyLogMock,
+      appendEntry: vi.fn().mockResolvedValue(undefined),
+      setHudStatus: vi.fn(),
+      recordMetric: vi.fn().mockResolvedValue(undefined),
+    }
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency,
+      steerTimeoutMs: 5_000,
+      memoryStore,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+    void fire('input', makeInputEvent('Build a REST API for todos with full authentication'), ctx)
+
+    // Drive all 6 steers: poll and fire agent_end after each sendUserMessage.
+    // Each steer is: sendUserMessage fires (writes file) → drive loop detects increment
+    // → fires agent_end → phase advances → next sendUserMessage fires, etc.
+    // We stop after driving 6 steers and give the run time to settle.
+    const drivePhases = async () => {
+      let driven = 0
+      const deadline = Date.now() + 20_000
+      while (driven < 6 && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 30))
+        if (steerCallCount > driven) {
+          // New steer detected — give the async file write a moment to complete
+          await new Promise(r => setTimeout(r, 50))
+          driven = steerCallCount
+          fire('agent_end', makeAgentEndEvent('output written'), ctx)
+          // Allow agent_end handler + phase executor to process before next check
+          await new Promise(r => setTimeout(r, 50))
+        }
+      }
+    }
+    await drivePhases()
+
+    // Wait for post-P6 async processing: store(success) → transparency.log("ALL DONE") throws
+    // → catch → _escalate checks _terminalStored → skips second store
+    await new Promise(r => setTimeout(r, 1000))
+
+    // memoryStore.store must have been called EXACTLY ONCE with outcome='success'
+    // (the _escalate from the catch must NOT call store again because _terminalStored=true)
+    expect(memoryStore.store).toHaveBeenCalledTimes(1)
+    const storeArg = (memoryStore.store as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, Record<string, unknown>]
+    expect(storeArg[2]).toMatchObject({ outcome: 'success' })
+  }, 30_000)
+})
+
 // ── Fix #2: _operatorBrief stores to memoryStore with outcome='operator-brief' ─
 
 describe('Fix #2: _operatorBrief stores to memoryStore with outcome=operator-brief', () => {
