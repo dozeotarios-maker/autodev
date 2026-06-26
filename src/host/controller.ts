@@ -56,7 +56,14 @@ export function compactAsync(ctx: ExtensionContext): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     ctx.compact({
       onComplete: () => resolve(),
-      onError: (err: Error) => reject(err),
+      onError: (err: Error) => {
+        // "Nothing to compact" on a small session at a phase boundary is benign — skip it.
+        if (/nothing to compact|too small/i.test(err.message)) {
+          resolve()
+        } else {
+          reject(err)
+        }
+      },
     })
   })
 }
@@ -275,6 +282,14 @@ export class Controller {
   }
 
   private async _onInput(e: InputEvent, ctx: ExtensionContext): Promise<void> {
+    // Filter self-originated steers: pi echoes sendUserMessage back through the `input`
+    // event with source='extension'. These are autodev's own steer messages — the host LLM
+    // acts on them; the controller observes the result via agent_end, NOT via the input event.
+    if (e.source === 'extension') {
+      await this.opts.transparency.log('input ignored (self-steer, source=extension)')
+      return
+    }
+
     const text = e.text ?? ''
 
     // Detect idea vs question: ideas are statements, not questions or commands

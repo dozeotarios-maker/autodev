@@ -1616,6 +1616,206 @@ describe('Fix (round-2): success→post-store throw → _escalate does NOT store
   }, 30_000)
 })
 
+// ── Regression: self-steer filter (Fix 1) + compactAsync benign error (Fix 2) ──
+
+describe('Regression: _onInput ignores source=extension (self-steer)', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'selfsteer-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  function makeController(piMock: ExtensionAPI, opts: Partial<ControllerOptions> = {}) {
+    return new Controller(piMock, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency: makeNullTransparency(),
+      ...opts,
+    })
+  }
+
+  it('test 1: source=extension steer text does NOT start a run (lifecycle.run not called, stays ARMED)', async () => {
+    const { pi, fire } = makeMockPi()
+    const transparency = makeNullTransparency()
+    const ctrl = makeController(pi, { transparency })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    // Fire the exact steer text that caused the live bug, with source='extension'
+    const steerEvent: InputEvent = {
+      type: 'input',
+      text: '## Role: Discovery Agent (P1) You are the P1 DISCOVER phase.',
+      source: 'extension',
+    } as unknown as InputEvent
+
+    await fire('input', steerEvent, ctx)
+    await new Promise(r => setImmediate(r))
+
+    // Must NOT transition to RUNNING
+    expect(transparency.log).not.toHaveBeenCalledWith(expect.stringContaining('RUNNING'))
+    // Must log the self-steer ignore message
+    expect(transparency.log).toHaveBeenCalledWith('input ignored (self-steer, source=extension)')
+    // No sendUserMessage (P1 steer) must have fired
+    expect(pi.sendUserMessage).not.toHaveBeenCalled()
+    // Status must still be ARMED (set by session_start), never RUNNING
+    expect(ctx.ui.setStatus).not.toHaveBeenCalledWith('autodev', 'RUNNING')
+  })
+
+  it('test 2: source=interactive idea DOES start a run', async () => {
+    const { pi, fire } = makeMockPi()
+    const transparency = makeNullTransparency()
+    const ctrl = makeController(pi, { transparency })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    const ideaEvent: InputEvent = {
+      type: 'input',
+      text: 'add a slugify function with tests',
+      source: 'interactive',
+    } as unknown as InputEvent
+
+    void fire('input', ideaEvent, ctx)
+    await new Promise(r => setImmediate(r))
+
+    // Must transition to RUNNING
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('RUNNING'))
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith('autodev', 'RUNNING')
+
+    // Clean up
+    const outputDir = path.join(tmpDir, '.autodev', 'phase-output')
+    await fs.mkdir(outputDir, { recursive: true })
+    await fs.writeFile(path.join(outputDir, 'p1-spec.json'), JSON.stringify({
+      phase: 'P1', spec: 'Add a slugify function with full test coverage', stackAdr: 'Node.js', webResearch: [],
+    }))
+    fire('agent_end', makeAgentEndEvent(), ctx)
+    await new Promise(r => setTimeout(r, 50))
+  }, 10_000)
+
+  it('test 3: source=rpc idea DOES start a run', async () => {
+    const { pi, fire } = makeMockPi()
+    const transparency = makeNullTransparency()
+    const ctrl = makeController(pi, { transparency })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    const rpcEvent: InputEvent = {
+      type: 'input',
+      text: 'add a slugify function with tests',
+      source: 'rpc',
+    } as unknown as InputEvent
+
+    void fire('input', rpcEvent, ctx)
+    await new Promise(r => setImmediate(r))
+
+    // Must transition to RUNNING
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('RUNNING'))
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith('autodev', 'RUNNING')
+
+    // Clean up
+    const outputDir = path.join(tmpDir, '.autodev', 'phase-output')
+    await fs.mkdir(outputDir, { recursive: true })
+    await fs.writeFile(path.join(outputDir, 'p1-spec.json'), JSON.stringify({
+      phase: 'P1', spec: 'Add a slugify function with full test coverage via rpc', stackAdr: 'Node.js', webResearch: [],
+    }))
+    fire('agent_end', makeAgentEndEvent(), ctx)
+    await new Promise(r => setTimeout(r, 50))
+  }, 10_000)
+})
+
+describe('Regression: compactAsync resolves on "nothing to compact" (Fix 2)', () => {
+  it('test 4a: compactAsync resolves when onError fires with "Nothing to compact (session too small)"', async () => {
+    const ctx = {
+      compact: vi.fn(({ onError }: { onComplete: () => void; onError: (e: Error) => void }) => {
+        setImmediate(() => onError(new Error('Nothing to compact (session too small)')))
+      }),
+    } as unknown as ExtensionContext
+
+    // Must resolve, not reject
+    await expect(compactAsync(ctx)).resolves.toBeUndefined()
+  })
+
+  it('test 4b: compactAsync rejects when onError fires with a different error ("disk full")', async () => {
+    const ctx = {
+      compact: vi.fn(({ onError }: { onComplete: () => void; onError: (e: Error) => void }) => {
+        setImmediate(() => onError(new Error('disk full')))
+      }),
+    } as unknown as ExtensionContext
+
+    // Must reject with the original error
+    await expect(compactAsync(ctx)).rejects.toThrow('disk full')
+  })
+})
+
+describe('Regression: lock frees after escalate, fresh interactive idea starts new run (Fix 1 + Fix 3)', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'lockfree-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('test 5: after escalate→ARMED, a fresh source=interactive idea starts a new run (lock not stuck)', async () => {
+    const { pi, fire } = makeMockPi()
+    const transparency = makeNullTransparency()
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency,
+      steerTimeoutMs: 50, // very short → P1 times out → escalate → ARMED
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    // First run — times out, escalates, releases lock back to ARMED
+    void fire('input', {
+      type: 'input', text: 'add a slugify function with tests', source: 'interactive',
+    } as unknown as InputEvent, ctx)
+
+    // Wait for escalation to complete
+    await new Promise(r => setTimeout(r, 500))
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('ESCALATE'))
+
+    // Reset mock call history so we can verify the second run independently
+    ;(transparency.log as ReturnType<typeof vi.fn>).mockClear()
+    ;(ctx.ui.setStatus as ReturnType<typeof vi.fn>).mockClear()
+
+    // Second run with a fresh interactive idea — should start (lock was released)
+    void fire('input', {
+      type: 'input', text: 'add a debounce utility function with tests', source: 'interactive',
+    } as unknown as InputEvent, ctx)
+
+    await new Promise(r => setImmediate(r))
+    await new Promise(r => setTimeout(r, 50))
+
+    // Must have transitioned to RUNNING again (lock was freed, not stuck)
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('RUNNING'))
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith('autodev', 'RUNNING')
+
+    // Clean up: let the second run timeout too (steerTimeoutMs=50)
+    await new Promise(r => setTimeout(r, 500))
+  }, 10_000)
+})
+
 // ── Fix #2: _operatorBrief stores to memoryStore with outcome='operator-brief' ─
 
 describe('Fix #2: _operatorBrief stores to memoryStore with outcome=operator-brief', () => {
