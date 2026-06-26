@@ -91,8 +91,8 @@ function makeInputEvent(text: string): InputEvent {
   return {
     type: 'input',
     text,
-    source: 'user',
-  } as unknown as InputEvent
+    source: 'interactive',
+  }
 }
 
 function makeSessionStartEvent(): SessionStartEvent {
