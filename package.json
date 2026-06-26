@@ -36,5 +36,9 @@
     "autodev",
     "autonomous",
     "build-pipeline"
-  ]
+  ],
+  "pi": {
+    "extensions": ["./dist/extension/index.js"],
+    "skills": ["./skills"]
+  }
 }
