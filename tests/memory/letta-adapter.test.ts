@@ -1,6 +1,6 @@
 // S2-M6 — LettaAdapter contract + unit tests (D1: test-first).
 // Covers: mock path (store/recall/contradiction/health) + real-HTTP contract
-// (correct Letta v1 endpoints verified against the real API shape).
+// (correct Letta v1 endpoints verified live against the real API, June 2026).
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import { LettaAdapter } from '../../src/memory/letta-adapter.js'
 import type { MemoryStore } from '../../src/ports.js'
@@ -127,8 +127,8 @@ describe('S2-M6: LettaAdapter — contract tests (real HTTP endpoint shape)', ()
     vi.unstubAllGlobals()
   })
 
-  it('store hits POST /v1/agents/{id}/archival with body { text: "[key] value" }', async () => {
-    // Recorded real Letta v1 response shape for archival insert
+  it('store hits POST /v1/agents/{id}/archival-memory with body { text: "[key] value" }', async () => {
+    // Recorded real Letta v1 response shape for archival-memory insert (array)
     const passage = {
       id: 'passage-abc123',
       text: '[mykey] myvalue',
@@ -139,8 +139,8 @@ describe('S2-M6: LettaAdapter — contract tests (real HTTP endpoint shape)', ()
     fetchMock.mockResolvedValueOnce({
       ok: true,
       status: 200,
-      json: async () => passage,
-      text: async () => JSON.stringify(passage),
+      json: async () => [passage],
+      text: async () => JSON.stringify([passage]),
     })
 
     const adapter = new LettaAdapter({ baseUrl: BASE, agentId: AGENT_ID })
@@ -149,8 +149,8 @@ describe('S2-M6: LettaAdapter — contract tests (real HTTP endpoint shape)', ()
     expect(fetchMock).toHaveBeenCalledTimes(1)
     const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit]
 
-    // Correct endpoint
-    expect(url).toBe(`${BASE}/v1/agents/${AGENT_ID}/archival`)
+    // Correct endpoint: archival-memory (not archival)
+    expect(url).toBe(`${BASE}/v1/agents/${AGENT_ID}/archival-memory`)
     expect(options.method).toBe('POST')
 
     // Body must be JSON with { text: "[key] value" }
@@ -162,16 +162,19 @@ describe('S2-M6: LettaAdapter — contract tests (real HTTP endpoint shape)', ()
     expect(headers['Content-Type']).toBe('application/json')
   })
 
-  it('recall hits GET /v1/agents/{id}/archival?query=...&limit=N', async () => {
-    // Recorded real Letta v1 response: array of Passage objects
-    const passages = [
-      { id: 'p1', text: 'result one', score: 0.92 },
-      { id: 'p2', text: 'result two', score: 0.75 },
-    ]
+  it('recall hits GET /v1/agents/{id}/archival-memory/search?query=...&limit=N', async () => {
+    // Recorded real Letta v1 search response shape
+    const searchResponse = {
+      results: [
+        { id: 'p1', content: 'result one', timestamp: '2026-06-26T07:00:00Z', tags: [] },
+        { id: 'p2', content: 'result two', timestamp: '2026-06-26T07:01:00Z', tags: [] },
+      ],
+      count: 2,
+    }
     fetchMock.mockResolvedValueOnce({
       ok: true,
       status: 200,
-      json: async () => passages,
+      json: async () => searchResponse,
     })
 
     const adapter = new LettaAdapter({ baseUrl: BASE, agentId: AGENT_ID })
@@ -180,22 +183,22 @@ describe('S2-M6: LettaAdapter — contract tests (real HTTP endpoint shape)', ()
     expect(fetchMock).toHaveBeenCalledTimes(1)
     const [url] = fetchMock.mock.calls[0] as [string, RequestInit]
 
-    // Correct endpoint with query params
-    expect(url).toContain(`${BASE}/v1/agents/${AGENT_ID}/archival`)
+    // Correct endpoint: archival-memory/search (not archival)
+    expect(url).toContain(`${BASE}/v1/agents/${AGENT_ID}/archival-memory/search`)
     expect(url).toContain('query=test-query')
     expect(url).toContain('limit=5')
 
-    // Response mapping: id→key, text→value, score preserved
+    // Response mapping: id→key, content→value, score defaults to 0.5
     expect(results).toHaveLength(2)
-    expect(results[0]).toEqual({ key: 'p1', value: 'result one', score: 0.92 })
-    expect(results[1]).toEqual({ key: 'p2', value: 'result two', score: 0.75 })
+    expect(results[0]).toEqual({ key: 'p1', value: 'result one', score: 0.5 })
+    expect(results[1]).toEqual({ key: 'p2', value: 'result two', score: 0.5 })
   })
 
-  it('recall defaults score to 0.5 when passage has no score field', async () => {
+  it('recall defaults score to 0.5 (search endpoint has no score field)', async () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
       status: 200,
-      json: async () => [{ id: 'p1', text: 'some text' }],
+      json: async () => ({ results: [{ id: 'p1', content: 'some text' }], count: 1 }),
     })
     const adapter = new LettaAdapter({ baseUrl: BASE, agentId: AGENT_ID })
     const results = await adapter.recall('q')
@@ -276,18 +279,155 @@ describe('S2-M6: LettaAdapter — contract tests (real HTTP endpoint shape)', ()
   })
 
   it('contradiction detection works on real recalled passages', async () => {
-    // Recall returns two passages with same key but different texts → conflict
+    // Search returns two passages with different content → conflict
     fetchMock.mockResolvedValueOnce({
       ok: true,
       status: 200,
-      json: async () => [
-        { id: 'p1', text: 'service X uses REST' },
-        { id: 'p2', text: 'service X uses gRPC' },
-      ],
+      json: async () => ({
+        results: [
+          { id: 'p1', content: 'service X uses REST' },
+          { id: 'p2', content: 'service X uses gRPC' },
+        ],
+        count: 2,
+      }),
     })
     const adapter = new LettaAdapter({ baseUrl: BASE, agentId: AGENT_ID })
     const conflicts = await adapter.detectContradictions('auth-method')
     expect(conflicts.length).toBeGreaterThan(0)
     expect(conflicts[0].conflictFlag).toBe(true)
+  })
+})
+
+// ─── ensureAgent tests (stubbed fetch, no live server) ───────────────────────
+
+describe('S2-M6: LettaAdapter — ensureAgent (stubbed fetch)', () => {
+  const BASE = 'http://localhost:8283'
+
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('ensureAgent finds existing agent by name and caches its id', async () => {
+    // GET /v1/agents/ returns a list including our named agent
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [
+        { id: 'agent-existing-001', name: 'pi-autodev-memory' },
+        { id: 'agent-other-002', name: 'other-agent' },
+      ],
+    })
+    // GET /v1/agents/{id}/archival-memory/search for recall
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ results: [], count: 0 }),
+    })
+
+    const adapter = new LettaAdapter({ baseUrl: BASE })
+    await adapter.recall('anything')
+
+    // First call: list agents
+    const [listUrl] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(listUrl).toBe(`${BASE}/v1/agents/`)
+
+    // Second call: search uses the resolved id
+    const [searchUrl] = fetchMock.mock.calls[1] as [string, RequestInit]
+    expect(searchUrl).toContain('agent-existing-001')
+  })
+
+  it('ensureAgent creates agent when none found by name', async () => {
+    // GET /v1/agents/ returns empty list
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [],
+    })
+    // POST /v1/agents/ creates agent
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: 'agent-newly-created-999', name: 'pi-autodev-memory' }),
+    })
+    // store POST to archival-memory
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [{ id: 'p1', text: '[k] v' }],
+      text: async () => '',
+    })
+
+    const adapter = new LettaAdapter({ baseUrl: BASE })
+    await adapter.store('k', 'v')
+
+    // list, create, store
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+
+    const [createUrl, createOpts] = fetchMock.mock.calls[1] as [string, RequestInit]
+    expect(createUrl).toBe(`${BASE}/v1/agents/`)
+    const createBody = JSON.parse(createOpts.body as string) as { name: string; model: string }
+    expect(createBody.name).toBe('pi-autodev-memory')
+    expect(createBody.model).toBe('letta/letta-free')
+
+    // store uses the newly-created id
+    const [storeUrl] = fetchMock.mock.calls[2] as [string, RequestInit]
+    expect(storeUrl).toContain('agent-newly-created-999')
+  })
+
+  it('ensureAgent caches resolved id — second call does not re-list', async () => {
+    // First ensureAgent: list → found
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [{ id: 'agent-cached-123', name: 'pi-autodev-memory' }],
+    })
+    // store call 1
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [],
+      text: async () => '',
+    })
+    // store call 2 (no extra ensureAgent list call)
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [],
+      text: async () => '',
+    })
+
+    const adapter = new LettaAdapter({ baseUrl: BASE })
+    await adapter.store('k1', 'v1')
+    await adapter.store('k2', 'v2')
+
+    // Only 3 calls total: 1 list + 2 stores (not 2 lists)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('ensureAgent is bypassed when static agentId is provided', async () => {
+    // store hits archival-memory directly, no list/create calls
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => [],
+      text: async () => '',
+    })
+
+    const adapter = new LettaAdapter({ baseUrl: BASE, agentId: 'static-agent-id' })
+    await adapter.store('k', 'v')
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toContain('static-agent-id')
+    // Must go straight to archival-memory, not to the agent list/create endpoint
+    expect(url).toContain('/archival-memory')
+    expect(url).not.toBe(`${BASE}/v1/agents/`)
   })
 })
