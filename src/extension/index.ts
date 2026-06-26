@@ -24,6 +24,7 @@ import type {
 import { LettaAdapter } from '../memory/letta-adapter.js'
 import { GeminiEmbedder } from '../memory/gemini-embedder.js'
 import { OllamaEmbedder } from '../memory/ollama-embedder.js'
+import { CodebaseMemoryAdapter } from '../memory/codebase-memory-adapter.js'
 
 // ── Lane D: Transparency ──────────────────────────────────────────────────────
 import { TransparencyImpl } from '../transparency/index.js'
@@ -364,12 +365,19 @@ export default function autodevExtension(pi: ExtensionAPI): void {
   const transparency = buildTransparency({ repoRoot })
   const gitOps = buildGitOps({ repoRoot })
 
+  const memoryStore = buildMemoryStore({})
+  const embedder = buildEmbedder({})
+  const codebaseMemory = new CodebaseMemoryAdapter()
+
   const controller = new Controller(pi, {
     repoRoot,
     verifier,
     gitOps,
     judge,
     transparency,
+    memoryStore,
+    embedder,
+    codebaseMemory,
   })
 
   controller.wire()

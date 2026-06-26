@@ -25,7 +25,7 @@ import type {
   ToolCallEventResult,
   SessionBeforeCompactEvent,
 } from '@earendil-works/pi-coding-agent'
-import type { Verifier, GitOps, Judge, Transparency } from '../ports.js'
+import type { Verifier, GitOps, Judge, Transparency, MemoryStore, Embedder } from '../ports.js'
 import { HostAgent } from './host-agent.js'
 import { SubagentDriver } from './subagent-driver.js'
 import { FSM } from '../engine/fsm.js'
@@ -85,6 +85,10 @@ export interface ControllerOptions {
   pauseFilePath?: string
   /** Optional RetroWriter for post-run retro (injected for test isolation) */
   retroWriter?: RetroWriter
+  /** Optional memory backends — wired at entry; probed by /autodev-doctor (not yet consumed by phases). */
+  memoryStore?: MemoryStore
+  embedder?: Embedder
+  codebaseMemory?: { healthCheck(): Promise<{ ok: boolean; details?: string }> }
 }
 
 // ── Controller ────────────────────────────────────────────────────────────────
@@ -240,6 +244,18 @@ export class Controller {
         } catch {
           checks.push('outputDir: not yet created (normal before first run)')
         }
+        const probe = async (name: string, hc?: { healthCheck(): Promise<{ ok: boolean; details?: string }> }) => {
+          if (!hc) { checks.push(`${name}: not wired`); return }
+          try {
+            const r = await hc.healthCheck()
+            checks.push(`${name}: ${r.ok ? 'OK' : 'DOWN'}${r.details ? ' (' + r.details + ')' : ''}`)
+          } catch (e) {
+            checks.push(`${name}: ERROR (${e instanceof Error ? e.message : String(e)})`)
+          }
+        }
+        await probe('letta (memory)', this.opts.memoryStore)
+        await probe('embedder', this.opts.embedder)
+        await probe('codebase-memory', this.opts.codebaseMemory)
         ctx.ui.notify(`[pi-autodev doctor]\n${checks.join('\n')}`, 'info')
       },
     })
