@@ -1,20 +1,17 @@
-// S2-M6 — Codebase-memory adapter.
-// ARCHITECTURE CORRECTION: codebase-memory-mcp is a binary that speaks JSON-RPC 2.0
-// over stdio (not HTTP). The Stage-1 implementation wrongly assumed an HTTP MCP server.
+// S2-M6 — Codebase-memory adapter (MCP protocol rewrite).
 //
-// Real access pattern:
+// codebase-memory-mcp 0.10.0 is a JSON-RPC 2.0 MCP server on stdio.
+// Protocol:
 //   1. spawn("codebase-memory-mcp", [], { stdio: ['pipe','pipe','pipe'] })
-//   2. write JSON-RPC 2.0 request to stdin
-//   3. read one newline-terminated JSON-RPC response from stdout
-//   4. parse and return the result
+//   2. Send { jsonrpc:"2.0", id:1, method:"initialize", params:{ protocolVersion, capabilities, clientInfo } }
+//   3. Send { jsonrpc:"2.0", method:"notifications/initialized" }  (no id = notification)
+//   4. Multiplex tools/call requests by JSON-RPC id over the kept-open stdio.
+//   5. Results arrive in result.content (MCP content array); text items are JSON strings → parse.
 //
-// BackendUnavailableError is thrown if:
-//   - the binary is not found (ENOENT)
-//   - the process exits non-zero before responding
-//   - the response cannot be parsed
+// One long-lived child per adapter instance. Handshake once. close()/dispose() tears it down.
 //
 // Mock path: pass { mock: true } or set CODEBASE_MEMORY_MOCK=1 env var.
-import { spawn } from 'child_process'
+import { spawn, type ChildProcess } from 'child_process'
 
 export interface CallerRef {
   file: string
@@ -40,15 +37,26 @@ export interface CodebaseMemoryOptions {
   binaryPath?: string
   /** Timeout for a single RPC call, in ms. Defaults to 10_000. */
   timeoutMs?: number
+  /**
+   * Root of the repository to index. Defaults to process.cwd().
+   * Passed to index_repository{repo_path} when the repo is not yet indexed.
+   */
+  repoRoot?: string
 }
 
-// ─── JSON-RPC 2.0 helpers ───────────────────────────────────────────────────
+// ─── JSON-RPC 2.0 helpers ────────────────────────────────────────────────────
 
 interface JsonRpcRequest {
   jsonrpc: '2.0'
   id: number
   method: string
   params: Record<string, unknown>
+}
+
+interface JsonRpcNotification {
+  jsonrpc: '2.0'
+  method: string
+  params?: Record<string, unknown>
 }
 
 interface JsonRpcSuccess<T> {
@@ -69,7 +77,19 @@ function isRpcError<T>(r: JsonRpcResponse<T>): r is JsonRpcError {
   return 'error' in r
 }
 
-// ─── In-memory mock call graph ───────────────────────────────────────────────
+// MCP result.content item
+interface McpContentItem {
+  type: string
+  text?: string
+}
+
+// MCP tools/call result shape
+interface McpToolResult {
+  content: McpContentItem[]
+  isError?: boolean
+}
+
+// ─── In-memory mock data ──────────────────────────────────────────────────────
 
 const MOCK_CALL_GRAPH: Record<string, CallerRef[]> = {
   processPayment: [
@@ -84,61 +104,46 @@ const MOCK_CALL_GRAPH: Record<string, CallerRef[]> = {
   sendEmail: [
     { file: 'src/notifications/email.ts', line: 11, symbol: 'notifyUser' },
   ],
+  execute: [
+    { file: 'src/host/controller.ts', line: 1, symbol: '_runPhases' },
+  ],
 }
 
-// ─── Adapter ─────────────────────────────────────────────────────────────────
+// ─── Persistent MCP client ───────────────────────────────────────────────────
 
-export class CodebaseMemoryAdapter {
-  private readonly mock: boolean
-  private readonly binaryPath: string
-  private readonly timeoutMs: number
-  private _rpcIdCounter = 0
+type PendingResolver = {
+  resolve: (value: unknown) => void
+  reject: (err: Error) => void
+  timer: ReturnType<typeof setTimeout>
+}
 
-  constructor(opts: CodebaseMemoryOptions = {}) {
-    this.mock = opts.mock ?? process.env['CODEBASE_MEMORY_MOCK'] === '1'
-    this.binaryPath = opts.binaryPath ?? 'codebase-memory-mcp'
-    this.timeoutMs = opts.timeoutMs ?? 10_000
-  }
+class McpClient {
+  private proc: ChildProcess | null = null
+  private pending = new Map<number, PendingResolver>()
+  private idCounter = 0
+  private stdoutBuf = ''
+  private initialized = false
+  private initPromise: Promise<void> | null = null
+  private closed = false
 
-  /**
-   * Find all call-sites for a symbol.
-   * Mock: returns MOCK_CALL_GRAPH entries.
-   * Real: spawns codebase-memory-mcp, sends find_callers JSON-RPC request,
-   *       reads the JSON-RPC response from stdout.
-   */
-  async findCallers(symbol: string): Promise<CallerRef[]> {
-    if (this.mock) {
-      return MOCK_CALL_GRAPH[symbol] ?? []
-    }
-    const result = await this._rpc<{ callers: CallerRef[] }>('find_callers', { symbol })
-    return result.callers ?? []
-  }
+  constructor(
+    private readonly binaryPath: string,
+    private readonly timeoutMs: number,
+  ) {}
 
   /**
-   * Health check: in mock mode always ok.
-   * In real mode, sends a JSON-RPC "ping" (method: health_check) and checks the
-   * process exits cleanly.  If the binary is absent → ok:false (no throw).
+   * Lazily spawn the process and perform the MCP initialize handshake once.
+   * Subsequent calls return the cached promise.
    */
-  async healthCheck(): Promise<{ ok: boolean; details?: string }> {
-    if (this.mock) {
-      return { ok: true, details: 'mock mode' }
+  ensureConnected(): Promise<void> {
+    if (this.closed) {
+      return Promise.reject(new BackendUnavailableError('McpClient is closed'))
     }
-    try {
-      await this._rpc<{ status: string }>('health_check', {})
-      return { ok: true }
-    } catch (err) {
-      return { ok: false, details: String(err) }
-    }
-  }
+    if (this.initialized) return Promise.resolve()
+    if (this.initPromise) return this.initPromise
 
-  /**
-   * Invoke a JSON-RPC method against the codebase-memory-mcp binary over stdio.
-   * Spawns the process, writes the request to stdin, reads the first newline-
-   * terminated line from stdout, then closes stdin to let the process exit.
-   */
-  private _rpc<T>(method: string, params: Record<string, unknown>): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      let proc: ReturnType<typeof spawn>
+    this.initPromise = new Promise<void>((resolve, reject) => {
+      let proc: ChildProcess
 
       try {
         proc = spawn(this.binaryPath, [], {
@@ -146,103 +151,411 @@ export class CodebaseMemoryAdapter {
           shell: false,
         })
       } catch (err) {
-        // spawn() itself may throw synchronously on very bad paths
         reject(new BackendUnavailableError(
-          `codebase-memory-mcp binary not found or could not be spawned: ${String(err)}`
+          `codebase-memory-mcp binary could not be spawned: ${String(err)}`
         ))
         return
       }
 
-      const id = ++this._rpcIdCounter
-      const request: JsonRpcRequest = { jsonrpc: '2.0', id, method, params }
+      this.proc = proc
 
-      let stdout = ''
-      let timedOut = false
-
-      const timer = setTimeout(() => {
-        timedOut = true
-        proc.kill()
-        reject(new BackendUnavailableError(
-          `codebase-memory-mcp RPC "${method}" timed out after ${this.timeoutMs}ms`
-        ))
-      }, this.timeoutMs)
-
+      // Route stdout through line buffer → dispatch to pending resolvers
       proc.stdout?.on('data', (chunk: Buffer) => {
-        stdout += chunk.toString()
+        this.stdoutBuf += chunk.toString()
+        this._drainLines()
       })
 
       proc.on('error', (err: NodeJS.ErrnoException) => {
-        clearTimeout(timer)
-        if (timedOut) return
-        if (err.code === 'ENOENT') {
-          reject(new BackendUnavailableError(
-            `codebase-memory-mcp binary not found on PATH: "${this.binaryPath}"`
-          ))
-        } else {
-          reject(new BackendUnavailableError(
-            `codebase-memory-mcp spawn error: ${String(err)}`
-          ))
+        const msg = err.code === 'ENOENT'
+          ? `codebase-memory-mcp binary not found on PATH: "${this.binaryPath}"`
+          : `codebase-memory-mcp spawn error: ${String(err)}`
+        const bErr = new BackendUnavailableError(msg)
+
+        if (!this.initialized) {
+          this.initPromise = null
+          reject(bErr)
         }
+        // Reject all pending calls
+        for (const [, p] of this.pending) {
+          clearTimeout(p.timer)
+          p.reject(bErr)
+        }
+        this.pending.clear()
       })
 
       proc.on('close', (exitCode: number | null) => {
-        clearTimeout(timer)
-        if (timedOut) return
-
-        if (exitCode !== 0 && stdout.trim() === '') {
-          reject(new BackendUnavailableError(
-            `codebase-memory-mcp exited with code ${exitCode} and no output`
-          ))
-          return
+        const bErr = new BackendUnavailableError(
+          `codebase-memory-mcp process exited with code ${exitCode}`
+        )
+        if (!this.initialized) {
+          this.initPromise = null
+          reject(bErr)
         }
-
-        // Parse the first complete JSON line from stdout.
-        const firstLine = stdout.split('\n').find(l => l.trim().length > 0)
-        if (!firstLine) {
-          reject(new BackendUnavailableError(
-            'codebase-memory-mcp returned no JSON output'
-          ))
-          return
+        for (const [, p] of this.pending) {
+          clearTimeout(p.timer)
+          p.reject(bErr)
         }
-
-        let parsed: JsonRpcResponse<T>
-        try {
-          parsed = JSON.parse(firstLine) as JsonRpcResponse<T>
-        } catch {
-          reject(new BackendUnavailableError(
-            `codebase-memory-mcp returned invalid JSON: ${firstLine.slice(0, 200)}`
-          ))
-          return
-        }
-
-        if (isRpcError(parsed)) {
-          reject(new BackendUnavailableError(
-            `codebase-memory-mcp RPC error ${parsed.error.code}: ${parsed.error.message}`
-          ))
-          return
-        }
-
-        resolve(parsed.result)
+        this.pending.clear()
+        this.proc = null
       })
 
-      // Write request + close stdin to signal end-of-input.
-      try {
-        proc.stdin?.write(JSON.stringify(request) + '\n', (err) => {
-          if (err) {
-            clearTimeout(timer)
-            reject(new BackendUnavailableError(
-              `Failed to write to codebase-memory-mcp stdin: ${String(err)}`
-            ))
-            return
-          }
-          proc.stdin?.end()
-        })
-      } catch (err) {
-        clearTimeout(timer)
-        reject(new BackendUnavailableError(
-          `Failed to write to codebase-memory-mcp stdin: ${String(err)}`
-        ))
+      // Send initialize request
+      const initId = ++this.idCounter
+      const initReq: JsonRpcRequest = {
+        jsonrpc: '2.0',
+        id: initId,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'pi-autodev', version: '1' },
+        },
       }
+
+      // Register resolver for the initialize response
+      const initTimer = setTimeout(() => {
+        this.initPromise = null
+        reject(new BackendUnavailableError(
+          `codebase-memory-mcp initialize timed out after ${this.timeoutMs}ms`
+        ))
+        proc.kill()
+      }, this.timeoutMs)
+
+      this.pending.set(initId, {
+        resolve: () => {
+          clearTimeout(initTimer)
+          // Send notifications/initialized (no id = notification)
+          const notif: JsonRpcNotification = {
+            jsonrpc: '2.0',
+            method: 'notifications/initialized',
+          }
+          this._write(JSON.stringify(notif))
+          this.initialized = true
+          resolve()
+        },
+        reject: (err: Error) => {
+          clearTimeout(initTimer)
+          this.initPromise = null
+          reject(err)
+        },
+        timer: initTimer,
+      })
+
+      this._write(JSON.stringify(initReq))
+    })
+
+    return this.initPromise
+  }
+
+  /**
+   * Call a tool via tools/call and return the parsed first text content.
+   */
+  async callTool<T>(name: string, args: Record<string, unknown>): Promise<T> {
+    await this.ensureConnected()
+
+    return new Promise<T>((resolve, reject) => {
+      const id = ++this.idCounter
+
+      const timer = setTimeout(() => {
+        this.pending.delete(id)
+        reject(new BackendUnavailableError(
+          `codebase-memory-mcp tools/call "${name}" timed out after ${this.timeoutMs}ms`
+        ))
+      }, this.timeoutMs)
+
+      this.pending.set(id, {
+        resolve: (raw: unknown) => {
+          clearTimeout(timer)
+          try {
+            const toolResult = raw as McpToolResult
+            const textItem = toolResult.content?.find(
+              (c: McpContentItem) => c.type === 'text' && typeof c.text === 'string'
+            )
+            if (!textItem?.text) {
+              reject(new BackendUnavailableError(
+                `codebase-memory-mcp tools/call "${name}" returned no text content`
+              ))
+              return
+            }
+            const parsed = JSON.parse(textItem.text) as T
+            resolve(parsed)
+          } catch (err) {
+            reject(new BackendUnavailableError(
+              `codebase-memory-mcp tools/call "${name}" content parse error: ${String(err)}`
+            ))
+          }
+        },
+        reject: (err: Error) => {
+          clearTimeout(timer)
+          reject(err)
+        },
+        timer,
+      })
+
+      const req: JsonRpcRequest = {
+        jsonrpc: '2.0',
+        id,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      }
+      this._write(JSON.stringify(req))
     })
   }
+
+  /** Tear down the child process. */
+  close(): void {
+    this.closed = true
+    this.initialized = false
+    this.initPromise = null
+    if (this.proc) {
+      try { this.proc.stdin?.end() } catch { /* ignore */ }
+      try { this.proc.kill() } catch { /* ignore */ }
+      this.proc = null
+    }
+    for (const [, p] of this.pending) {
+      clearTimeout(p.timer)
+      p.reject(new BackendUnavailableError('McpClient closed'))
+    }
+    this.pending.clear()
+  }
+
+  // ── private ────────────────────────────────────────────────────────────────
+
+  private _write(line: string): void {
+    try {
+      this.proc?.stdin?.write(line + '\n')
+    } catch (err) {
+      throw new BackendUnavailableError(
+        `Failed to write to codebase-memory-mcp stdin: ${String(err)}`
+      )
+    }
+  }
+
+  private _drainLines(): void {
+    const lines = this.stdoutBuf.split('\n')
+    // Keep any incomplete trailing line in the buffer
+    this.stdoutBuf = lines.pop() ?? ''
+
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      this._dispatch(trimmed)
+    }
+  }
+
+  private _dispatch(line: string): void {
+    let msg: JsonRpcResponse<unknown>
+    try {
+      msg = JSON.parse(line) as JsonRpcResponse<unknown>
+    } catch {
+      // Unparseable line — ignore (could be server log or stderr bleed)
+      return
+    }
+
+    // Ignore notifications (no id)
+    if (!('id' in msg) || msg.id == null) return
+
+    const pending = this.pending.get(msg.id)
+    if (!pending) return
+    this.pending.delete(msg.id)
+
+    if (isRpcError(msg)) {
+      pending.reject(new BackendUnavailableError(
+        `codebase-memory-mcp RPC error ${msg.error.code}: ${msg.error.message}`
+      ))
+    } else {
+      pending.resolve((msg as JsonRpcSuccess<unknown>).result)
+    }
+  }
+}
+
+// ─── Adapter ──────────────────────────────────────────────────────────────────
+
+// Probed trace_path result shape
+interface TracePathResult {
+  function: string
+  direction: string
+  callers?: Array<{ name: string; qualified_name: string; hop: number }>
+  callees?: Array<{ name: string; qualified_name: string; hop: number }>
+}
+
+// index_status result
+interface IndexStatusResult {
+  project: string
+  status: string
+  nodes?: number
+  edges?: number
+}
+
+// index_repository result
+interface IndexRepositoryResult {
+  project: string
+  status: string
+}
+
+// list_projects result
+interface ListProjectsResult {
+  projects: string[]
+  hint?: string
+}
+
+export class CodebaseMemoryAdapter {
+  private readonly mock: boolean
+  private readonly repoRoot: string
+  private client: McpClient | null = null
+  private projectName: string | null = null
+
+  constructor(opts: CodebaseMemoryOptions = {}) {
+    this.mock = opts.mock ?? process.env['CODEBASE_MEMORY_MOCK'] === '1'
+    this.repoRoot = opts.repoRoot ?? process.cwd()
+
+    if (!this.mock) {
+      this.client = new McpClient(
+        opts.binaryPath ?? 'codebase-memory-mcp',
+        opts.timeoutMs ?? 10_000,
+      )
+    }
+  }
+
+  /**
+   * Ensure the repo is indexed. Calls index_status; if not ready, calls
+   * index_repository. Caches the project name on the adapter.
+   */
+  async ensureIndexed(): Promise<void> {
+    if (this.mock) return
+    if (this.projectName) return
+
+    // Derive a candidate project name from the repo path (matches server convention)
+    // e.g. /root/pi-autodev → root-pi-autodev
+    const segments = this.repoRoot.replace(/^\//, '').split('/')
+    const candidateProject = segments.join('-')
+
+    // Try index_status first
+    try {
+      const status = await this.client!.callTool<IndexStatusResult>('index_status', {
+        project: candidateProject,
+      })
+      if (status.status === 'ready') {
+        this.projectName = candidateProject
+        return
+      }
+    } catch {
+      // Not indexed yet — fall through to index_repository
+    }
+
+    // Index the repository and capture the returned project name
+    const indexed = await this.client!.callTool<IndexRepositoryResult>('index_repository', {
+      repo_path: this.repoRoot,
+    })
+    this.projectName = indexed.project
+  }
+
+  /**
+   * Get a compact structural summary of the repository architecture.
+   */
+  async getArchitecture(): Promise<string> {
+    if (this.mock) {
+      return '{"project":"mock","total_nodes":0,"packages":[]}'
+    }
+    await this.ensureIndexed()
+    const result = await this.client!.callTool<Record<string, unknown>>('get_architecture', {
+      project: this.projectName!,
+    })
+    return JSON.stringify(result)
+  }
+
+  /**
+   * Find all call-sites for a symbol using trace_path (direction: inbound).
+   * Mock: returns MOCK_CALL_GRAPH entries.
+   */
+  async findCallers(symbol: string): Promise<CallerRef[]> {
+    if (this.mock) {
+      return MOCK_CALL_GRAPH[symbol] ?? []
+    }
+    await this.ensureIndexed()
+
+    const result = await this.client!.callTool<TracePathResult>('trace_path', {
+      function_name: symbol,
+      project: this.projectName!,
+      direction: 'inbound',
+      depth: 2,
+    })
+
+    // Map trace_path callers to CallerRef[].
+    // The server returns {name, qualified_name, hop}; qualified_name encodes the file path:
+    //   root-pi-autodev.src.host.controller.Controller._runPhases
+    // We map qualified_name → file by replacing dots-after-project-prefix with slashes.
+    const callers = result.callers ?? []
+    return callers.map((c) => {
+      const file = qualifiedNameToFile(c.qualified_name, this.projectName!)
+      return { file, line: c.hop, symbol: c.name }
+    })
+  }
+
+  /**
+   * Health check: in mock mode always ok.
+   * Real: perform handshake + list_projects. Returns {ok:true} if server responds.
+   * Fail-conservative: any spawn/parse/timeout error → {ok:false, details}.
+   */
+  async healthCheck(): Promise<{ ok: boolean; details?: string }> {
+    if (this.mock) {
+      return { ok: true, details: 'mock mode' }
+    }
+    try {
+      // ensureConnected performs the handshake
+      await this.client!.ensureConnected()
+      // list_projects confirms the server is functional
+      await this.client!.callTool<ListProjectsResult>('list_projects', {})
+      return { ok: true }
+    } catch (err) {
+      return { ok: false, details: String(err) }
+    }
+  }
+
+  /**
+   * Tear down the persistent MCP child process.
+   */
+  close(): void {
+    this.client?.close()
+  }
+
+  /** Alias for close() to match dispose pattern. */
+  dispose(): void {
+    this.close()
+  }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Convert a qualified_name like "root-pi-autodev.src.host.controller.Controller._runPhases"
+ * to a file path like "src/host/controller.ts".
+ *
+ * Heuristic: strip the project prefix, then walk dot-separated segments converting
+ * to path segments. Stop when we find a .ts file-like segment (no uppercase first char
+ * and not a class/method name). If derivation fails, return the qualified_name as-is.
+ */
+function qualifiedNameToFile(qualifiedName: string, projectName: string): string {
+  const prefix = projectName + '.'
+  const rest = qualifiedName.startsWith(prefix)
+    ? qualifiedName.slice(prefix.length)
+    : qualifiedName
+
+  // Split on dots — segments that start with uppercase are class/method names, skip them
+  const parts = rest.split('.')
+  const fileParts: string[] = []
+  for (const part of parts) {
+    if (/^[A-Z_]/.test(part)) break  // reached a class/constructor/method
+    fileParts.push(part)
+  }
+
+  if (fileParts.length === 0) return qualifiedName
+
+  // Last file part: append .ts if it doesn't already have an extension
+  const last = fileParts[fileParts.length - 1]!
+  if (!last.includes('.')) {
+    fileParts[fileParts.length - 1] = last + '.ts'
+  }
+
+  return fileParts.join('/')
 }

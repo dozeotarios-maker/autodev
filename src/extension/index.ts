@@ -369,6 +369,8 @@ export default function autodevExtension(pi: ExtensionAPI): void {
   const embedder = buildEmbedder({})
   const codebaseMemory = new CodebaseMemoryAdapter()
 
+  const securityLane = buildSecurityLane({})
+
   const controller = new Controller(pi, {
     repoRoot,
     verifier,
@@ -378,6 +380,7 @@ export default function autodevExtension(pi: ExtensionAPI): void {
     memoryStore,
     embedder,
     codebaseMemory,
+    securityLane,
   })
 
   controller.wire()

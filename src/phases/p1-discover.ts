@@ -19,8 +19,48 @@ You are the P1 DISCOVER phase. Your job:
 4. Vet all proposed dependencies for known vulnerabilities and license compatibility (G21).
 `.trim()
 
-export function buildP1Instruction(ctx: P1Context, outputFile: string): string {
-  return [
+const MEMORY_CHAR_CAP = 1500
+
+/**
+ * Recall prior memory hits, screen each for injection threats, and return a
+ * capped block to inject into the P1 instruction.
+ * Returns undefined on any error (memory absent, backend down, screening error) —
+ * callers must degrade gracefully.
+ */
+async function recallMemoryBlock(ctx: P1Context): Promise<string | undefined> {
+  if (!ctx.memoryStore) return undefined
+  try {
+    const hits = await ctx.memoryStore.recall(ctx.idea, 3)
+    const safeLines: string[] = []
+    for (const hit of hits) {
+      let safe = true
+      if (ctx.screenContent) {
+        try {
+          const result = await ctx.screenContent(hit.value, 'repo')
+          if (!result.safe) { safe = false }
+        } catch {
+          // screening error → drop the hit (fail-safe)
+          safe = false
+        }
+      }
+      if (safe) {
+        safeLines.push(`- ${hit.value}`)
+      }
+    }
+    if (safeLines.length === 0) return undefined
+    const block = safeLines.join('\n')
+    const capped = block.length > MEMORY_CHAR_CAP ? block.slice(0, MEMORY_CHAR_CAP) + '\n...(truncated)' : block
+    return capped
+  } catch {
+    // backend error → degrade silently
+    return undefined
+  }
+}
+
+export async function buildP1Instruction(ctx: P1Context, outputFile: string): Promise<string>
+export function buildP1Instruction(ctx: P1Context, outputFile: string): string | Promise<string>
+export function buildP1Instruction(ctx: P1Context, outputFile: string): string | Promise<string> {
+  const base = [
     ROLE_DIRECTIVES,
     '',
     `## Input`,
@@ -47,6 +87,20 @@ export function buildP1Instruction(ctx: P1Context, outputFile: string): string {
     '',
     'Do NOT add extra fields. Write the file, then confirm "P1 output written."',
   ].join('\n')
+
+  // If no memory backend, return synchronously (preserves byte-identical baseline).
+  if (!ctx.memoryStore) return base
+
+  // Memory present: async path — recall, screen, cap, inject.
+  return recallMemoryBlock(ctx).then((block) => {
+    if (!block) return base
+    return [
+      base,
+      '',
+      '## Prior memory (screened)',
+      block,
+    ].join('\n')
+  })
 }
 
 export class P1Discover {

@@ -22,8 +22,8 @@ export interface PhaseExecutorOptions<I extends PhaseContext, O extends PhaseOut
   phase: string
   /** Path where the host must write the output JSON file */
   outputFile: string
-  /** Build the steer instruction from context */
-  buildInstruction(ctx: I): string
+  /** Build the steer instruction from context (may be async for memory recall) */
+  buildInstruction(ctx: I): string | Promise<string>
   /** Schema-validate the parsed JSON; return false → retry */
   validate(raw: unknown): raw is O
   /** Gate: post-validation check (e.g. panelObjCount within bounds). Return null = pass, string = fail+reason */
@@ -48,7 +48,7 @@ export class PhaseExecutor<I extends PhaseContext, O extends PhaseOutput> {
     // Ensure output directory exists
     await fs.mkdir(path.dirname(outputFile), { recursive: true })
 
-    const instruction = buildInstruction(ctx)
+    const instruction = await buildInstruction(ctx)
 
     // steer() already handles retry ≤2 for expectFile missing/invalid JSON
     let steerResult

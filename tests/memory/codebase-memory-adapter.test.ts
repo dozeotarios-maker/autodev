@@ -1,31 +1,37 @@
-// S2-M6 — CodebaseMemoryAdapter tests (D1: test-first).
-// Architecture correction: codebase-memory-mcp is a stdio JSON-RPC binary, NOT HTTP.
-// These tests mock child_process.spawn (hoisted vi.mock for ESM) to verify:
-//   - writes a well-formed JSON-RPC 2.0 request to stdin
-//   - parses the JSON-RPC response from stdout
-//   - throws BackendUnavailableError on ENOENT / non-zero exit / bad JSON / RPC error
-// Mock path tests run without any spawn mocking.
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
+// S2-M6 — CodebaseMemoryAdapter tests (MCP protocol rewrite).
+//
+// Architecture: codebase-memory-mcp is a persistent stdio MCP server.
+// Handshake: initialize → notifications/initialized → then tools/call multiplexed by id.
+// Results arrive in result.content[0].text (JSON string).
+//
+// Test strategy:
+//   - Mock child_process.spawn to control the fake process.
+//   - Feed responses line by line from the fake stdout.
+//   - Assert the handshake + tools/call envelopes.
+//   - Assert findCallers maps a recorded trace_path response to CallerRef[].
+//   - Assert healthCheck is ok + fail-conservative on error.
+//   - Mock path tests run without spawn mocking.
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { EventEmitter } from 'events'
 
-// Hoist the mock so it is set up before the ESM module graph resolves.
-// vi.mock is automatically hoisted to the top of the file by vitest.
 vi.mock('child_process', () => ({
   spawn: vi.fn(),
 }))
 
-// Import AFTER vi.mock so the module sees the mocked spawn.
-import { CodebaseMemoryAdapter, BackendUnavailableError } from '../../src/memory/codebase-memory-adapter.js'
+import {
+  CodebaseMemoryAdapter,
+  BackendUnavailableError,
+} from '../../src/memory/codebase-memory-adapter.js'
 import { spawn } from 'child_process'
 
 const spawnMock = vi.mocked(spawn)
 
-// ─── Fake child_process helper ────────────────────────────────────────────────
+// ─── Fake child process ───────────────────────────────────────────────────────
 
 interface FakeStdin {
   write: (data: string, cb?: (err?: Error | null) => void) => void
   end: () => void
-  _writtenData: string
+  _lines: string[]
 }
 
 interface FakeProc extends EventEmitter {
@@ -35,35 +41,78 @@ interface FakeProc extends EventEmitter {
   kill: ReturnType<typeof vi.fn>
 }
 
-function buildFakeProc(options: {
-  stdoutData?: string
-  exitCode?: number
-  delayMs?: number
-} = {}): FakeProc {
+function buildFakeProc(): FakeProc {
   const proc = new EventEmitter() as FakeProc
   proc.stdout = new EventEmitter()
   proc.stderr = new EventEmitter()
-  proc.kill = vi.fn()
+  proc.kill = vi.fn(() => { proc.emit('close', null) })
 
-  const state = { written: '' }
-
+  const lines: string[] = []
   proc.stdin = {
     write: (data: string, cb?: (err?: Error | null) => void) => {
-      state.written += data
-      proc.stdin._writtenData = state.written
+      lines.push(data)
+      proc.stdin._lines = lines
       if (cb) cb(null)
     },
-    end: () => {
-      const delay = options.delayMs ?? 0
-      setTimeout(() => {
-        if (options.stdoutData !== undefined) {
-          proc.stdout.emit('data', Buffer.from(options.stdoutData))
-        }
-        proc.emit('close', options.exitCode ?? 0)
-      }, delay)
-    },
-    _writtenData: '',
+    end: () => { /* no-op by default */ },
+    _lines: lines,
   }
+
+  return proc
+}
+
+/**
+ * Helper: emit a JSON-RPC response line to the fake proc's stdout.
+ */
+function emitLine(proc: FakeProc, obj: unknown): void {
+  proc.stdout.emit('data', Buffer.from(JSON.stringify(obj) + '\n'))
+}
+
+/**
+ * Build a fake proc that auto-answers the initialize handshake, then queues
+ * additional tool responses in order.
+ *
+ * autoResponses: array of result objects to return for tools/call in order.
+ */
+function buildAutoProc(autoResponses: unknown[] = []): FakeProc {
+  const proc = buildFakeProc()
+  const queue = [...autoResponses]
+  let toolCallCount = 0
+
+  const origWrite = proc.stdin.write.bind(proc.stdin)
+  proc.stdin.write = (data: string, cb?: (err?: Error | null) => void) => {
+    origWrite(data, cb)
+    let msg: { jsonrpc: string; id?: number; method?: string }
+    try { msg = JSON.parse(data.trim()) } catch { return }
+
+    if (msg.method === 'initialize' && msg.id != null) {
+      // Respond to initialize
+      setImmediate(() => {
+        emitLine(proc, {
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: '2024-11-05',
+            serverInfo: { name: 'codebase-memory-mcp', version: '0.10.0' },
+            capabilities: { tools: {} },
+          },
+        })
+      })
+    } else if (msg.method === 'tools/call' && msg.id != null) {
+      const response = queue[toolCallCount++]
+      if (response !== undefined) {
+        setImmediate(() => {
+          emitLine(proc, {
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { content: [{ type: 'text', text: JSON.stringify(response) }] },
+          })
+        })
+      }
+    }
+    // notifications/initialized has no id → no response needed
+  }
+
   return proc
 }
 
@@ -76,6 +125,10 @@ describe('S2-M6: CodebaseMemoryAdapter — mock path', () => {
     adapter = new CodebaseMemoryAdapter({ mock: true })
   })
 
+  afterEach(() => {
+    adapter.close()
+  })
+
   it('exposes findCallers method', () => {
     expect(typeof adapter.findCallers).toBe('function')
   })
@@ -86,7 +139,7 @@ describe('S2-M6: CodebaseMemoryAdapter — mock path', () => {
     expect(callers.length).toBeGreaterThan(0)
     expect(callers[0]).toHaveProperty('file')
     expect(callers[0]).toHaveProperty('line')
-    const uniqueFiles = new Set(callers.map(c => c.file))
+    const uniqueFiles = new Set(callers.map((c) => c.file))
     expect(uniqueFiles.size).toBeGreaterThanOrEqual(1)
   })
 
@@ -106,152 +159,459 @@ describe('S2-M6: CodebaseMemoryAdapter — mock path', () => {
     process.env['CODEBASE_MEMORY_MOCK'] = '1'
     try {
       const a = new CodebaseMemoryAdapter()
-      const health = await a.healthCheck()
-      expect(health.ok).toBe(true)
+      try {
+        const health = await a.healthCheck()
+        expect(health.ok).toBe(true)
+      } finally {
+        a.close()
+      }
     } finally {
       if (orig === undefined) delete process.env['CODEBASE_MEMORY_MOCK']
       else process.env['CODEBASE_MEMORY_MOCK'] = orig
     }
   })
+
+  it('ensureIndexed is a no-op in mock mode', async () => {
+    await expect(adapter.ensureIndexed()).resolves.toBeUndefined()
+    expect(spawnMock).not.toHaveBeenCalled()
+  })
+
+  it('getArchitecture returns stub JSON in mock mode', async () => {
+    const arch = await adapter.getArchitecture()
+    expect(typeof arch).toBe('string')
+    const parsed = JSON.parse(arch) as { project: string }
+    expect(parsed.project).toBe('mock')
+  })
 })
 
-// ─── Real path (stdio JSON-RPC) tests ────────────────────────────────────────
+// ─── MCP handshake tests ──────────────────────────────────────────────────────
 
-describe('S2-M6: CodebaseMemoryAdapter — stdio JSON-RPC (spawn mocked)', () => {
+describe('S2-M6: CodebaseMemoryAdapter — MCP handshake (spawn mocked)', () => {
   afterEach(() => {
     vi.clearAllMocks()
   })
 
-  it('findCallers sends a well-formed JSON-RPC 2.0 request to stdin', async () => {
-    const callers = [{ file: 'src/foo.ts', line: 10, symbol: 'bar' }]
-    const response = { jsonrpc: '2.0', id: 1, result: { callers } }
-    const fakeProc = buildFakeProc({ stdoutData: JSON.stringify(response) + '\n' })
-    spawnMock.mockReturnValue(fakeProc as unknown as ReturnType<typeof spawn>)
+  it('sends initialize then notifications/initialized before tools/call', async () => {
+    const proc = buildAutoProc([
+      // list_projects response (for healthCheck)
+      { projects: [] },
+    ])
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
 
     const adapter = new CodebaseMemoryAdapter({ mock: false, binaryPath: 'codebase-memory-mcp' })
-    const result = await adapter.findCallers('mySymbol')
+    await adapter.healthCheck()
+    adapter.close()
 
-    // spawn called with the binary name and correct options
-    expect(spawnMock).toHaveBeenCalledWith(
-      'codebase-memory-mcp',
-      [],
-      expect.objectContaining({ stdio: ['pipe', 'pipe', 'pipe'], shell: false })
-    )
+    const lines = proc.stdin._lines.map((l) => {
+      try { return JSON.parse(l.trim()) as Record<string, unknown> }
+      catch { return null }
+    }).filter(Boolean) as Array<Record<string, unknown>>
 
-    // stdin received a valid JSON-RPC 2.0 request
-    const written = fakeProc.stdin._writtenData.trim()
-    const req = JSON.parse(written) as { jsonrpc: string; id: number; method: string; params: { symbol: string } }
-    expect(req.jsonrpc).toBe('2.0')
-    expect(req.method).toBe('find_callers')
-    expect(req.params.symbol).toBe('mySymbol')
-    expect(typeof req.id).toBe('number')
+    // First message must be initialize
+    expect(lines[0]?.method).toBe('initialize')
+    expect(lines[0]?.id).toBeDefined()
+    expect((lines[0]?.params as Record<string, unknown>)?.protocolVersion).toBe('2024-11-05')
 
-    // Result parsed correctly from JSON-RPC response
-    expect(result).toEqual(callers)
+    // Second must be notifications/initialized (no id)
+    expect(lines[1]?.method).toBe('notifications/initialized')
+    expect(lines[1]?.id).toBeUndefined()
+
+    // Third must be tools/call
+    expect(lines[2]?.method).toBe('tools/call')
   })
 
-  it('findCallers parses JSON-RPC result.callers array from stdout', async () => {
-    const callers = [
-      { file: 'a.ts', line: 1 },
-      { file: 'b.ts', line: 2 },
-    ]
-    const fakeProc = buildFakeProc({
-      stdoutData: JSON.stringify({ jsonrpc: '2.0', id: 1, result: { callers } }) + '\n',
+  it('only spawns once per adapter instance (persistent connection)', async () => {
+    const proc = buildAutoProc([
+      { projects: [] },        // healthCheck list_projects
+      { projects: ['foo'] },   // second healthCheck
+    ])
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({ mock: false })
+    await adapter.healthCheck()
+    await adapter.healthCheck()
+    adapter.close()
+
+    expect(spawnMock).toHaveBeenCalledTimes(1)
+  })
+})
+
+// ─── tools/call envelope tests ────────────────────────────────────────────────
+
+describe('S2-M6: CodebaseMemoryAdapter — tools/call envelope', () => {
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('sends correct tools/call envelope for list_projects in healthCheck', async () => {
+    const proc = buildAutoProc([{ projects: [] }])
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({ mock: false })
+    await adapter.healthCheck()
+    adapter.close()
+
+    const toolCalls = proc.stdin._lines
+      .map((l) => { try { return JSON.parse(l.trim()) as Record<string, unknown> } catch { return null } })
+      .filter((m) => m?.method === 'tools/call')
+
+    expect(toolCalls).toHaveLength(1)
+    const params = toolCalls[0]?.params as { name: string; arguments: Record<string, unknown> }
+    expect(params.name).toBe('list_projects')
+    expect(params.arguments).toEqual({})
+  })
+
+  it('sends tools/call for index_status before index_repository in ensureIndexed', async () => {
+    const proc = buildAutoProc([
+      // index_status → not ready (throws → falls through to index_repository)
+      // Actually we test the already-indexed path here:
+      { project: 'root-pi-autodev', status: 'ready', nodes: 100, edges: 200 },
+    ])
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({
+      mock: false,
+      repoRoot: '/root/pi-autodev',
     })
-    spawnMock.mockReturnValue(fakeProc as unknown as ReturnType<typeof spawn>)
+    await adapter.ensureIndexed()
+    adapter.close()
 
-    const adapter = new CodebaseMemoryAdapter({ mock: false })
-    const result = await adapter.findCallers('someFunc')
-    expect(result).toEqual(callers)
+    const toolCalls = proc.stdin._lines
+      .map((l) => { try { return JSON.parse(l.trim()) as Record<string, unknown> } catch { return null } })
+      .filter((m) => m?.method === 'tools/call')
+
+    expect(toolCalls[0]).toBeDefined()
+    const params0 = toolCalls[0]?.params as { name: string; arguments: Record<string, unknown> }
+    expect(params0.name).toBe('index_status')
+    expect(params0.arguments).toHaveProperty('project', 'root-pi-autodev')
   })
 
-  it('throws BackendUnavailableError on ENOENT (binary not found)', async () => {
-    const fakeProc = buildFakeProc()
-    spawnMock.mockReturnValue(fakeProc as unknown as ReturnType<typeof spawn>)
+  it('calls index_repository when index_status is not ready', async () => {
+    const proc = buildFakeProc()
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
 
-    const enoent = Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) as NodeJS.ErrnoException
+    const adapter = new CodebaseMemoryAdapter({
+      mock: false,
+      repoRoot: '/root/pi-autodev',
+      timeoutMs: 2000,
+    })
 
-    const adapter = new CodebaseMemoryAdapter({ mock: false, binaryPath: 'codebase-memory-mcp' })
-    const findPromise = adapter.findCallers('sym')
+    // Intercept writes to control the conversation
+    const sentMessages: Array<Record<string, unknown>> = []
+    const origWrite = proc.stdin.write.bind(proc.stdin)
+    proc.stdin.write = (data: string, cb?: (err?: Error | null) => void) => {
+      origWrite(data, cb)
+      let msg: Record<string, unknown>
+      try { msg = JSON.parse(data.trim()) } catch { return }
+      sentMessages.push(msg)
 
-    // Emit error to simulate binary not found
-    fakeProc.emit('error', enoent)
-
-    await expect(findPromise).rejects.toBeInstanceOf(BackendUnavailableError)
-    await expect(findPromise.catch(e => (e as Error).message)).resolves.toMatch(/not found on PATH/)
-  })
-
-  it('throws BackendUnavailableError when process exits non-zero with no output', async () => {
-    const fakeProc = buildFakeProc({ exitCode: 1, stdoutData: '' })
-    spawnMock.mockReturnValue(fakeProc as unknown as ReturnType<typeof spawn>)
-
-    const adapter = new CodebaseMemoryAdapter({ mock: false })
-    await expect(adapter.findCallers('sym')).rejects.toBeInstanceOf(BackendUnavailableError)
-  })
-
-  it('throws BackendUnavailableError when stdout is not valid JSON', async () => {
-    const fakeProc = buildFakeProc({ stdoutData: 'not-json\n' })
-    spawnMock.mockReturnValue(fakeProc as unknown as ReturnType<typeof spawn>)
-
-    const adapter = new CodebaseMemoryAdapter({ mock: false })
-    await expect(adapter.findCallers('sym')).rejects.toBeInstanceOf(BackendUnavailableError)
-  })
-
-  it('throws BackendUnavailableError on JSON-RPC error response', async () => {
-    const errorResp = {
-      jsonrpc: '2.0',
-      id: 1,
-      error: { code: -32601, message: 'Method not found' },
+      setImmediate(() => {
+        if (msg['method'] === 'initialize') {
+          emitLine(proc, {
+            jsonrpc: '2.0', id: msg['id'],
+            result: { protocolVersion: '2024-11-05', serverInfo: {}, capabilities: { tools: {} } },
+          })
+        } else if (msg['method'] === 'tools/call') {
+          const params = msg['params'] as { name: string }
+          if (params.name === 'index_status') {
+            // Return a non-ready status to trigger index_repository
+            emitLine(proc, {
+              jsonrpc: '2.0', id: msg['id'],
+              result: { content: [{ type: 'text', text: JSON.stringify({ project: 'root-pi-autodev', status: 'not_indexed' }) }] },
+            })
+          } else if (params.name === 'index_repository') {
+            emitLine(proc, {
+              jsonrpc: '2.0', id: msg['id'],
+              result: { content: [{ type: 'text', text: JSON.stringify({ project: 'root-pi-autodev', status: 'indexed' }) }] },
+            })
+          }
+        }
+      })
     }
-    const fakeProc = buildFakeProc({ stdoutData: JSON.stringify(errorResp) + '\n' })
-    spawnMock.mockReturnValue(fakeProc as unknown as ReturnType<typeof spawn>)
 
-    const adapter = new CodebaseMemoryAdapter({ mock: false })
-    await expect(adapter.findCallers('sym')).rejects.toBeInstanceOf(BackendUnavailableError)
-    await expect(adapter.findCallers('sym')).rejects.toThrow(/Method not found/)
+    await adapter.ensureIndexed()
+    adapter.close()
+
+    const toolNames = sentMessages
+      .filter((m) => m['method'] === 'tools/call')
+      .map((m) => (m['params'] as { name: string }).name)
+
+    expect(toolNames).toContain('index_status')
+    expect(toolNames).toContain('index_repository')
+    // index_status must come before index_repository
+    expect(toolNames.indexOf('index_status')).toBeLessThan(toolNames.indexOf('index_repository'))
+  })
+})
+
+// ─── findCallers tests ────────────────────────────────────────────────────────
+
+describe('S2-M6: CodebaseMemoryAdapter — findCallers → trace_path', () => {
+  afterEach(() => {
+    vi.clearAllMocks()
   })
 
-  it('healthCheck returns ok:false (no throw) when binary absent', async () => {
-    const fakeProc = buildFakeProc()
-    spawnMock.mockReturnValue(fakeProc as unknown as ReturnType<typeof spawn>)
+  it('sends trace_path with direction:inbound and depth:2', async () => {
+    const proc = buildAutoProc([
+      // index_status
+      { project: 'root-pi-autodev', status: 'ready' },
+      // trace_path
+      {
+        function: 'execute',
+        direction: 'inbound',
+        callers: [
+          { name: '_runPhases', qualified_name: 'root-pi-autodev.src.host.controller.Controller._runPhases', hop: 1 },
+        ],
+      },
+    ])
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
 
-    const enoent = Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) as NodeJS.ErrnoException
+    const adapter = new CodebaseMemoryAdapter({ mock: false, repoRoot: '/root/pi-autodev' })
+    await adapter.findCallers('execute')
+    adapter.close()
+
+    const toolCalls = proc.stdin._lines
+      .map((l) => { try { return JSON.parse(l.trim()) as Record<string, unknown> } catch { return null } })
+      .filter((m) => m?.method === 'tools/call')
+
+    const traceCall = toolCalls.find((m) => (m?.params as { name: string })?.name === 'trace_path')
+    expect(traceCall).toBeDefined()
+    const args = (traceCall!.params as { name: string; arguments: Record<string, unknown> }).arguments
+    expect(args['direction']).toBe('inbound')
+    expect(args['depth']).toBe(2)
+    expect(args['function_name']).toBe('execute')
+  })
+
+  it('maps a recorded trace_path response to CallerRef[]', async () => {
+    // Recorded live response from probe
+    const traceResult = {
+      function: 'execute',
+      direction: 'inbound',
+      callers: [
+        { name: '_runPhases', qualified_name: 'root-pi-autodev.src.host.controller.Controller._runPhases', hop: 1 },
+        { name: '_onInput', qualified_name: 'root-pi-autodev.src.host.controller.Controller._onInput', hop: 2 },
+      ],
+    }
+
+    const proc = buildAutoProc([
+      { project: 'root-pi-autodev', status: 'ready' },
+      traceResult,
+    ])
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({ mock: false, repoRoot: '/root/pi-autodev' })
+    const callers = await adapter.findCallers('execute')
+    adapter.close()
+
+    expect(Array.isArray(callers)).toBe(true)
+    expect(callers.length).toBe(2)
+
+    // Each CallerRef must have file, line, symbol
+    for (const c of callers) {
+      expect(typeof c.file).toBe('string')
+      expect(typeof c.line).toBe('number')
+      expect(typeof c.symbol).toBe('string')
+    }
+
+    // Symbol names come from the name field
+    expect(callers[0]!.symbol).toBe('_runPhases')
+    expect(callers[1]!.symbol).toBe('_onInput')
+
+    // File should be derived from qualified_name
+    expect(callers[0]!.file).toContain('controller')
+    expect(callers[1]!.file).toContain('controller')
+  })
+
+  it('returns empty array when trace_path returns no callers', async () => {
+    const proc = buildAutoProc([
+      { project: 'root-pi-autodev', status: 'ready' },
+      { function: 'unknown', direction: 'inbound', callers: [] },
+    ])
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({ mock: false, repoRoot: '/root/pi-autodev' })
+    const callers = await adapter.findCallers('unknown_symbol')
+    adapter.close()
+
+    expect(callers).toEqual([])
+  })
+
+  it('returns empty array when trace_path result has no callers field', async () => {
+    const proc = buildAutoProc([
+      { project: 'root-pi-autodev', status: 'ready' },
+      { function: 'noop', direction: 'inbound' },
+    ])
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({ mock: false, repoRoot: '/root/pi-autodev' })
+    const callers = await adapter.findCallers('noop')
+    adapter.close()
+
+    expect(callers).toEqual([])
+  })
+
+  it('project is cached after first ensureIndexed — only one index_status call', async () => {
+    const proc = buildAutoProc([
+      // First ensureIndexed: index_status
+      { project: 'root-pi-autodev', status: 'ready' },
+      // First findCallers: trace_path
+      { function: 'execute', direction: 'inbound', callers: [] },
+      // Second findCallers: trace_path (no index_status again)
+      { function: 'execute', direction: 'inbound', callers: [] },
+    ])
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({ mock: false, repoRoot: '/root/pi-autodev' })
+    await adapter.findCallers('execute')
+    await adapter.findCallers('execute')
+    adapter.close()
+
+    const toolCalls = proc.stdin._lines
+      .map((l) => { try { return JSON.parse(l.trim()) as Record<string, unknown> } catch { return null } })
+      .filter((m) => m?.method === 'tools/call')
+      .map((m) => (m!.params as { name: string }).name)
+
+    // Only one index_status call (cached after first)
+    expect(toolCalls.filter((n) => n === 'index_status')).toHaveLength(1)
+    // Two trace_path calls
+    expect(toolCalls.filter((n) => n === 'trace_path')).toHaveLength(2)
+  })
+})
+
+// ─── healthCheck tests ────────────────────────────────────────────────────────
+
+describe('S2-M6: CodebaseMemoryAdapter — healthCheck', () => {
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('returns ok:true when server responds to list_projects', async () => {
+    const proc = buildAutoProc([{ projects: [] }])
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({ mock: false })
+    const health = await adapter.healthCheck()
+    adapter.close()
+
+    expect(health.ok).toBe(true)
+    expect(health.details).toBeUndefined()
+  })
+
+  it('returns ok:false (no throw) when binary not found (ENOENT)', async () => {
+    const proc = buildFakeProc()
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
 
     const adapter = new CodebaseMemoryAdapter({ mock: false })
     const healthPromise = adapter.healthCheck()
 
-    fakeProc.emit('error', enoent)
+    const enoent = Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) as NodeJS.ErrnoException
+    proc.emit('error', enoent)
 
     const health = await healthPromise
     expect(health.ok).toBe(false)
     expect(typeof health.details).toBe('string')
+    expect(health.details).toMatch(/not found on PATH|ENOENT|spawn/)
+    adapter.close()
   })
 
-  it('monotonic RPC id increments per call', async () => {
-    const capturedBodies: string[] = []
+  it('returns ok:false (no throw) on RPC error response', async () => {
+    const proc = buildFakeProc()
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
 
-    const makeProc = () => {
-      const proc = buildFakeProc({
-        stdoutData: JSON.stringify({ jsonrpc: '2.0', id: 1, result: { callers: [] } }) + '\n',
+    const adapter = new CodebaseMemoryAdapter({ mock: false, timeoutMs: 2000 })
+
+    const origWrite = proc.stdin.write.bind(proc.stdin)
+    proc.stdin.write = (data: string, cb?: (err?: Error | null) => void) => {
+      origWrite(data, cb)
+      let msg: Record<string, unknown>
+      try { msg = JSON.parse(data.trim()) } catch { return }
+
+      setImmediate(() => {
+        if (msg['method'] === 'initialize') {
+          emitLine(proc, {
+            jsonrpc: '2.0', id: msg['id'],
+            result: { protocolVersion: '2024-11-05', serverInfo: {}, capabilities: { tools: {} } },
+          })
+        } else if (msg['method'] === 'tools/call') {
+          emitLine(proc, {
+            jsonrpc: '2.0', id: msg['id'],
+            error: { code: -32601, message: 'Method not found' },
+          })
+        }
       })
-      const origWrite = proc.stdin.write.bind(proc.stdin)
-      proc.stdin.write = (data: string, cb?: (err?: Error | null) => void) => {
-        capturedBodies.push(data)
-        origWrite(data, cb)
-      }
-      return proc
     }
 
-    spawnMock.mockImplementation(() => makeProc() as unknown as ReturnType<typeof spawn>)
+    const health = await adapter.healthCheck()
+    adapter.close()
+
+    expect(health.ok).toBe(false)
+    expect(typeof health.details).toBe('string')
+  })
+
+  it('returns ok:false (no throw) on process close before response', async () => {
+    const proc = buildFakeProc()
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({ mock: false, timeoutMs: 2000 })
+    const healthPromise = adapter.healthCheck()
+
+    // Simulate process dying immediately
+    proc.emit('close', 1)
+
+    const health = await healthPromise
+    expect(health.ok).toBe(false)
+    expect(typeof health.details).toBe('string')
+    adapter.close()
+  })
+})
+
+// ─── getArchitecture tests ────────────────────────────────────────────────────
+
+describe('S2-M6: CodebaseMemoryAdapter — getArchitecture', () => {
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('calls get_architecture tool and returns JSON string', async () => {
+    const archPayload = { project: 'root-pi-autodev', total_nodes: 894, packages: [] }
+    const proc = buildAutoProc([
+      { project: 'root-pi-autodev', status: 'ready' },
+      archPayload,
+    ])
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({ mock: false, repoRoot: '/root/pi-autodev' })
+    const arch = await adapter.getArchitecture()
+    adapter.close()
+
+    const parsed = JSON.parse(arch) as { project: string; total_nodes: number }
+    expect(parsed.project).toBe('root-pi-autodev')
+    expect(parsed.total_nodes).toBe(894)
+  })
+})
+
+// ─── close / dispose tests ────────────────────────────────────────────────────
+
+describe('S2-M6: CodebaseMemoryAdapter — close/dispose', () => {
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('close() tears down the client without throwing', async () => {
+    const proc = buildAutoProc([{ projects: [] }])
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
 
     const adapter = new CodebaseMemoryAdapter({ mock: false })
-    await adapter.findCallers('a')
-    await adapter.findCallers('b')
+    await adapter.healthCheck()
+    expect(() => adapter.close()).not.toThrow()
+  })
 
-    expect(capturedBodies).toHaveLength(2)
-    const req1 = JSON.parse(capturedBodies[0].trim()) as { id: number }
-    const req2 = JSON.parse(capturedBodies[1].trim()) as { id: number }
-    expect(req2.id).toBeGreaterThan(req1.id)
+  it('dispose() is an alias for close()', async () => {
+    const proc = buildAutoProc([{ projects: [] }])
+    spawnMock.mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const adapter = new CodebaseMemoryAdapter({ mock: false })
+    await adapter.healthCheck()
+    expect(() => adapter.dispose()).not.toThrow()
   })
 })
 

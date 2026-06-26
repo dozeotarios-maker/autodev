@@ -25,7 +25,7 @@ import type {
   ToolCallEventResult,
   SessionBeforeCompactEvent,
 } from '@earendil-works/pi-coding-agent'
-import type { Verifier, GitOps, Judge, Transparency, MemoryStore, Embedder } from '../ports.js'
+import type { Verifier, GitOps, Judge, Transparency, MemoryStore, Embedder, SecurityLane } from '../ports.js'
 import { HostAgent } from './host-agent.js'
 import { SubagentDriver } from './subagent-driver.js'
 import { FSM } from '../engine/fsm.js'
@@ -85,10 +85,12 @@ export interface ControllerOptions {
   pauseFilePath?: string
   /** Optional RetroWriter for post-run retro (injected for test isolation) */
   retroWriter?: RetroWriter
-  /** Optional memory backends — wired at entry; probed by /autodev-doctor (not yet consumed by phases). */
+  /** Optional memory backends — wired at entry; consumed by P1 and retro. */
   memoryStore?: MemoryStore
   embedder?: Embedder
   codebaseMemory?: { healthCheck(): Promise<{ ok: boolean; details?: string }> }
+  /** Optional security lane — used to screen recalled memory before injecting into instructions. */
+  securityLane?: SecurityLane
 }
 
 // ── Controller ────────────────────────────────────────────────────────────────
@@ -406,7 +408,16 @@ export class Controller {
       if (await this._isPaused()) { await this._waitResume() }
 
       const p1 = new P1Discover(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
-      const p1Result = await p1.execute({ phase: 'P1', idea: this.currentIdea, sizing: this.currentSizing })
+      const p1Result = await p1.execute({
+        phase: 'P1',
+        idea: this.currentIdea,
+        sizing: this.currentSizing,
+        memoryStore: this.opts.memoryStore,
+        embedder: this.opts.embedder,
+        screenContent: this.opts.securityLane
+          ? (t, s) => this.opts.securityLane!.screenContent(t, s)
+          : undefined,
+      })
       if (!p1Result.ok || !p1Result.output) {
         await this._escalate('P1', p1Result.reason ?? 'P1 failed')
         return
@@ -568,12 +579,19 @@ export class Controller {
       await this.journal.write({ type: 'completion', phase: 'P6', action: `P6 release: ${p6Result.output.commitSha}` })
 
       // Retro: success (BEFORE lifecycle.release)
+      const successLesson = `${this.currentIdea.slice(0, 120)} → ${p6Result.output.commitSha}`
       await this.opts.retroWriter?.write({
         runId: this.currentRunId,
-        lesson: `${this.currentIdea.slice(0, 120)} → ${p6Result.output.commitSha}`,
+        lesson: successLesson,
         bugPattern: 'none',
         convention: this.currentTier,
       })
+      try {
+        await this.opts.memoryStore?.store(this.currentRunId, successLesson, {
+          tier: this.currentTier,
+          outcome: 'success',
+        })
+      } catch { /* store failure must not break the run */ }
 
       // All done
       await this.lifecycle.release()
@@ -599,6 +617,12 @@ export class Controller {
         bugPattern: phase,
         convention: 'halted',
       })
+      try {
+        await this.opts.memoryStore?.store(this.currentRunId, reason, {
+          tier: this.currentTier,
+          outcome: 'halted',
+        })
+      } catch { /* store failure must not break the run */ }
     }
     await this.lifecycle.release()
   }

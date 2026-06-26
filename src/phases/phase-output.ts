@@ -4,6 +4,7 @@
 // is derived from the prior phase's PhaseOutput.
 
 import type { Sizing } from '../engine/complexity.js'
+import type { MemoryStore, Embedder } from '../ports.js'
 
 // ── P1 DISCOVER ───────────────────────────────────────────────────────────────
 
@@ -25,6 +26,12 @@ export interface P1Context {
   idea: string
   // TODO: make sizing required once test fixtures updated
   sizing?: Sizing
+  /** Optional Letta memory backend — absent when not wired; phases must degrade gracefully. */
+  memoryStore?: MemoryStore
+  /** Optional embedder — absent when not wired. */
+  embedder?: Embedder
+  /** Injection-screening hook — screen recalled text before injecting into instructions. */
+  screenContent?: (text: string, source: 'repo') => Promise<{ safe: boolean; threats: string[] }>
 }
 
 // ── P2 ELABORATE ─────────────────────────────────────────────────────────────

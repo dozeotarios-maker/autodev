@@ -1306,3 +1306,125 @@ describe('Fix #4: _rescoreFromSpec empty-spec guard — minimal spec scores XS w
     expect(journalContent).toMatch(/tier:/)
   }, 10_000)
 })
+
+// ── B4: retro → memoryStore.store called on success and halt ─────────────────
+
+import type { MemoryStore } from '../../src/ports.js'
+
+function makeMockMemoryStore(): MemoryStore {
+  return {
+    store: vi.fn().mockResolvedValue(undefined),
+    recall: vi.fn().mockResolvedValue([]),
+    detectContradictions: vi.fn().mockResolvedValue([]),
+    healthCheck: vi.fn().mockResolvedValue({ ok: true }),
+  }
+}
+
+describe('B4: retro → memoryStore.store called once on halt path', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mem-store-halt-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('halted run → memoryStore.store called once with outcome=halted', async () => {
+    const { pi, fire } = makeMockPi()
+    const memoryStore = makeMockMemoryStore()
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency: makeNullTransparency(),
+      steerTimeoutMs: 50, // short → P1 times out → _escalate
+      memoryStore,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+    void fire('input', makeInputEvent('Build a real-time collaboration platform'), ctx)
+
+    // Wait for timeout + escalation
+    await new Promise(r => setTimeout(r, 500))
+
+    expect(memoryStore.store).toHaveBeenCalledTimes(1)
+    const storeArg = (memoryStore.store as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, Record<string, unknown>]
+    expect(storeArg[2]).toMatchObject({ outcome: 'halted' })
+  }, 10_000)
+
+  it('absent memoryStore → halt path does not throw', async () => {
+    const { pi, fire } = makeMockPi()
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency: makeNullTransparency(),
+      steerTimeoutMs: 50,
+      // no memoryStore
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    // Should not throw even without memoryStore
+    await expect(
+      (async () => {
+        void fire('input', makeInputEvent('Build something'), ctx)
+        await new Promise(r => setTimeout(r, 500))
+      })()
+    ).resolves.not.toThrow()
+  }, 10_000)
+})
+
+describe('B5: memoryStore.store throwing does not break the run', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mem-store-throw-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('memoryStore.store that throws → escalate still logs ESCALATE (run proceeds to release)', async () => {
+    const { pi, fire } = makeMockPi()
+    const transparency = makeNullTransparency()
+
+    const throwingStore: MemoryStore = {
+      store: vi.fn().mockRejectedValue(new Error('Letta unavailable')),
+      recall: vi.fn().mockResolvedValue([]),
+      detectContradictions: vi.fn().mockResolvedValue([]),
+      healthCheck: vi.fn().mockResolvedValue({ ok: false }),
+    }
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency,
+      steerTimeoutMs: 50, // P1 times out → _escalate → store throws
+      memoryStore: throwingStore,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+    void fire('input', makeInputEvent('Build a platform'), ctx)
+
+    await new Promise(r => setTimeout(r, 500))
+
+    // The run should have escalated (ESCALATE in log) despite store throwing
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('ESCALATE'))
+  }, 10_000)
+})
