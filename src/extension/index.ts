@@ -138,29 +138,59 @@ function buildTransparency(opts: AutodevExtensionOptions): Transparency {
   return new TransparencyImpl(repoRoot, hudClient)
 }
 
-function buildGitOps(opts: AutodevExtensionOptions): GitOps {
-  if (opts.gitOps) return opts.gitOps
-  const cwd = opts.repoRoot ?? process.cwd()
-  const scopedCommit = new ScopedCommit(cwd)
-  const perPhasePush = new PerPhasePush(cwd)
+/**
+ * GitOps with a setRepoRoot hook so the controller can re-root the
+ * construction-captured git adapters (ScopedCommit/PerPhasePush/GitleaksHook)
+ * after a project re-root. Without this, P6 would commit/push and scan the
+ * build-time cwd instead of the resolved project dir.
+ */
+export interface ReRootableGitOps extends GitOps {
+  setRepoRoot(dir: string): void
+}
+
+function buildGitOps(opts: AutodevExtensionOptions): ReRootableGitOps {
   const tierDGate = new TierDGate({ timeoutMs: 30_000 })
-  const gitleaksHook = new GitleaksHook(cwd)
   tierDGate.setApprovalProvider(async () => false)
+
+  // Rebuildable cwd-bound adapters: scopedCommit/perPhasePush/gitleaks freeze cwd
+  // at construction, so re-rooting means rebuilding them against the new dir.
+  let cwd = opts.repoRoot ?? process.cwd()
+  let scopedCommit = new ScopedCommit(cwd)
+  let perPhasePush = new PerPhasePush(cwd)
+  let gitleaksHook = new GitleaksHook(cwd)
+
+  // If an external gitOps is injected, wrap it so setRepoRoot is still present
+  // (a no-op for the injected impl — it owns its own dir handling).
+  if (opts.gitOps) {
+    const injected = opts.gitOps
+    return {
+      scopedCommit: (msg, paths) => injected.scopedCommit(msg, paths),
+      perPhasePush: (branch) => injected.perPhasePush(branch),
+      tierDGate: (action, brief) => injected.tierDGate(action, brief),
+      scanSecrets: (staged) => injected.scanSecrets(staged),
+      setRepoRoot: () => { /* injected gitOps manages its own dir */ },
+    }
+  }
+
   return {
     scopedCommit: (msg, paths) => scopedCommit.scopedCommit(msg, paths),
     perPhasePush: (branch) => perPhasePush.perPhasePush(branch),
     tierDGate: (action, brief) => tierDGate.tierDGate(action, brief),
     scanSecrets: (staged) => gitleaksHook.scanSecrets(staged),
+    setRepoRoot: (dir: string) => {
+      cwd = dir
+      scopedCommit = new ScopedCommit(cwd)
+      perPhasePush = new PerPhasePush(cwd)
+      gitleaksHook = new GitleaksHook(cwd)
+    },
   }
 }
 
 function buildVerifier(opts: AutodevExtensionOptions): Verifier {
   if (opts.verifier) return opts.verifier
-  const cwd = opts.repoRoot ?? process.cwd()
   const det = new DeterministicVerifier()
   const judge = opts.judge ?? noopJudge()
   const holdout = new HoldoutVerifier(judge)
-  const gitleaks = new GitleaksHook(cwd)
   return {
     runDeterministic: (testCmd, wd) => det.run(testCmd, wd),
     runMutation: (wd, threshold) => new MutationGate({ threshold }).run(wd),
@@ -175,7 +205,9 @@ function buildVerifier(opts: AutodevExtensionOptions): Verifier {
       })
       return { passed: holdoutResult.passed, output: holdoutResult.reason ?? detResult.output }
     },
-    runSecurityScan: (_wd) => gitleaks.scan({ staged: false }),
+    // Honor the wd arg (P5 passes the resolved repoRoot). A fresh GitleaksHook
+    // is bound to the caller-supplied dir so the scan targets the right tree.
+    runSecurityScan: (wd) => new GitleaksHook(wd).scan({ staged: false }),
   }
 }
 
@@ -346,7 +378,6 @@ export default function autodevExtension(pi: ExtensionAPI): void {
   // ── Verifier with real SubagentJudge for holdout ──────────────────────────
   const det = new DeterministicVerifier()
   const holdout = new HoldoutVerifier(judge)
-  const gitleaks = new GitleaksHook(repoRoot)
   const verifier: Verifier = {
     runDeterministic: (testCmd, wd) => det.run(testCmd, wd),
     runMutation: (wd, threshold) => new MutationGate({ threshold }).run(wd),
@@ -361,7 +392,8 @@ export default function autodevExtension(pi: ExtensionAPI): void {
       })
       return { passed: holdoutResult.passed, output: holdoutResult.reason ?? detResult.output }
     },
-    runSecurityScan: (_wd) => gitleaks.scan({ staged: false }),
+    // Honor the wd arg (P5 passes the resolved repoRoot) so the scan follows the re-root.
+    runSecurityScan: (wd) => new GitleaksHook(wd).scan({ staged: false }),
   }
 
   // ── Memory (injectable; real Letta + real codebase-memory) ────────────────

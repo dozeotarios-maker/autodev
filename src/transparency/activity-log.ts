@@ -3,9 +3,14 @@ import * as fs from 'fs/promises'
 import * as path from 'path'
 
 export class ActivityLog {
-  private readonly logPath: string
+  private logPath: string
 
   constructor(repoRoot: string) {
+    this.logPath = path.join(repoRoot, '.autodev', 'activity.log')
+  }
+
+  /** Re-root the writer after a project re-root (controller chdir). */
+  setBaseDir(repoRoot: string): void {
     this.logPath = path.join(repoRoot, '.autodev', 'activity.log')
   }
 

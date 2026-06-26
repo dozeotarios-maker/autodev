@@ -425,7 +425,7 @@ interface ListProjectsResult {
 
 export class CodebaseMemoryAdapter {
   private readonly mock: boolean
-  private readonly repoRoot: string
+  private repoRoot: string
   private client: McpClient | null = null
   private projectName: string | null = null
 
@@ -439,6 +439,16 @@ export class CodebaseMemoryAdapter {
         opts.timeoutMs ?? 10_000,
       )
     }
+  }
+
+  /**
+   * Re-root the adapter after a project re-root (controller chdir).
+   * Resets the cached project name so the NEXT ensureIndexed() indexes the new
+   * dir instead of returning early on the stale (old-dir) index name.
+   */
+  setRepoRoot(repoRoot: string): void {
+    this.repoRoot = repoRoot
+    this.projectName = null
   }
 
   /**

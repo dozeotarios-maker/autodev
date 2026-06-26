@@ -11,9 +11,14 @@ export interface JournalEntry {
 }
 
 export class AppendEntry {
-  private readonly journalPath: string
+  private journalPath: string
 
   constructor(repoRoot: string) {
+    this.journalPath = path.join(repoRoot, '.autodev', 'journal.jsonl')
+  }
+
+  /** Re-root the writer after a project re-root (controller chdir). */
+  setBaseDir(repoRoot: string): void {
     this.journalPath = path.join(repoRoot, '.autodev', 'journal.jsonl')
   }
 

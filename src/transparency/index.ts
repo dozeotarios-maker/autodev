@@ -24,6 +24,18 @@ export class TransparencyImpl implements Transparency {
     this.metricsRecorder = new MetricsRecorder(repoRoot)
   }
 
+  /**
+   * Re-root all file-writing sub-adapters after a project re-root.
+   * The controller calls this in _resolveRepoRoot so activity.log + metrics.jsonl
+   * + journal.jsonl land under the resolved dir's .autodev, not the original cwd.
+   * The HUD client is a live sink (no path) and is intentionally untouched.
+   */
+  setRepoRoot(repoRoot: string): void {
+    this.activityLog.setBaseDir(repoRoot)
+    this.appendEntryWriter.setBaseDir(repoRoot)
+    this.metricsRecorder.setBaseDir(repoRoot)
+  }
+
   // Transparency.log — writes one human-readable line to .autodev/activity.log
   // Returns Promise<void> (compatible with the port's void return — callers may await or ignore)
   log(action: string): Promise<void> {

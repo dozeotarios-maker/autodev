@@ -5,9 +5,14 @@ import * as path from 'path'
 import type { MetricEntry } from '../ports.js'
 
 export class MetricsRecorder {
-  private readonly metricsPath: string
+  private metricsPath: string
 
   constructor(repoRoot: string) {
+    this.metricsPath = path.join(repoRoot, '.autodev', 'metrics.jsonl')
+  }
+
+  /** Re-root the writer after a project re-root (controller chdir). */
+  setBaseDir(repoRoot: string): void {
     this.metricsPath = path.join(repoRoot, '.autodev', 'metrics.jsonl')
   }
 

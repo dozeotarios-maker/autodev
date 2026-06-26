@@ -100,7 +100,12 @@ export interface ControllerOptions {
   /** Optional memory backends — wired at entry; consumed by P1 and retro. */
   memoryStore?: MemoryStore
   embedder?: Embedder
-  codebaseMemory?: { healthCheck(): Promise<{ ok: boolean; details?: string }>; ensureIndexed?(): Promise<void> }
+  codebaseMemory?: {
+    healthCheck(): Promise<{ ok: boolean; details?: string }>
+    ensureIndexed?(): Promise<void>
+    /** Re-root the indexer to the resolved dir (resets cached index). */
+    setRepoRoot?(dir: string): void
+  }
   /** Optional security lane — used to screen recalled memory before injecting into instructions. */
   securityLane?: SecurityLane
   /** Optional project registry — when injected, _resolveRepoRoot re-roots the build dir from the idea. */
@@ -120,6 +125,13 @@ export class Controller {
   private outputDir: string
   private pauseFilePath: string
   private repoRoot: string
+  /**
+   * Original process.cwd() captured immediately before the registry-injected
+   * re-root chdir's into the resolved dir. Restored when the run terminates so a
+   * later non-autodev pi command isn't surprised by a moved cwd. Undefined means
+   * no chdir happened (no-registry path, or chdir failed), so restore is a no-op.
+   */
+  private originalCwd: string | undefined
 
   private phaseStore: PhaseStore = {}
   private currentIdea = ''
@@ -672,6 +684,9 @@ export class Controller {
 
       // All done
       await this.lifecycle.release()
+      // Restore cwd after a successful run so a later non-autodev pi command
+      // isn't surprised by the moved cwd (no-op when no re-root chdir happened).
+      this._restoreCwd()
       this.opts.transparency.setHudStatus('DONE', p6Result.output.commitSha, 'done', 'none')
       await this.opts.transparency.log(`ALL DONE: commit=${p6Result.output.commitSha}`)
 
@@ -684,8 +699,13 @@ export class Controller {
 
   /**
    * Re-roots repoRoot, outputDir, journal, actionMonitor, pauseFilePath from
-   * the resolved project dir. No-op if no registry is injected (preserves
-   * existing behavior: repoRoot stays process.cwd()).
+   * the resolved project dir AND chdir's the host process into it so the
+   * dominant write vector (bash/npm/git spawn) is confined to the project dir.
+   * All construction-captured backends (GitOps, CodebaseMemory, Transparency)
+   * are re-rooted too, because chdir does NOT fix paths frozen at construction.
+   *
+   * No-op if no registry is injected (preserves existing behavior: repoRoot
+   * stays process.cwd(), NO chdir).
    */
   private async _resolveRepoRoot(idea: string): Promise<void> {
     if (!this.opts.registry) return
@@ -707,13 +727,31 @@ export class Controller {
       return
     }
 
-    this.repoRoot = r.dir
-    this.subagentDriver.setRepoRoot(r.dir)
-
-    // mkdir -p the resolved dir if new
+    // mkdir -p the resolved dir if new — must exist before we chdir into it.
     if (r.isNew) {
       await fs.mkdir(r.dir, { recursive: true })
     }
+
+    // chdir the host process so its bash/npm/git spawn in the project dir.
+    // Capture originalCwd FIRST. If chdir throws, journal + abort the re-root
+    // safely: stay on the original cwd, do NOT mutate any instance state (no
+    // half-rooted controller). originalCwd stays undefined so restore is a no-op.
+    const originalCwd = process.cwd()
+    try {
+      process.chdir(r.dir)
+    } catch (e) {
+      void this.journal.write({
+        type: 'decision',
+        phase: 'P1',
+        action: `_resolveRepoRoot: chdir to ${r.dir} failed (${String(e)}), aborting re-root, keeping cwd`,
+      })
+      return
+    }
+    this.originalCwd = originalCwd
+
+    // chdir succeeded — now safe to mutate instance state to the new dir.
+    this.repoRoot = r.dir
+    this.subagentDriver.setRepoRoot(r.dir)
 
     // Re-derive all repoRoot-dependent fields
     this.outputDir = path.join(r.dir, '.autodev', 'phase-output')
@@ -721,13 +759,25 @@ export class Controller {
     this.journal = new Journal(path.join(r.dir, '.autodev', 'journal.jsonl'))
     this.actionMonitor = new ActionMonitor([r.dir])
 
+    // Re-root construction-captured backends (chdir does NOT fix frozen paths):
+    //  - GitOps: rebuild ScopedCommit/PerPhasePush/GitleaksHook → P6 commits/pushes r.dir.
+    //  - Transparency: redirect activity.log + metrics.jsonl → r.dir/.autodev.
+    //  - CodebaseMemory: reset cached index, then ensureIndexed() indexes r.dir.
+    // securityScan honors its wd arg (P5 passes this.repoRoot) — no per-instance call.
+    const gitOps = this.opts.gitOps as { setRepoRoot?: (dir: string) => void }
+    gitOps.setRepoRoot?.(r.dir)
+    const transparency = this.opts.transparency as { setRepoRoot?: (dir: string) => void }
+    transparency.setRepoRoot?.(r.dir)
+    this.opts.codebaseMemory?.setRepoRoot?.(r.dir)
+
     // Register in registry
     await this.opts.registry.register(r.name, r.dir, { lastRun: new Date().toISOString() })
     if (!r.isNew) {
       await this.opts.registry.setActive(r.name)
     }
 
-    // Index existing codebase (degrade gracefully on failure)
+    // Index existing codebase (degrade gracefully on failure).
+    // setRepoRoot above already reset the cached index, so this indexes r.dir.
     if (r.isExisting && this.opts.codebaseMemory?.ensureIndexed) {
       try {
         await this.opts.codebaseMemory.ensureIndexed()
@@ -743,8 +793,29 @@ export class Controller {
     void this.journal.write({
       type: 'decision',
       phase: 'P1',
-      action: `resolved project '${r.name}' -> ${r.dir} (${r.isNew ? 'new' : 'existing'})`,
+      action: `resolved project '${r.name}' -> ${r.dir} (${r.isNew ? 'new' : 'existing'}); chdir from ${originalCwd}`,
     })
+  }
+
+  /**
+   * Restore the process cwd captured before the re-root chdir. Idempotent and
+   * safe: a no-op when no chdir happened (originalCwd undefined). Wrapped in
+   * try/catch so a restore failure never crashes the terminal path; clears
+   * originalCwd after the attempt so it runs at most once per run.
+   */
+  private _restoreCwd(): void {
+    if (this.originalCwd === undefined) return
+    const target = this.originalCwd
+    this.originalCwd = undefined
+    try {
+      process.chdir(target)
+    } catch (e) {
+      void this.journal.write({
+        type: 'decision',
+        phase: this.fsm.getPhase(),
+        action: `_restoreCwd: chdir back to ${target} failed (${String(e)}), continuing`,
+      })
+    }
   }
 
   private async _escalate(phase: string, reason: string): Promise<void> {
@@ -771,6 +842,8 @@ export class Controller {
       }
     }
     await this.lifecycle.release()
+    // Restore cwd on the halt/escalate terminal path too.
+    this._restoreCwd()
   }
 
   private async _operatorBrief(phase: string, brief: string): Promise<void> {
@@ -798,6 +871,8 @@ export class Controller {
       }
     }
     await this.lifecycle.release()
+    // Restore cwd on the operator-brief terminal path too.
+    this._restoreCwd()
   }
 
   /**
