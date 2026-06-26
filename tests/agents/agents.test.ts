@@ -132,28 +132,26 @@ describe('M8: Persona files (10 personas)', () => {
   })
 })
 
-// ---- phase skills ----------------------------------------------------------
+// ---- autodev skill -------------------------------------------------------
 
-describe('M8: Phase skill files (6 phases)', () => {
-  it('skills/ dir contains SKILL.md for each of 6 phases', async () => {
-    const phaseDirs = await fs.readdir(SKILLS_DIR)
-    const phaseSubdirs = (phaseDirs as string[]).filter(d => d.startsWith('phase'))
-    expect(phaseSubdirs.length).toBe(6)
-    for (const d of phaseSubdirs) {
-      const skillPath = path.join(SKILLS_DIR, d, 'SKILL.md')
-      const exists = await fs.access(skillPath).then(() => true).catch(() => false)
-      expect(exists, `missing SKILL.md in ${d}`).toBe(true)
-    }
+describe('M8: autodev skill (single consolidated skill)', () => {
+  it('skills/autodev/SKILL.md exists', async () => {
+    const skillPath = path.join(SKILLS_DIR, 'autodev', 'SKILL.md')
+    const exists = await fs.access(skillPath).then(() => true).catch(() => false)
+    expect(exists, 'missing skills/autodev/SKILL.md').toBe(true)
   })
 
-  it('each SKILL.md parses via js-yaml frontmatter parser and has name + phase frontmatter', async () => {
-    const phaseDirs = await fs.readdir(SKILLS_DIR)
-    const phaseSubdirs = (phaseDirs as string[]).filter(d => d.startsWith('phase'))
-    for (const d of phaseSubdirs) {
-      const content = await fs.readFile(path.join(SKILLS_DIR, d, 'SKILL.md'), 'utf-8')
-      const parsed = parseFrontmatter(content)
-      expect(parsed.data.name, `${d}/SKILL.md missing name`).toBeTruthy()
-      expect(parsed.data.phase, `${d}/SKILL.md missing phase`).toBeTruthy()
+  it('SKILL.md parses via js-yaml frontmatter and has name=autodev + a description', async () => {
+    const content = await fs.readFile(path.join(SKILLS_DIR, 'autodev', 'SKILL.md'), 'utf-8')
+    const parsed = parseFrontmatter(content)
+    expect(parsed.data.name, 'SKILL.md missing name').toBe('autodev')
+    expect(parsed.data.description, 'SKILL.md missing description').toBeTruthy()
+  })
+
+  it('all six phases (P1-P6) are documented in the consolidated skill', async () => {
+    const content = await fs.readFile(path.join(SKILLS_DIR, 'autodev', 'SKILL.md'), 'utf-8')
+    for (const p of ['P1', 'P2', 'P3', 'P4', 'P5', 'P6']) {
+      expect(content, `autodev SKILL.md missing ${p}`).toContain(p)
     }
   })
 })

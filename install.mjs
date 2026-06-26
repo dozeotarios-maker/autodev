@@ -22,6 +22,12 @@ async function main() {
     path.join(PI_EXTENSIONS_DIR, 'package.json')
   )
 
+  // Copy skills/ so the installed extension OWNS its single `autodev` skill.
+  // pi discovers skills under the extension dir (same as how pi-subagents
+  // bundles its skill), so this is what makes autodev surface as one
+  // extension+skill instead of loose phase skills.
+  await copyDir(path.join(__dirname, 'skills'), path.join(PI_EXTENSIONS_DIR, 'skills'))
+
   // Register in pi settings
   let settings = {}
   try {
