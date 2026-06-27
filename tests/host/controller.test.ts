@@ -8,7 +8,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
-import { Controller, compactAsync, shouldCompact, COMPACT_TIMEOUT_MS } from '../../src/host/controller.js'
+import { Controller, compactAsync, shouldCompact, COMPACT_TIMEOUT_MS, parseOverrides } from '../../src/host/controller.js'
 import type { ControllerOptions } from '../../src/host/controller.js'
 import type {
   ExtensionAPI,
@@ -2168,6 +2168,214 @@ describe('A1: shouldCompact — skips low-usage, runs high-usage', () => {
   it('COMPACT_TIMEOUT_MS is exported and positive', () => {
     expect(COMPACT_TIMEOUT_MS).toBeGreaterThan(0)
   })
+})
+
+// ── B1 Task 5: _parseOverrides + override prefix wiring ──────────────────────
+
+describe('B1 Task5: _parseOverrides — prefix parsing (unit via exported helper)', () => {
+  it('no prefix → idea unchanged, no forcedTier, taskType=build', () => {
+    const result = parseOverrides('add a config function')
+    expect(result.idea).toBe('add a config function')
+    expect(result.forcedTier).toBeUndefined()
+    expect(result.taskType).toBe('build')
+  })
+
+  it('quick: prefix → forcedTier=XS, idea stripped', () => {
+    const result = parseOverrides('quick: add a config function')
+    expect(result.idea).toBe('add a config function')
+    expect(result.forcedTier).toBe('XS')
+    expect(result.taskType).toBe('build')
+  })
+
+  it('mid: prefix → forcedTier=M', () => {
+    const result = parseOverrides('mid: build a payments system')
+    expect(result.idea).toBe('build a payments system')
+    expect(result.forcedTier).toBe('M')
+  })
+
+  it('full: prefix → forcedTier=XL', () => {
+    const result = parseOverrides('full: build a payments system')
+    expect(result.idea).toBe('build a payments system')
+    expect(result.forcedTier).toBe('XL')
+  })
+
+  it('debug: prefix → taskType=debug, no forcedTier', () => {
+    const result = parseOverrides('debug: tests fail in auth')
+    expect(result.idea).toBe('tests fail in auth')
+    expect(result.forcedTier).toBeUndefined()
+    expect(result.taskType).toBe('debug')
+  })
+
+  it('build: prefix → taskType=build, no forcedTier', () => {
+    const result = parseOverrides('build: a REST API')
+    expect(result.idea).toBe('a REST API')
+    expect(result.taskType).toBe('build')
+    expect(result.forcedTier).toBeUndefined()
+  })
+
+  it('refactor: prefix → taskType=refactor, no forcedTier', () => {
+    const result = parseOverrides('refactor: extract auth module')
+    expect(result.idea).toBe('extract auth module')
+    expect(result.taskType).toBe('refactor')
+    expect(result.forcedTier).toBeUndefined()
+  })
+
+  it('combined quick: build: → forcedTier=XS + taskType=build', () => {
+    const result = parseOverrides('quick: build: add auth endpoint')
+    expect(result.idea).toBe('add auth endpoint')
+    expect(result.forcedTier).toBe('XS')
+    expect(result.taskType).toBe('build')
+  })
+
+  it('combined build: quick: → forcedTier=XS + taskType=build (both orders work)', () => {
+    const result = parseOverrides('build: quick: add auth endpoint')
+    expect(result.idea).toBe('add auth endpoint')
+    expect(result.forcedTier).toBe('XS')
+    expect(result.taskType).toBe('build')
+  })
+
+  it('mid-sentence colon untouched (only known leading prefix stripped)', () => {
+    const result = parseOverrides('add a thing: with detail')
+    expect(result.idea).toBe('add a thing: with detail')
+    expect(result.forcedTier).toBeUndefined()
+    expect(result.taskType).toBe('build')
+  })
+
+  it('case-insensitive: QUICK: prefix works', () => {
+    const result = parseOverrides('QUICK: add a function')
+    expect(result.idea).toBe('add a function')
+    expect(result.forcedTier).toBe('XS')
+  })
+
+  it('only two prefix strips maximum', () => {
+    // Third prefix is not stripped — becomes part of the idea
+    const result = parseOverrides('quick: build: debug: something')
+    expect(result.idea).toBe('debug: something')
+    expect(result.forcedTier).toBe('XS')
+    expect(result.taskType).toBe('build')
+  })
+})
+
+describe('B1 Task5: forced tier skips post-P1 rescore (integration)', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'b1t5-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('quick: idea → forced XS at run-start; rescore block is SKIPPED (journal has no rescore entry)', async () => {
+    const { pi, fire } = makeMockPi()
+    const setThinkingLevelMock = vi.fn()
+    ;(pi as unknown as Record<string, unknown>)['setThinkingLevel'] = setThinkingLevelMock
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency: makeNullTransparency(),
+      steerTimeoutMs: 500,
+    })
+    ctrl.wire()
+
+    const outputDir = path.join(tmpDir, '.autodev', 'phase-output')
+    await fs.mkdir(outputDir, { recursive: true })
+    // P1 output with a "complex" spec that would otherwise trigger XL via keyword heuristic
+    await fs.writeFile(path.join(outputDir, 'p1-spec.json'), JSON.stringify({
+      phase: 'P1',
+      spec: 'Build a distributed microservice with event sourcing CQRS schema migration breaking change cross-service platform-wide global all-users',
+      stackAdr: 'TypeScript microservices',
+      webResearch: [],
+    }))
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+    void fire('input', makeInputEvent('quick: add a config constant'), ctx)
+
+    // Wait for P1 steer to be in-flight
+    await new Promise<void>((resolve) => {
+      const check = () => {
+        const calls = (pi.sendUserMessage as ReturnType<typeof vi.fn>).mock.calls
+        if (calls.length >= 1) resolve()
+        else setTimeout(check, 10)
+      }
+      check()
+    })
+
+    fire('agent_end', makeAgentEndEvent('P1 output written'), ctx)
+
+    // Poll journal for "forced" entry (run-start sets forced tier)
+    const journalPath = path.join(tmpDir, '.autodev', 'journal.jsonl')
+    await new Promise<void>((resolve, reject) => {
+      const deadline = Date.now() + 4_000
+      const check = async () => {
+        if (Date.now() > deadline) { reject(new Error('journal forced-tier entry not seen within 4s')); return }
+        const exists = await fs.access(journalPath).then(() => true).catch(() => false)
+        if (exists) {
+          const content = await fs.readFile(journalPath, 'utf-8')
+          if (content.includes('forced') || content.includes('XS')) { resolve(); return }
+        }
+        setTimeout(check, 20)
+      }
+      void check()
+    })
+
+    const journal = await fs.readFile(journalPath, 'utf-8')
+    // Must mention forced / XS
+    expect(journal).toMatch(/forced|XS/)
+    // Must NOT contain rescore-source entries (rescore was skipped)
+    expect(journal).not.toContain('p1.complexity')
+    expect(journal).not.toContain('keyword heuristic')
+    // setThinkingLevel must have been called with 'low' (XS tier)
+    expect(setThinkingLevelMock).toHaveBeenCalledWith('low')
+  }, 10_000)
+
+  it('full: idea → setThinkingLevel called with xhigh (XL tier)', async () => {
+    const { pi, fire } = makeMockPi()
+    const setThinkingLevelMock = vi.fn()
+    ;(pi as unknown as Record<string, unknown>)['setThinkingLevel'] = setThinkingLevelMock
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency: makeNullTransparency(),
+      steerTimeoutMs: 500,
+    })
+    ctrl.wire()
+
+    const outputDir = path.join(tmpDir, '.autodev', 'phase-output')
+    await fs.mkdir(outputDir, { recursive: true })
+    await fs.writeFile(path.join(outputDir, 'p1-spec.json'), JSON.stringify({
+      phase: 'P1',
+      spec: 'Add a single config constant value to src/config.ts',
+      stackAdr: 'TypeScript',
+      webResearch: [],
+    }))
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+    void fire('input', makeInputEvent('full: build a payments system'), ctx)
+
+    await new Promise<void>((resolve) => {
+      const check = () => {
+        const calls = (pi.sendUserMessage as ReturnType<typeof vi.fn>).mock.calls
+        if (calls.length >= 1) resolve()
+        else setTimeout(check, 10)
+      }
+      check()
+    })
+
+    fire('agent_end', makeAgentEndEvent('P1 output written'), ctx)
+    await new Promise(r => setTimeout(r, 300))
+
+    expect(setThinkingLevelMock).toHaveBeenCalledWith('xhigh')
+  }, 10_000)
 })
 
 // ── B1 Task 4: post-P1 rescore uses p1.complexity when valid ─────────────────

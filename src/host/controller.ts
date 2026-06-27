@@ -42,7 +42,7 @@ import { P4Build } from '../phases/p4-build.js'
 import { P5Verify } from '../phases/p5-verify.js'
 import { P6Release } from '../phases/p6-release.js'
 import type { P1Output, P2Output, P3Output, P4Output, P5Output } from '../phases/phase-output.js'
-import { scoreComplexity, tierSizing, DEFAULT_SIZING, isValidComplexityInput } from '../engine/complexity.js'
+import { scoreComplexity, tierSizing, DEFAULT_SIZING, isValidComplexityInput, tierFromOverride } from '../engine/complexity.js'
 import type { Sizing, ComplexityInput, ComplexityTier } from '../engine/complexity.js'
 import type { RetroWriter } from '../engine/retro.js'
 import { resolveProjectDir } from '../project/resolver.js'
@@ -181,6 +181,44 @@ export interface ControllerOptions {
   registry?: ProjectRegistry
 }
 
+// ── B1: Override-prefix parser ────────────────────────────────────────────────
+
+const TASK_TYPE_PREFIXES = new Set(['build', 'debug', 'refactor'])
+
+export interface ParsedOverrides {
+  idea: string
+  forcedTier?: ComplexityTier
+  taskType: string
+}
+
+/**
+ * Strip up to two known leading prefixes from a raw idea string.
+ * quick/mid/full → sets forcedTier; build/debug/refactor → sets taskType (default 'build').
+ * Only KNOWN leading tokens matched by /^(quick|mid|full|build|debug|refactor)\s*:\s*‌/i are stripped.
+ * Mid-sentence colons are untouched.
+ */
+export function parseOverrides(raw: string): ParsedOverrides {
+  let idea = raw
+  let forcedTier: ComplexityTier | undefined
+  let taskType = 'build'
+  const PREFIX_RE = /^(quick|mid|full|build|debug|refactor)\s*:\s*/i
+
+  for (let i = 0; i < 2; i++) {
+    const m = PREFIX_RE.exec(idea)
+    if (!m) break
+    const token = m[1].toLowerCase()
+    idea = idea.slice(m[0].length)
+    const tier = tierFromOverride(token)
+    if (tier !== null) {
+      forcedTier = tier
+    } else if (TASK_TYPE_PREFIXES.has(token)) {
+      taskType = token
+    }
+  }
+
+  return { idea, forcedTier, taskType }
+}
+
 // ── Controller ────────────────────────────────────────────────────────────────
 
 export class Controller {
@@ -207,6 +245,10 @@ export class Controller {
   private startedAt = Date.now()
   private currentSizing: Sizing = DEFAULT_SIZING
   private currentTier: ComplexityTier = 'M'
+  /** B1: forced tier from override prefix (quick:/mid:/full:). Undefined = no override. */
+  private currentForcedTier: ComplexityTier | undefined
+  /** B1: task type from prefix (build/debug/refactor). Default 'build'. */
+  private currentTaskType = 'build'
   private currentRunId = ''
   /** Fix #1: set true after the first terminal store so _escalate cannot double-store. */
   private _terminalStored = false
@@ -472,11 +514,10 @@ export class Controller {
       return
     }
 
-    // Capture idea in a local — do NOT write this.currentIdea yet.
-    // Fix: two concurrent _onInput calls must not overwrite each other's idea
-    // before the lock is won. this.currentIdea is only written by the winner,
-    // after lifecycle.run() returns {ok:true}.
-    const idea = text.trim()
+    // B1: parse override prefixes (quick:/mid:/full:/build:/debug:/refactor:) before
+    // lock acquisition — strips the idea to its bare form, captures forcedTier/taskType locally.
+    const parsed = parseOverrides(text.trim())
+    const idea = parsed.idea
 
     // Fix 6 (TOCTOU): lifecycle.run() is the SINGLE atomic source of truth.
     // It sets internal state to RUNNING synchronously before any async I/O, so
@@ -503,8 +544,15 @@ export class Controller {
       return
     }
 
-    // Lock won — now safe to update the shared field.
+    // Lock won — now safe to update the shared fields.
     this.currentIdea = idea
+    this.currentForcedTier = parsed.forcedTier
+    this.currentTaskType = parsed.taskType
+    void this.journal.write({
+      type: 'decision',
+      phase: 'P1',
+      action: `overrides parsed: forcedTier=${parsed.forcedTier ?? 'none'} taskType=${parsed.taskType}`,
+    })
 
     // Re-root repoRoot to the resolved project dir (async, before _runPhases).
     // _resolveRepoRoot is a no-op when no registry is injected (preserves current behavior).
@@ -636,12 +684,23 @@ export class Controller {
    */
   private async _runPhases(ctx: ExtensionContext): Promise<void> {
     try {
-      // ── Run-start: default tier M, set thinking level ─────────────────────
+      // ── Run-start: default tier M (or forced tier from prefix override) ──────
       this.currentRunId = `run-${crypto.randomUUID()}`
-      this.currentSizing = tierSizing('M')
-      this.currentTier = 'M'
       this._terminalStored = false // Fix #1: reset per-run so consecutive runs don't share state
       const pi = this.pi as unknown as { setThinkingLevel?: (level: string) => void }
+      if (this.currentForcedTier) {
+        // B1: forced tier from quick:/mid:/full: prefix — use directly, skip rescore later
+        this.currentTier = this.currentForcedTier
+        this.currentSizing = tierSizing(this.currentForcedTier)
+        await this.journal.write({
+          type: 'decision',
+          phase: 'P1',
+          action: `tier forced to ${this.currentForcedTier} via prefix override`,
+        })
+      } else {
+        this.currentSizing = tierSizing('M')
+        this.currentTier = 'M'
+      }
       pi.setThinkingLevel?.(this.currentSizing.thinkingLevel)
 
       await this.journal.write({ type: 'pre-action', phase: 'P1', action: 'starting P1 DISCOVER' })
@@ -666,30 +725,32 @@ export class Controller {
       }
       this.phaseStore.p1 = p1Result.output
 
-      // ── Post-P1 rescore: prefer p1.complexity (B1); fall back to keyword heuristic ──
-      const assessed = this.phaseStore.p1.complexity
-      const usingAssessment = assessed !== undefined && isValidComplexityInput(assessed)
-      const rescoreInput: ComplexityInput = usingAssessment
-        ? assessed
-        : this._rescoreFromSpec(this.phaseStore.p1.spec)
-      await this.journal.write({
-        type: 'decision',
-        phase: 'P1',
-        action: usingAssessment
-          ? 'tier rescore via p1.complexity (host self-assessment)'
-          : 'tier rescore via keyword heuristic (no p1.complexity)',
-      })
-      const rescoreResult = scoreComplexity(rescoreInput)
-      const newSizing = tierSizing(rescoreResult.tier)
-      if (rescoreResult.tier !== this.currentTier) {
+      // ── Post-P1 rescore: skipped when forced tier is set; else prefer p1.complexity ──
+      if (!this.currentForcedTier) {
+        const assessed = this.phaseStore.p1.complexity
+        const usingAssessment = assessed !== undefined && isValidComplexityInput(assessed)
+        const rescoreInput: ComplexityInput = usingAssessment
+          ? assessed
+          : this._rescoreFromSpec(this.phaseStore.p1.spec)
         await this.journal.write({
           type: 'decision',
           phase: 'P1',
-          action: `tier: ${this.currentTier} -> ${rescoreResult.tier} (post-P1 rescore)`,
+          action: usingAssessment
+            ? 'tier rescore via p1.complexity (host self-assessment)'
+            : 'tier rescore via keyword heuristic (no p1.complexity)',
         })
-        this.currentTier = rescoreResult.tier
-        this.currentSizing = newSizing
-        pi.setThinkingLevel?.(this.currentSizing.thinkingLevel)
+        const rescoreResult = scoreComplexity(rescoreInput)
+        const newSizing = tierSizing(rescoreResult.tier)
+        if (rescoreResult.tier !== this.currentTier) {
+          await this.journal.write({
+            type: 'decision',
+            phase: 'P1',
+            action: `tier: ${this.currentTier} -> ${rescoreResult.tier} (post-P1 rescore)`,
+          })
+          this.currentTier = rescoreResult.tier
+          this.currentSizing = newSizing
+          pi.setThinkingLevel?.(this.currentSizing.thinkingLevel)
+        }
       }
 
       await this.journal.write({ type: 'completion', phase: 'P1', action: 'P1 complete' })
