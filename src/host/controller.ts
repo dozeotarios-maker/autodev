@@ -53,6 +53,12 @@ import { checkReproFaithfulness } from '../debug/faithfulness-check.js'
 import { isHarnessError } from '../debug/harness-error.js'
 import type { D1Output, D2Output, D3Output } from '../debug/debug-output.js'
 import { MAX_DEBUG_ROUNDS } from '../debug/debug-output.js'
+import { R1Characterize } from '../refactor/r1-characterize.js'
+import { R2Transform } from '../refactor/r2-transform.js'
+import { runR3Gate } from '../refactor/r3-verify.js'
+import { runR4Ship } from '../refactor/r4-ship.js'
+import type { R1Output, R2Output } from '../refactor/refactor-output.js'
+import { MAX_REFACTOR_ROUNDS } from '../refactor/refactor-output.js'
 import { scoreComplexity, tierSizing, DEFAULT_SIZING, isValidComplexityInput, tierFromOverride, gearFromForced } from '../engine/complexity.js'
 import type { Sizing, ComplexityInput, ComplexityTier, Gear } from '../engine/complexity.js'
 import type { RetroWriter } from '../engine/retro.js'
@@ -288,6 +294,8 @@ export class Controller {
   private currentIntent: { useCase?: string; scale?: string; audience?: string } | undefined
   /** C-1: active debug-track step label (e.g. 'D1', 'D2', 'D3', 'D4', 'D5'). Undefined when not in debug track. */
   private currentDebugStep: string | undefined
+  /** Stage D: active refactor-track step label (e.g. 'R1', 'R2', 'R3', 'R4'). Undefined when not in refactor track. */
+  private currentRefactorStep: string | undefined
 
   constructor(
     private readonly pi: ExtensionAPI,
@@ -381,6 +389,7 @@ export class Controller {
           phaseByPhase: this.phaseByPhase,
           intentCaptured: this.currentIntent !== undefined,
           debugStep: this.currentDebugStep ?? null,
+          refactorStep: this.currentRefactorStep ?? null,
         }
         ctx.ui.notify(JSON.stringify(status, null, 2), 'info')
       },
@@ -623,7 +632,8 @@ export class Controller {
     if (this.currentTaskType === 'refactor') {
       this.currentRunId = `run-${crypto.randomUUID()}`
       this._terminalStored = false
-      void this._escalate('ROUTER', 'refactor track not yet implemented. Re-run without refactor: to use the build pipeline.')
+      this.currentRefactorStep = undefined
+      void this._runRefactorTrack(ctx)
       return
     }
 
@@ -1942,6 +1952,258 @@ export class Controller {
 
     } catch (err) {
       await this._escalate('DEBUG', `Unexpected error in debug track: ${String(err)}`)
+    }
+  }
+
+  // ── Stage D: Refactor track R1→R4 ────────────────────────────────────────────
+
+  /**
+   * _runRefactorTrack: linear R1→R4 refactor execution.
+   *
+   * Independent of the P1-P6 FSM — uses its own R-step counter.
+   * Refactor runs are NON-resurrectable in v1.
+   * Full lifecycle bookends: currentRunId + _terminalStored reset at entry;
+   * try/catch → _escalate; every terminal releases lock + restores cwd.
+   *
+   * Gates (all deterministic, no host self-report):
+   *   R1: characterizationCommand runs consistently GREEN 3× on CURRENT code (baseline).
+   *       SHA-256 snapshot of characterizationArtifact (anti-cheat for R2/R3).
+   *   R2: gitOps.changedFiles non-empty; characterizationArtifact NOT in changed set
+   *       AND its SHA-256 == R1 snapshot (cannot edit the oracle).
+   *   R3: characterizationCommand runs consistently GREEN 3× (behavior preserved).
+   *       Full suite via verifier.runDeterministic GREEN.
+   *       If characterization RED → HARD escalate "refactor altered behavior" (no retry).
+   *       If only suite fails (char green) → loop R2 capped MAX_REFACTOR_ROUNDS.
+   *   R4: scopedCommit refactor+characterization, scanSecrets, perPhasePush. TierDGate skipped.
+   */
+  private async _runRefactorTrack(ctx: ExtensionContext): Promise<void> {
+    // ── Entry: reset per-run refactor state ─────────────────────────────────
+    this.currentRefactorStep = undefined
+
+    // Journal non-resurrectable marker
+    await this.journal.write({
+      type: 'decision', phase: 'REFACTOR',
+      action: 'refactor track started — NON-RESURRECTABLE in v1; R-steps journalled for post-mortem only',
+    })
+
+    try {
+      const refactorRequest = this.currentIdea
+      const repoRoot = this.repoRoot
+      const outputDir = this.outputDir
+
+      // boundedExec is required for the refactor track
+      const boundedExec = this.opts.boundedExec
+      if (!boundedExec) {
+        await this._escalate('R1', 'boundedExec not injected — refactor track requires BoundedExec')
+        return
+      }
+
+      // Arm allowedPaths so boundedExec path-guard works even when _resolveRepoRoot
+      // was not called (e.g. repoRoot supplied directly via opts).
+      boundedExec.setRepoRoot?.(repoRoot)
+
+      // ── R1: CHARACTERIZE ─────────────────────────────────────────────────
+      this.currentRefactorStep = 'R1'
+      this.opts.transparency.setHudStatus('R1', refactorRequest.slice(0, 60), 'running', 'opus')
+      await this.journal.write({ type: 'pre-action', phase: 'R1', action: 'starting R1 CHARACTERIZE' })
+
+      const r1Step = new R1Characterize(this.hostAgent, outputDir, this.opts.steerTimeoutMs)
+      const r1Result = await r1Step.execute(refactorRequest, repoRoot)
+      if (!r1Result.ok || !r1Result.output) {
+        await this._escalate('R1', r1Result.reason ?? 'R1 failed')
+        return
+      }
+      const r1: R1Output = r1Result.output
+
+      // ── R1 gate: run characterizationCommand 3× — require consistent GREEN ──
+      const CHAR_TIMEOUT_MS = 60_000
+      const RUNS = 3
+
+      for (let i = 0; i < RUNS; i++) {
+        const run = await boundedExec.run(r1.characterizationCommand, repoRoot, { timeoutMs: CHAR_TIMEOUT_MS })
+
+        if (run.blocked) {
+          await this._escalate('R1', `characterizationCommand blocked by action-monitor: ${r1.characterizationCommand}`)
+          return
+        }
+        if (run.timedOut) {
+          await this._escalate('R1', `characterizationCommand timed out after ${CHAR_TIMEOUT_MS}ms`)
+          return
+        }
+        if (run.output && isHarnessError(run.output)) {
+          await this._escalate('R1', 'characterization harness broken — test suite could not be collected')
+          return
+        }
+        if (!run.passed) {
+          // Characterization is RED on current (unchanged) code — cannot establish baseline
+          await this._escalate('R1', 'characterization not green on current code — cannot establish a behavior baseline')
+          return
+        }
+      }
+
+      // ── R1 SHA-256 snapshot of characterizationArtifact (anti-cheat for R2) ──
+      let charHashSnapshot: string
+      try {
+        const charContent = await fs.readFile(
+          r1.characterizationArtifact.startsWith('/') ? r1.characterizationArtifact : path.join(repoRoot, r1.characterizationArtifact),
+          'utf-8'
+        )
+        charHashSnapshot = crypto.createHash('sha256').update(charContent).digest('hex')
+      } catch (err) {
+        await this._escalate('R1', `Could not read characterizationArtifact for hash snapshot: ${String(err)}`)
+        return
+      }
+
+      await this.journal.write({ type: 'completion', phase: 'R1', action: `R1 complete — characterization confirmed GREEN 3×; artifact=${r1.characterizationArtifact}` })
+
+      // ── R2/R3 loop — capped at MAX_REFACTOR_ROUNDS ───────────────────────
+      let r2: R2Output | undefined
+      let round = 0
+
+      while (round < MAX_REFACTOR_ROUNDS) {
+        round++
+
+        // ── R2: TRANSFORM ──────────────────────────────────────────────────
+        this.currentRefactorStep = 'R2'
+        this.opts.transparency.setHudStatus('R2', refactorRequest.slice(0, 60), 'running', 'opus')
+        await this.journal.write({ type: 'pre-action', phase: 'R2', action: `starting R2 TRANSFORM (round ${round})` })
+
+        const r2Step = new R2Transform(this.hostAgent, outputDir, this.opts.steerTimeoutMs)
+        const r2Result = await r2Step.execute(refactorRequest, r1)
+        if (!r2Result.ok || !r2Result.output) {
+          await this._escalate('R2', r2Result.reason ?? 'R2 failed')
+          return
+        }
+        r2 = r2Result.output
+
+        // ── R2 anti-cheat: deterministic changedFiles gate ──────────────────
+        const changedFiles = await this.opts.gitOps.changedFiles(repoRoot)
+
+        // Guard: changedFiles must be non-empty after transform steer
+        if (changedFiles.length === 0) {
+          await this._escalate('R2', 'no changes detected after transform — host wrote nothing to disk')
+          return
+        }
+
+        // Guard: characterizationArtifact must NOT be in changedFiles (can't edit the oracle)
+        const charAbsolute = path.resolve(repoRoot, r1.characterizationArtifact)
+        const charModified = changedFiles.some(f =>
+          f === r1.characterizationArtifact || path.resolve(repoRoot, f) === charAbsolute
+        )
+        if (charModified) {
+          await this._escalate('R2', `characterization oracle was modified during transform — anti-cheat failed: ${r1.characterizationArtifact} appears in changedFiles`)
+          return
+        }
+
+        // Guard: characterizationArtifact content hash unchanged
+        let currentHash: string
+        try {
+          const currentContent = await fs.readFile(
+            r1.characterizationArtifact.startsWith('/') ? r1.characterizationArtifact : path.join(repoRoot, r1.characterizationArtifact),
+            'utf-8'
+          )
+          currentHash = crypto.createHash('sha256').update(currentContent).digest('hex')
+        } catch (err) {
+          await this._escalate('R2', `Could not re-read characterizationArtifact for hash check: ${String(err)}`)
+          return
+        }
+
+        if (currentHash !== charHashSnapshot) {
+          await this._escalate('R2', 'characterization oracle was altered during transform — content hash changed (anti-cheat failed)')
+          return
+        }
+
+        await this.journal.write({ type: 'completion', phase: 'R2', action: `R2 complete — ${r2.filesChanged.length} file(s) changed; anti-cheat passed` })
+
+        // ── R3: VERIFY ────────────────────────────────────────────────────
+        this.currentRefactorStep = 'R3'
+        this.opts.transparency.setHudStatus('R3', refactorRequest.slice(0, 60), 'running', 'opus')
+        await this.journal.write({ type: 'pre-action', phase: 'R3', action: `starting R3 VERIFY (round ${round})` })
+
+        const r3Gate = await runR3Gate(r1, repoRoot, boundedExec, this.opts.verifier)
+
+        if (r3Gate.harnessError) {
+          // Transform broke the characterization's imports/collection
+          await this._escalate('R3', `harness broken during verify — characterization test suite could not be collected after R2 (round ${round}): ${r3Gate.characterizationOutput.slice(0, 300)}`)
+          return
+        }
+
+        if (r3Gate.behaviorChanged) {
+          // Characterization went RED — behavior CHANGED. Hard stop, do NOT retry.
+          await this._escalate('R3', `refactor altered behavior: ${r3Gate.characterizationOutput.slice(0, 300)}`)
+          return
+        }
+
+        if (r3Gate.characterizationGreen && r3Gate.suiteGreen) {
+          // Both gates pass — proceed to R4
+          await this.journal.write({ type: 'completion', phase: 'R3', action: `R3 complete — characterization GREEN 3×, suite GREEN (round ${round})` })
+          break
+        }
+
+        // Characterization green but suite failed — log and loop (if rounds remain)
+        await this.journal.write({
+          type: 'decision', phase: 'R3',
+          action: `R3 suite failed (round ${round}/${MAX_REFACTOR_ROUNDS}) — characterizationGreen=${r3Gate.characterizationGreen} suiteGreen=${r3Gate.suiteGreen}; ${round < MAX_REFACTOR_ROUNDS ? 'looping R2' : 'cap reached'}`,
+        })
+
+        if (round >= MAX_REFACTOR_ROUNDS) {
+          const evidence = [
+            `characterization ${r3Gate.characterizationGreen ? 'GREEN' : 'RED'} after ${round} rounds`,
+            `suite ${r3Gate.suiteGreen ? 'GREEN' : 'RED'}`,
+            `last characterization output: ${r3Gate.characterizationOutput.slice(0, 400)}`,
+          ].join('\n')
+          await this._operatorBrief('R3', `refactor track did not converge after ${MAX_REFACTOR_ROUNDS} rounds:\n${evidence}`)
+          return
+        }
+        // Continue loop (r2 will be re-executed next iteration)
+      }
+
+      // r2 must be defined here (loop ran at least once and broke on R3 success)
+      if (!r2) {
+        await this._escalate('REFACTOR', 'internal error: R2 undefined after loop — should not happen')
+        return
+      }
+
+      // ── R4: SHIP ──────────────────────────────────────────────────────────
+      this.currentRefactorStep = 'R4'
+      this.opts.transparency.setHudStatus('R4', refactorRequest.slice(0, 60), 'running', 'opus')
+      await this.journal.write({ type: 'pre-action', phase: 'R4', action: 'starting R4 SHIP' })
+
+      const r4Result = await runR4Ship(r1, r2, repoRoot, this.opts.gitOps)
+      if (!r4Result.ok || !r4Result.output) {
+        await this._escalate('R4', r4Result.reason ?? 'R4 failed')
+        return
+      }
+
+      await this.journal.write({
+        type: 'completion', phase: 'R4',
+        action: `R4 complete — commit=${r4Result.output.commitSha} push=${r4Result.output.pushResult}`,
+      })
+
+      // ── Success: retro + store + release ──────────────────────────────────
+      const successLesson = `[refactor] ${refactorRequest.slice(0, 120)} → ${r4Result.output.commitSha}`
+      await this.opts.retroWriter?.write({
+        runId: this.currentRunId,
+        lesson: successLesson,
+        bugPattern: 'none',
+        convention: this.currentTier,
+      })
+      this._terminalStored = true
+      try {
+        await this.opts.memoryStore?.store(this.currentRunId, successLesson, {
+          tier: this.currentTier,
+          outcome: 'refactor-success',
+        })
+      } catch (e) { void this.opts.transparency.log(`memory store failed: ${e}`) }
+
+      await this.lifecycle.release()
+      this._restoreCwd()
+      this.currentRefactorStep = undefined
+      this.opts.transparency.setHudStatus('DONE', r4Result.output.commitSha, 'done', 'none')
+      await this.opts.transparency.log(`ALL DONE (refactor track): commit=${r4Result.output.commitSha}`)
+
+    } catch (err) {
+      await this._escalate('REFACTOR', `Unexpected error in refactor track: ${String(err)}`)
     }
   }
 
