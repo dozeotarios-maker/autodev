@@ -145,6 +145,12 @@ const mockP5Output: P5Output = {
   reviewFindings: [],
 }
 
+// Captured ONCE at module load, BEFORE any test calls process.chdir(). Tests that
+// chdir into a temp dir must restore cwd to this stable dir in afterEach BEFORE the
+// temp dir is removed — otherwise process.cwd() points at a since-deleted dir and a
+// later sibling test's path/cwd op throws ENOENT (the ~1-in-3 flake root cause).
+const STABLE_CWD = process.cwd()
+
 // ── Test 1: _resolveRepoRoot re-roots controller + registers + calls ensureIndexed ──
 
 describe('Lane W+C: _resolveRepoRoot re-roots controller when registry injected', () => {
@@ -160,6 +166,9 @@ describe('Lane W+C: _resolveRepoRoot re-roots controller when registry injected'
   })
 
   afterEach(async () => {
+    // Restore cwd to the stable dir BEFORE removing tmpDir: these tests chdir into
+    // resolvedDir, and removing the tree while cwd is inside it strands the process.
+    try { process.chdir(STABLE_CWD) } catch { /* cwd already valid */ }
     await fs.rm(tmpDir, { recursive: true, force: true })
   })
 
@@ -735,7 +744,11 @@ describe('Lane W: P4/P5/P6 instructions contain absolute repoRoot + cd prefix', 
     await p4.execute(ctx)
 
     expect(steerPrompts[0]).not.toContain('Write ALL files under')
-    expect(steerPrompts[0]).not.toContain('cd')
+    // Assert the real cd-prefix marker line is absent. NOTE: a bare not.toContain('cd')
+    // is brittle — the prompt embeds random hex nonces from wrapUntrusted() that
+    // intermittently contain the substring "cd" (~12%/run), so we check the exact
+    // cd-prefix directive line that buildP4Instruction only emits when repoRoot is set.
+    expect(steerPrompts[0]).not.toContain('Prefix every shell command with: cd')
   })
 
   it('P5 instruction contains absolute repoRoot path and cd prefix when repoRoot set', async () => {
@@ -1000,6 +1013,8 @@ describe('Fix 3: /autodev-project command validation', () => {
     await fs.mkdir(path.join(projectDir, '.git'), { recursive: true })
   })
   afterEach(async () => {
+    // Restore cwd before removing tmpDir: these tests chdir into projectDir/junkDir.
+    try { process.chdir(STABLE_CWD) } catch { /* cwd already valid */ }
     await fs.rm(tmpDir, { recursive: true, force: true })
   })
 
@@ -1116,5 +1131,29 @@ describe('Fix 3: /autodev-project command validation', () => {
     )
     const active = await registry.getActive()
     expect(active).toBe('valid-project')
+  })
+
+  // Item 5: '.', '..', and all-dot names must be rejected (they pass the charset
+  // regex but are filesystem-relative path components, never valid project names).
+  it.each(['.', '..', '...'])('dot-name "%s" is refused as invalid', async (badName) => {
+    const registry = new ProjectRegistry(registryDir)
+    const origCwd = process.cwd()
+    process.chdir(projectDir)
+    const { pi } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir, registry })
+    ctrl.wire()
+    ctrl.registerCommands()
+
+    const handler = await getProjectHandler(pi)
+    const notifyMock = vi.fn()
+    await handler!(badName, { ui: { notify: notifyMock } })
+    process.chdir(origCwd)
+
+    expect(notifyMock).toHaveBeenCalledWith(
+      expect.stringContaining('Invalid project name'),
+      'warning'
+    )
+    // Must NOT have registered or activated the dot-name.
+    expect(await registry.getActive()).toBeUndefined()
   })
 })

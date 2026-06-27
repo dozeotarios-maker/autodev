@@ -320,6 +320,42 @@ describe('resolveProjectDir — guardrail: never return homeDir', () => {
     expect(result.dir).not.toBe(fakeHome)
     expect(result.isNew).toBe(true)
   })
+
+  // Item 4: resolver's OWN realpathSafe (used by isHomeOrAncestor) walks up to the
+  // nearest existing ancestor on ENOENT. A registered project dir reached via a
+  // symlinked parent with a MISSING leaf must dereference to its real path so the
+  // $HOME guardrail recognises it as homeDir and falls through to step 4. Without
+  // the walk-up, the guardrail compares the non-dereferenced string, fails to match
+  // home, and (wrongly) returns the registered dir at step 1.
+  it('registered dir via a symlinked parent (missing leaf) is caught by the home guardrail', async () => {
+    const realParent = path.join(tmpDir, 'real-home-parent')
+    const linkParent = path.join(tmpDir, 'link-home-parent')
+    await fs.mkdir(realParent, { recursive: true })
+    await fs.symlink(realParent, linkParent)
+
+    // homeDir real path == realParent/myhome (leaf absent).
+    const homeDir = path.join(realParent, 'myhome')
+    // The registered project dir points at the SAME real location via the symlink.
+    const registeredViaLink = path.join(linkParent, 'myhome')
+
+    const registry = new ProjectRegistry(tmpDir)
+    await registry.register('home-symlink-proj', registeredViaLink)
+
+    // cwd is the registered dir string → step-1 findByDir matches it, then the
+    // guardrail must deref both to realParent/myhome and treat it as home.
+    const result = await resolveProjectDir({
+      cwd: registeredViaLink,
+      idea: 'symlinked home guardrail',
+      registry,
+      homeDir,
+    })
+
+    // Guardrail dereferenced the symlink → registered dir === home → step 4.
+    // On the OLD realpathSafe this would return isNew=false (the registered dir).
+    expect(result.isNew).toBe(true)
+    expect(result.dir).not.toBe(registeredViaLink)
+    expect(result.dir.startsWith(path.join(homeDir, 'autodev') + path.sep)).toBe(true)
+  })
 })
 
 describe('resolveProjectDir — cwd already registered (recall)', () => {

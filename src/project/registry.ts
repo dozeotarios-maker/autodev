@@ -10,12 +10,32 @@ import * as fsSync from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 
-/** Resolve a path to its real target, falling back to path.resolve on error (fix 4). */
+/**
+ * Resolve a path to its real (symlink-dereferenced) target.
+ *
+ * Fix 4 (Item 4): when the leaf doesn't exist (ENOENT), walk UP to the nearest
+ * existing ancestor, realpath THAT (following symlinks), then re-join the missing
+ * tail — so a symlinked parent dir with a missing leaf resolves through the symlink
+ * instead of falling back to a non-dereferenced path.resolve.
+ */
 function realpathSafe(p: string): string {
   try {
     return fsSync.realpathSync(p)
   } catch {
-    return path.resolve(p)
+    const abs = path.resolve(p)
+    let cur = abs
+    const tail: string[] = []
+    while (true) {
+      const parent = path.dirname(cur)
+      if (parent === cur) return abs
+      tail.unshift(path.basename(cur))
+      try {
+        const realParent = fsSync.realpathSync(parent)
+        return path.join(realParent, ...tail)
+      } catch {
+        cur = parent
+      }
+    }
   }
 }
 
@@ -75,7 +95,10 @@ export class ProjectRegistry {
   private save(): Promise<void> {
     // Fix 5: chain onto saveQueue to serialize concurrent saves within this instance.
     // Each save reads the latest this.data (captured in closure after mutations are applied).
-    this.saveQueue = this.saveQueue.then(() => this._doSave())
+    // Item 6: swallow the PRIOR save's rejection before chaining so one failed _doSave()
+    // does not poison the queue — every subsequent save still gets its own _doSave()
+    // attempt (and surfaces its own success/failure to its own caller).
+    this.saveQueue = this.saveQueue.catch(() => undefined).then(() => this._doSave())
     return this.saveQueue
   }
 

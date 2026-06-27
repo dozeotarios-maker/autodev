@@ -251,10 +251,14 @@ export class Controller {
           return
         }
         if (name) {
-          // Fix 3: validate name charset/length
-          if (name.length > 64 || !/^[a-zA-Z0-9_\-\.]+$/.test(name)) {
+          // Fix 3: validate name charset/length.
+          // Item 5: also reject '.', '..', and all-dot names ('...' etc.) — they pass
+          // the charset regex but are filesystem-relative path components, never valid
+          // project identifiers.
+          const isAllDots = /^\.+$/.test(name)
+          if (name.length > 64 || !/^[a-zA-Z0-9_\-\.]+$/.test(name) || isAllDots) {
             ctx.ui.notify(
-              `[pi-autodev] Invalid project name "${name.slice(0, 40)}": must be ≤64 chars, [a-zA-Z0-9_\\-.] only`,
+              `[pi-autodev] Invalid project name "${name.slice(0, 40)}": must be ≤64 chars, [a-zA-Z0-9_\\-.] only, and not an all-dot name (. .. ...)`,
               'warning'
             )
             return

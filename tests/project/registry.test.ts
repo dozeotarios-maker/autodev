@@ -276,4 +276,84 @@ describe('Fix 4: findByDir uses realpathSafe (symlink dirs)', () => {
     const found = await registry.findByDir(realDir)
     expect(found).toBe('real-proj')
   })
+
+  // Item 4: realpathSafe walks up to the nearest existing ancestor on ENOENT, so a
+  // symlinked PARENT with a MISSING leaf still dereferences through the symlink.
+  it('findByDir matches across a symlinked parent when the leaf dir does not exist', async () => {
+    const realParent = path.join(tmpDir, 'real-parent')
+    const linkParent = path.join(tmpDir, 'link-parent')
+    await fs.mkdir(realParent, { recursive: true })
+    await fs.symlink(realParent, linkParent)
+
+    // Register the project under the REAL parent, with a leaf that is NOT created.
+    const registry = new ProjectRegistry(tmpDir)
+    await registry.register('missing-leaf-proj', path.join(realParent, 'app'))
+
+    // Look it up via the SYMLINKED parent path (leaf still absent). The walk-up
+    // realpaths link-parent → real-parent, so both normalize to the same path.
+    const found = await registry.findByDir(path.join(linkParent, 'app'))
+    expect(found).toBe('missing-leaf-proj')
+  })
+})
+
+// ── Item 6: saveQueue must not be poisoned by a failed _doSave ─────────────────
+//
+// _doSave() writes a tmp file then renames it onto projects.json. If projects.json
+// is a non-empty DIRECTORY, the rename fails (ENOTEMPTY/EISDIR/EEXIST) — a real,
+// deterministic _doSave failure that needs no fs mocking (which ESM forbids via
+// vi.spyOn on a module namespace). We fail the FIRST save this way, then clear the
+// obstruction so the SECOND save can succeed — proving the chain was not poisoned.
+
+describe('Item 6: saveQueue does not poison the chain on a failed _doSave', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await makeTmpDir()
+  })
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('a failed save (real rename failure) does not break the NEXT save', async () => {
+    const registry = new ProjectRegistry(tmpDir)
+    const filePath = path.join(tmpDir, 'projects.json')
+
+    // Make projects.json a NON-EMPTY directory so rename(tmp, projects.json) fails.
+    await fs.mkdir(filePath, { recursive: true })
+    await fs.writeFile(path.join(filePath, 'blocker'), 'x', 'utf-8')
+
+    // First register → _doSave's rename fails. Must reject (not hang).
+    await expect(registry.register('first', '/dir/first')).rejects.toThrow()
+
+    // Clear the obstruction so the next save can succeed.
+    await fs.rm(filePath, { recursive: true, force: true })
+
+    // Second register → its save MUST still run _doSave (chain not poisoned).
+    // If the queue were poisoned (no .catch), this would reject with the FIRST
+    // error forever and 'second' would never reach disk.
+    await expect(registry.register('second', '/dir/second')).resolves.toBeUndefined()
+
+    // Proof the second save actually executed _doSave: a fresh instance reads it.
+    const r2 = new ProjectRegistry(tmpDir)
+    expect(await r2.get('second')).toBeDefined()
+    expect((await r2.get('second'))!.dir).toBe(path.resolve('/dir/second'))
+  })
+
+  it('two consecutive failures then a success: each failure rejects, success persists', async () => {
+    const registry = new ProjectRegistry(tmpDir)
+    const filePath = path.join(tmpDir, 'projects.json')
+    await fs.mkdir(filePath, { recursive: true })
+    await fs.writeFile(path.join(filePath, 'blocker'), 'x', 'utf-8')
+
+    // Two failing saves in a row — second must NOT inherit the first's rejection
+    // via a poisoned chain; it must fail on its OWN _doSave attempt and reject.
+    await expect(registry.register('a', '/dir/a')).rejects.toThrow()
+    await expect(registry.register('b', '/dir/b')).rejects.toThrow()
+
+    await fs.rm(filePath, { recursive: true, force: true })
+
+    await expect(registry.register('c', '/dir/c')).resolves.toBeUndefined()
+    const r2 = new ProjectRegistry(tmpDir)
+    expect(await r2.get('c')).toBeDefined()
+  })
 })

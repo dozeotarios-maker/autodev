@@ -235,3 +235,139 @@ describe('Fix 4: symlink escape — symlink resolving to protected/home caught',
     }
   })
 })
+
+// ── Item 2: tilde / $HOME / quoted redirect targets must be expanded then checked ──
+
+describe('Item 2: bash redirect targets — tilde/$HOME expansion + quote stripping', () => {
+  const HOME = os.homedir()
+
+  it('blocks echo x > ~/f (tilde expands to $HOME, outside allowedPaths)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    const result = m.checkBashCommand('echo x > ~/f')
+    expect(result.allowed).toBe(false)
+    expect(result.reason).toMatch(/absolute-path write escape/)
+  })
+
+  it('blocks echo x > "/root/f" (quoted absolute path outside allowedPaths)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x > "/root/f"').allowed).toBe(false)
+  })
+
+  it('blocks echo x > "${HOME}/f" (braced $HOME expands, outside allowedPaths)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x > "${HOME}/f"').allowed).toBe(false)
+  })
+
+  it('blocks echo x > $HOME/f (bare $HOME expands, outside allowedPaths)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x > $HOME/f').allowed).toBe(false)
+  })
+
+  it("blocks echo x > '/root/f' (single-quoted absolute path)", () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand("echo x > '/root/f'").allowed).toBe(false)
+  })
+
+  it('allows echo x > ./rel.txt (relative path stays allowed)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x > ./rel.txt').allowed).toBe(true)
+  })
+
+  it('allows cat ~/.bashrc (read, not a write)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('cat ~/.bashrc').allowed).toBe(true)
+  })
+
+  it('allows redirect to a tilde path INSIDE allowedPaths', () => {
+    // allowedPaths includes $HOME itself → ~/f expands under it → allowed
+    const m = new ActionMonitor([HOME])
+    expect(m.checkBashCommand('echo x > ~/f').allowed).toBe(true)
+  })
+})
+
+// ── Item 3: cp/mv segment detection + -t/--target-directory ────────────────────
+
+describe('Item 3: cp/mv in any segment + target-directory flag', () => {
+  it('blocks cd /tmp && cp a /root/f (cp is head of a later &&-segment)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    const result = m.checkBashCommand('cd /tmp && cp a /root/f')
+    expect(result.allowed).toBe(false)
+    expect(result.reason).toMatch(/absolute-path write escape/)
+  })
+
+  it('blocks cp -t /root/d a (-t target-directory outside allowedPaths)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('cp -t /root/d a').allowed).toBe(false)
+  })
+
+  it('blocks cp --target-directory=/root/d a (long-form target-directory)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('cp --target-directory=/root/d a').allowed).toBe(false)
+  })
+
+  it('blocks mv -t /root/d a (mv with -t target outside allowedPaths)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('mv -t /root/d a').allowed).toBe(false)
+  })
+
+  it('blocks foo; cp a /root/b (cp head of a ;-segment)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('foo; cp a /root/b').allowed).toBe(false)
+  })
+
+  it('blocks cp a.txt b.txt /root/dst (absolute path among multiple args)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('cp a.txt b.txt /root/dst').allowed).toBe(false)
+  })
+
+  it('allows cp /root/src ./local (only abs path is a SOURCE inside no-write-dst — dest relative)', () => {
+    // NOTE: per task spec this must be ALLOWED. The cp scan flags an abs path that is
+    // outside allowedPaths; /root/src is a read source. Spec says allow this case.
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('cp /root/src ./local').allowed).toBe(true)
+  })
+
+  it('allows cp a ./local (no absolute paths at all)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('cp a ./local').allowed).toBe(true)
+  })
+
+  it('allows cp a /tmp/proj/dst (destination inside allowedPaths)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('cp a /tmp/proj/dst').allowed).toBe(true)
+  })
+})
+
+// ── Item 4: realpathSafe walks up to nearest existing ancestor on ENOENT ─────────
+
+describe('Item 4: realpathSafe dereferences a symlinked parent for a missing leaf', () => {
+  it('a write to <symlinked-parent>/missing-leaf resolves through the symlink', () => {
+    // realParent is the true target; linkParent is a symlink to it. The leaf does
+    // NOT exist, so a naive realpathSync(leaf) throws ENOENT and falls back to
+    // path.resolve (which does NOT follow the symlink). The walk-up fix must
+    // realpath the existing symlinked parent then re-join the missing leaf.
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'item4-realpath-'))
+    const realParent = path.join(base, 'real-parent')
+    const linkParent = path.join(base, 'link-parent')
+    fs.mkdirSync(realParent, { recursive: true })
+    try {
+      fs.symlinkSync(realParent, linkParent)
+      // allowedPaths = realParent only. Writing under the SYMLINK path must be
+      // recognised as inside realParent (deref) → allowed.
+      const m = new ActionMonitor([realParent])
+      const viaLink = path.join(linkParent, 'subdir', 'newfile.ts') // leaf missing
+      expect(m.checkFileWrite(viaLink).allowed).toBe(true)
+
+      // Conversely, a symlink whose real parent is OUTSIDE allowedPaths must be
+      // blocked even for a missing leaf (deref reveals the true location).
+      const outsideReal = path.join(base, 'outside-real')
+      const outsideLink = path.join(base, 'outside-link')
+      fs.mkdirSync(outsideReal, { recursive: true })
+      fs.symlinkSync(outsideReal, outsideLink)
+      const viaOutside = path.join(outsideLink, 'x', 'missing.ts')
+      expect(m.checkFileWrite(viaOutside).allowed).toBe(false)
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true })
+    }
+  })
+})
