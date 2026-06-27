@@ -15,6 +15,7 @@ import type { PhaseResult } from './phase-executor.js'
 import { wrapUntrusted } from './safe-prompt.js'
 import { DEFAULT_SIZING } from '../engine/complexity.js'
 import { MINIMALISM_REVIEW_LENS, CRAFTSMANSHIP_REVIEW_LENS } from '../principles.js'
+import { resolveTestCommand } from '../verify/test-command.js'
 
 const ROLE_DIRECTIVES = `
 ## Role: Verifier Agent (P5)
@@ -116,10 +117,15 @@ export class P5Verify {
     const outputFile = path.join(this.outputDir, 'p5-verify.json')
     await fs.mkdir(path.dirname(outputFile), { recursive: true })
 
+    // Resolve the project's own test command (honors the stack P1 chose). Hardcoding
+    // `npx vitest run` made a node:test/jest build fail the gate with zero suites
+    // collected, forcing it to abandon its chosen stack to satisfy the verifier.
+    const testCmd = await resolveTestCommand(this.repoRoot)
+
     // Run deterministic checks via Verifier port
     let deterministicPassed = false
     try {
-      const detResult = await this.verifier.runDeterministic('npx vitest run', this.repoRoot)
+      const detResult = await this.verifier.runDeterministic(testCmd, this.repoRoot)
       deterministicPassed = detResult.passed
     } catch {
       deterministicPassed = false
@@ -128,7 +134,7 @@ export class P5Verify {
     // Run holdout via Verifier port
     let holdoutPassed = false
     try {
-      const holdoutResult = await this.verifier.runHoldout('npx vitest run', this.repoRoot)
+      const holdoutResult = await this.verifier.runHoldout(testCmd, this.repoRoot)
       holdoutPassed = holdoutResult.passed
     } catch {
       holdoutPassed = false

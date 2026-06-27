@@ -7,6 +7,7 @@ import type { BoundedExec } from '../ports.js'
 import type { Verifier } from '../ports.js'
 import type { R1Output } from './refactor-output.js'
 import { isHarnessError } from '../debug/harness-error.js'
+import { resolveTestCommand } from '../verify/test-command.js'
 
 export interface R3GateResult {
   characterizationGreen: boolean
@@ -85,7 +86,7 @@ export async function runR3Gate(
   }
 
   // Characterization consistently green — now run the full suite
-  const suiteResult = await verifier.runDeterministic('npx vitest run', repoRoot)
+  const suiteResult = await verifier.runDeterministic(await resolveTestCommand(repoRoot), repoRoot)
 
   return {
     characterizationGreen: true,

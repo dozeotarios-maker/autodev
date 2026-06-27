@@ -64,6 +64,7 @@ import type { Sizing, ComplexityInput, ComplexityTier, Gear } from '../engine/co
 import { MINIMALISM_DIRECTIVE, CRAFTSMANSHIP_DIRECTIVE } from '../principles.js'
 import type { RetroWriter } from '../engine/retro.js'
 import { resolveProjectDir } from '../project/resolver.js'
+import { ensureGitRepo } from '../git/ensure-repo.js'
 import type { ProjectRegistry } from '../project/registry.js'
 
 // ── compactAsync ─────────────────────────────────────────────────────────────
@@ -1176,6 +1177,18 @@ export class Controller {
     this.pauseFilePath = path.join(r.dir, '.autodev', 'PAUSE')
     this.journal = new Journal(path.join(r.dir, '.autodev', 'journal.jsonl'))
     this.actionMonitor = new ActionMonitor([r.dir])
+
+    // A fresh scratch project (~/autodev/<slug>) is just an empty directory — make it a
+    // git repo so P6's scoped commit has somewhere to land. Existing repos are untouched.
+    if (r.isNew) {
+      try {
+        if (await ensureGitRepo(r.dir)) {
+          void this.journal.write({ type: 'decision', phase: 'P1', action: 'git init: fresh project repo created' })
+        }
+      } catch (e) {
+        void this.journal.write({ type: 'decision', phase: 'P1', action: `git init failed: ${String(e)}` })
+      }
+    }
 
     // Re-root construction-captured backends (chdir does NOT fix frozen paths):
     //  - GitOps: rebuild ScopedCommit/PerPhasePush/GitleaksHook → P6 commits/pushes r.dir.

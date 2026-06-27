@@ -6,6 +6,7 @@ import type { BoundedExec } from '../ports.js'
 import type { Verifier } from '../ports.js'
 import type { D1Output } from './debug-output.js'
 import { isHarnessError } from './harness-error.js'
+import { resolveTestCommand } from '../verify/test-command.js'
 
 export interface D4GateResult {
   reproGreen: boolean
@@ -73,7 +74,7 @@ export async function runD4Gate(
   }
 
   // Repro is consistently green — now run the full suite
-  const suiteResult = await verifier.runDeterministic('npx vitest run', repoRoot)
+  const suiteResult = await verifier.runDeterministic(await resolveTestCommand(repoRoot), repoRoot)
 
   return {
     reproGreen: true,
