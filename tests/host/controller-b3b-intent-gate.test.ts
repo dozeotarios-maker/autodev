@@ -586,6 +586,93 @@ describe('B3b Task3: _intentGate — full flow (hasUI+isNew+no-override)', () =>
     expect(result).toEqual({ useCase: 'a todo app', scale: 'small' })
   })
 
+  it('Q1 empty string → gate returns undefined (same as cancel), input called once', async () => {
+    const { pi } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir, dialogueTimeoutMs: 100 })
+
+    const c = ctrl as unknown as {
+      resolvedIsNew: boolean
+      currentForcedTier: string | undefined
+    }
+    c.resolvedIsNew = true
+    c.currentForcedTier = undefined
+
+    const inputMock = vi.fn().mockResolvedValueOnce('')  // empty string, not undefined
+
+    const ctx = {
+      hasUI: true,
+      ui: { setStatus: vi.fn(), notify: vi.fn(), input: inputMock },
+      compact: vi.fn(),
+    } as unknown as ExtensionContext
+
+    const gate = (ctrl as unknown as {
+      _intentGate(ctx: ExtensionContext): Promise<{ useCase?: string; scale?: string; audience?: string } | undefined>
+    })._intentGate
+    const result = await gate.call(ctrl, ctx)
+
+    expect(inputMock).toHaveBeenCalledTimes(1)
+    expect(result).toBeUndefined()
+  })
+
+  it('Q2 empty string after valid Q1 → partial intent with useCase only, no scale key', async () => {
+    const { pi } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir, dialogueTimeoutMs: 100 })
+
+    const c = ctrl as unknown as {
+      resolvedIsNew: boolean
+      currentForcedTier: string | undefined
+    }
+    c.resolvedIsNew = true
+    c.currentForcedTier = undefined
+
+    const inputMock = vi.fn()
+      .mockResolvedValueOnce('a todo app')
+      .mockResolvedValueOnce('')  // empty scale → stop, don't add scale key
+
+    const ctx = {
+      hasUI: true,
+      ui: { setStatus: vi.fn(), notify: vi.fn(), input: inputMock },
+      compact: vi.fn(),
+    } as unknown as ExtensionContext
+
+    const gate = (ctrl as unknown as {
+      _intentGate(ctx: ExtensionContext): Promise<{ useCase?: string; scale?: string; audience?: string } | undefined>
+    })._intentGate
+    const result = await gate.call(ctrl, ctx)
+
+    expect(inputMock).toHaveBeenCalledTimes(2)
+    expect(result).toEqual({ useCase: 'a todo app' })
+    expect(result).not.toHaveProperty('scale')
+  })
+
+  it('Q1 whitespace-only → treated as empty (falsy after trim) → gate returns undefined', async () => {
+    const { pi } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir, dialogueTimeoutMs: 100 })
+
+    const c = ctrl as unknown as {
+      resolvedIsNew: boolean
+      currentForcedTier: string | undefined
+    }
+    c.resolvedIsNew = true
+    c.currentForcedTier = undefined
+
+    const inputMock = vi.fn().mockResolvedValueOnce('   ')  // whitespace only
+
+    const ctx = {
+      hasUI: true,
+      ui: { setStatus: vi.fn(), notify: vi.fn(), input: inputMock },
+      compact: vi.fn(),
+    } as unknown as ExtensionContext
+
+    const gate = (ctrl as unknown as {
+      _intentGate(ctx: ExtensionContext): Promise<{ useCase?: string; scale?: string; audience?: string } | undefined>
+    })._intentGate
+    const result = await gate.call(ctrl, ctx)
+
+    expect(inputMock).toHaveBeenCalledTimes(1)
+    expect(result).toBeUndefined()
+  })
+
   it('each input call uses the configured dialogueTimeoutMs', async () => {
     const { pi } = makeMockPi()
     const ctrl = makeController(pi, { repoRoot: tmpDir, dialogueTimeoutMs: 42_000 })
@@ -683,6 +770,85 @@ describe('B3b Task3 (integration): intent gate threads into P1 on new project ru
     expect(inputMock).not.toHaveBeenCalled()
     process.chdir(origCwd)
   }, 15_000)
+
+  it('end-to-end gate→P1 wiring: intent values appear in P1 steer instruction', async () => {
+    // This test MUST FAIL if `intent: this.currentIntent` is removed from _runPhases.
+    // It drives a full new-project run with hasUI=true + ui.input returning 3 answers,
+    // then asserts the P1 sendUserMessage call contains the intent use-case string.
+    const registry = new ProjectRegistry(registryDir)
+    const junkDir = path.join(tmpDir, 'junk-wiring')
+    await fs.mkdir(junkDir, { recursive: true })
+
+    process.chdir(tmpDir)
+    const origCwd = process.cwd()
+    process.chdir(junkDir)
+
+    const outputDir = path.join(tmpDir, '.autodev', 'phase-output')
+
+    const { pi, fire } = makeMockPi()
+
+    // Capture all sendUserMessage calls to inspect the P1 instruction
+    const steerCalls: string[] = []
+    ;(pi as unknown as Record<string, unknown>).sendUserMessage = vi.fn(async (msg: string) => {
+      steerCalls.push(msg)
+      await fs.mkdir(outputDir, { recursive: true })
+      // P1 output on first steer
+      if (steerCalls.length === 1) {
+        await fs.writeFile(path.join(outputDir, 'p1-spec.json'), JSON.stringify({
+          phase: 'P1',
+          spec: 'A todo app for personal task management with reminders',
+          stackAdr: 'Node.js + Express + SQLite',
+          webResearch: [],
+        }))
+      }
+    })
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency: makeNullTransparency(),
+      dialogueTimeoutMs: 200,
+      steerTimeoutMs: 400,
+      registry,
+    })
+    ctrl.wire()
+
+    // ctx WITH hasUI=true + ui.input returning 3 intent answers
+    const inputMock = vi.fn()
+      .mockResolvedValueOnce('wiring-test-use-case')
+      .mockResolvedValueOnce('solo')
+      .mockResolvedValueOnce('just me')
+
+    const ctx: ExtensionContext = {
+      hasUI: true,
+      ui: { setStatus: vi.fn(), notify: vi.fn(), input: inputMock },
+      compact: vi.fn(({ onComplete }: { onComplete: () => void }) => {
+        setImmediate(onComplete)
+      }),
+    } as unknown as ExtensionContext
+
+    await fire('session_start', makeSessionStartEvent(), ctx)
+    void fire('input', makeInputEvent('Build a brand new wiring test project'), ctx)
+
+    // Wait for P1 steer to fire
+    await new Promise<void>((resolve) => {
+      const deadline = Date.now() + 6_000
+      const check = () => {
+        if (steerCalls.length >= 1 || Date.now() > deadline) resolve()
+        else setTimeout(check, 20)
+      }
+      check()
+    })
+
+    // Assert intent was wired into P1 instruction
+    expect(steerCalls.length).toBeGreaterThanOrEqual(1)
+    expect(steerCalls[0]).toContain('wiring-test-use-case')
+
+    await waitForLockRelease(tmpDir, 8_000)
+    process.chdir(origCwd)
+  }, 20_000)
 })
 
 // ════════════════════════════════════════════════════════════════════════════════

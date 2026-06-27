@@ -1904,35 +1904,38 @@ export class Controller {
     const timeout = this.opts.dialogueTimeoutMs ?? 300_000
     const intent: { useCase?: string; scale?: string; audience?: string } = {}
 
-    const useCase = await uiAny.input(
+    const useCaseRaw = await uiAny.input(
       'What are you building? (use case)',
       'e.g. a todo app, a REST API, a CLI tool',
       { timeout }
     )
-    if (useCase === undefined) {
-      void this.journal.write({ type: 'decision', phase: 'P1', action: 'intent gate: use-case cancelled/timed out — degrading' })
+    const useCase = useCaseRaw?.trim()
+    if (!useCase) {
+      void this.journal.write({ type: 'decision', phase: 'P1', action: 'intent gate: use-case empty/cancelled — degrading' })
       return undefined
     }
     intent.useCase = useCase
 
-    const scale = await uiAny.input(
+    const scaleRaw = await uiAny.input(
       'What scale? (team size / user count)',
       'e.g. solo, small team, 1k users',
       { timeout }
     )
-    if (scale === undefined) {
-      void this.journal.write({ type: 'decision', phase: 'P1', action: 'intent gate: scale cancelled/timed out — proceeding with partial intent' })
+    const scale = scaleRaw?.trim()
+    if (!scale) {
+      void this.journal.write({ type: 'decision', phase: 'P1', action: 'intent gate: scale empty/cancelled — proceeding with partial intent' })
       return intent
     }
     intent.scale = scale
 
-    const audience = await uiAny.input(
+    const audienceRaw = await uiAny.input(
       'Who is the audience?',
       'e.g. just me, internal team, public users',
       { timeout }
     )
-    if (audience === undefined) {
-      void this.journal.write({ type: 'decision', phase: 'P1', action: 'intent gate: audience cancelled/timed out — proceeding with partial intent' })
+    const audience = audienceRaw?.trim()
+    if (!audience) {
+      void this.journal.write({ type: 'decision', phase: 'P1', action: 'intent gate: audience empty/cancelled — proceeding with partial intent' })
       return intent
     }
     intent.audience = audience
