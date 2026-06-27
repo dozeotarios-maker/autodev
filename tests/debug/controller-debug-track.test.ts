@@ -111,29 +111,27 @@ function makeNullJudge(): Judge {
 
 // ── B1 teardown-settle helper ──────────────────────────────────────────────────
 
-async function waitForLockRelease(tmpDir: string, timeoutMs = 20_000): Promise<void> {
+async function waitForLockRelease(tmpDir: string, timeoutMs = 3_000): Promise<void> {
   const lockPath = path.join(tmpDir, '.autodev', 'running.lock')
   const deadline = Date.now() + timeoutMs
 
-  // Phase 1: wait for lock to appear (run started).
-  // Break early if lock never appears (run completed so fast it was never observed,
-  // or run already completed before we started polling — both are valid "done" states).
-  // Cap phase-1 at 2s so we don't block 20s waiting for a lock that won't come.
-  const phase1Deadline = Math.min(deadline, Date.now() + 2_000)
-  while (Date.now() < phase1Deadline) {
-    const locked = await fs.access(lockPath).then(() => true).catch(() => false)
-    if (locked) break
+  // Check immediately — if lock is already gone (run completed before we got here), done fast.
+  const initiallyLocked = await fs.access(lockPath).then(() => true).catch(() => false)
+  if (!initiallyLocked) {
+    // Lock never appeared or already released — run is done.
     await new Promise((r) => setTimeout(r, 10))
+    return
   }
 
+  // Phase 1: wait for lock to appear (it's already appeared above — skip to phase 2).
   // Phase 2: wait for lock to disappear (run released)
   while (Date.now() < deadline) {
     const locked = await fs.access(lockPath).then(() => true).catch(() => false)
     if (!locked) break
-    await new Promise((r) => setTimeout(r, 15))
+    await new Promise((r) => setTimeout(r, 10))
   }
 
-  await new Promise((r) => setTimeout(r, 25))
+  await new Promise((r) => setTimeout(r, 10))
 }
 
 // ── Steer driver helper ────────────────────────────────────────────────────────
@@ -148,11 +146,21 @@ async function driveDebugSteers(
   steerPrompts: string[],
   driver: SteerDriver,
   maxSteers = 8,
-  timeoutMs = 15_000
+  timeoutMs = 15_000,
+  tmpDir?: string
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
   let driven = 0
   while (driven < maxSteers && Date.now() < deadline) {
+    // Stop as soon as the run-lock disappears — the run is done (D4/D5 are
+    // deterministic gates that fire no steers, so driven never reaches maxSteers
+    // for those paths, causing the old code to busy-wait the full deadline).
+    if (tmpDir) {
+      const lockPath = path.join(tmpDir, '.autodev', 'running.lock')
+      const locked = await fs.access(lockPath).then(() => true).catch(() => false)
+      // If lock was never created OR has already been released, the run is done
+      if (!locked && driven > 0) break
+    }
     await new Promise((r) => setTimeout(r, 20))
     if (steerPrompts.length > driven) {
       const prompt = steerPrompts[driven]
@@ -263,7 +271,7 @@ describe('C-1 debug track: happy path D1→D5→commit', () => {
     }
 
     void fire('input', makeInputEvent('debug: tests fail in the auth module'), ctx)
-    await driveDebugSteers(pi, fire, ctx, steerPrompts, steerDriver, 5, 15_000)
+    await driveDebugSteers(pi, fire, ctx, steerPrompts, steerDriver, 5, 15_000, tmpDir)
     await waitForLockRelease(tmpDir)
 
     // Verify: build pipeline NOT entered (no P1 DISCOVER steer)
@@ -338,7 +346,7 @@ describe('C-1 debug track: D1 no-repro (boundedExec green) → escalate + lock r
     }
 
     void fire('input', makeInputEvent('debug: tests fail in the auth module'), ctx)
-    await driveDebugSteers(pi, fire, ctx, steerPrompts, steerDriver, 2, 10_000)
+    await driveDebugSteers(pi, fire, ctx, steerPrompts, steerDriver, 2, 10_000, tmpDir)
     await waitForLockRelease(tmpDir)
 
     // Lock released
@@ -411,7 +419,7 @@ describe('C-1 debug track: D1 faithfulness-fail → escalate', () => {
     }
 
     void fire('input', makeInputEvent('debug: tests fail in the auth module'), ctx)
-    await driveDebugSteers(pi, fire, ctx, steerPrompts, steerDriver, 2, 10_000)
+    await driveDebugSteers(pi, fire, ctx, steerPrompts, steerDriver, 2, 10_000, tmpDir)
     await waitForLockRelease(tmpDir)
 
     // Lock released
@@ -506,7 +514,7 @@ describe('C-1 debug track: D3 repro-altered → escalate', () => {
     }
 
     void fire('input', makeInputEvent('debug: tests fail in the auth module'), ctx)
-    await driveDebugSteers(pi, fire, ctx, steerPrompts, steerDriver, 5, 15_000)
+    await driveDebugSteers(pi, fire, ctx, steerPrompts, steerDriver, 5, 15_000, tmpDir)
     await waitForLockRelease(tmpDir)
 
     // Lock released
@@ -600,7 +608,7 @@ describe('C-1 debug track: D4 non-convergence → operatorBrief + lock released'
 
     void fire('input', makeInputEvent('debug: tests fail in the auth module'), ctx)
     // Drive up to 8 steers: D1 + 3 rounds × (D2 + D3) = 7 steers max
-    await driveDebugSteers(pi, fire, ctx, steerPrompts, steerDriver, 8, 25_000)
+    await driveDebugSteers(pi, fire, ctx, steerPrompts, steerDriver, 8, 25_000, tmpDir)
     await waitForLockRelease(tmpDir)
 
     // Lock released
@@ -691,4 +699,453 @@ describe('C-1 /autodev-status shows debugStep when active', () => {
       await fs.rm(tmpDir, { recursive: true, force: true })
     }
   })
+})
+
+// ── HIGH: D1 harness-error gate ───────────────────────────────────────────────
+
+describe('C-1 debug track: D1 harness-error → escalate repro harness broken', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'c1-harness-'))
+  })
+
+  afterEach(async () => {
+    await waitForLockRelease(tmpDir)
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('D1 gate: boundedExec returns harness-error output → ESCALATE repro harness broken, NOT proceed-to-D2', async () => {
+    const { pi, fire, steerPrompts } = makeMockPi()
+    const transparency = makeNullTransparency()
+
+    // boundedExec: fails with "No test suite found" (harness error, not assertion failure)
+    const boundedExec: BoundedExec = {
+      run: vi.fn().mockResolvedValue({
+        passed: false,
+        exitCode: 1,
+        output: 'Error: No test suite found in tests/debug/repro-auth.test.ts',
+        timedOut: false,
+        blocked: false,
+      }),
+    }
+
+    const reproArtifact = path.join(tmpDir, 'tests', 'debug', 'repro-auth.test.ts')
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency,
+      steerTimeoutMs: 5_000,
+      boundedExec,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    const steerDriver: SteerDriver = async (_idx, _prompt, dir) => {
+      await fs.mkdir(dir, { recursive: true })
+      const d1Data: D1Output = {
+        reproSummary: 'Repro test',
+        reproCommand: `npx vitest run ${reproArtifact}`,
+        reproArtifact,
+      }
+      await fs.mkdir(path.dirname(reproArtifact), { recursive: true })
+      await fs.writeFile(reproArtifact, '// repro')
+      await fs.writeFile(path.join(dir, 'd1-reproduce.json'), JSON.stringify(d1Data))
+    }
+
+    void fire('input', makeInputEvent('debug: tests fail in the auth module'), ctx)
+    await driveDebugSteers(pi, fire, ctx, steerPrompts, steerDriver, 2, 10_000, tmpDir)
+    await waitForLockRelease(tmpDir)
+
+    // Lock released
+    const lockPath = path.join(tmpDir, '.autodev', 'running.lock')
+    expect(await fs.access(lockPath).then(() => true).catch(() => false)).toBe(false)
+
+    // MUST escalate with 'repro harness broken' — NOT proceed to D2
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('ESCALATE'))
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('harness broken'))
+
+    // MUST NOT have reached D2 (no D2 steer)
+    expect(steerPrompts.length).toBe(1) // only D1 steer was sent
+  }, 20_000)
+
+  it('D1 gate: "failed to resolve import" output → ESCALATE repro harness broken', async () => {
+    const { pi, fire, steerPrompts } = makeMockPi()
+    const transparency = makeNullTransparency()
+
+    const boundedExec: BoundedExec = {
+      run: vi.fn().mockResolvedValue({
+        passed: false,
+        exitCode: 1,
+        output: 'failed to resolve import "../../src/missing-module" from tests/debug/repro.test.ts',
+        timedOut: false,
+        blocked: false,
+      }),
+    }
+
+    const reproArtifact = path.join(tmpDir, 'tests', 'debug', 'repro-auth.test.ts')
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency,
+      steerTimeoutMs: 5_000,
+      boundedExec,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    const steerDriver: SteerDriver = async (_idx, _prompt, dir) => {
+      await fs.mkdir(dir, { recursive: true })
+      const d1Data: D1Output = {
+        reproSummary: 'Repro test',
+        reproCommand: `npx vitest run ${reproArtifact}`,
+        reproArtifact,
+      }
+      await fs.mkdir(path.dirname(reproArtifact), { recursive: true })
+      await fs.writeFile(reproArtifact, '// repro')
+      await fs.writeFile(path.join(dir, 'd1-reproduce.json'), JSON.stringify(d1Data))
+    }
+
+    void fire('input', makeInputEvent('debug: tests fail in the auth module'), ctx)
+    await driveDebugSteers(pi, fire, ctx, steerPrompts, steerDriver, 2, 10_000, tmpDir)
+    await waitForLockRelease(tmpDir)
+
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('ESCALATE'))
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('harness broken'))
+    expect(steerPrompts.length).toBe(1) // D2 never reached
+  }, 20_000)
+})
+
+// ── MEDIUM: faithfulness skip is journalled ───────────────────────────────────
+
+describe('C-1 debug track: throwing judge → faithful:true + skip journalled', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'c1-faithskip-'))
+  })
+
+  afterEach(async () => {
+    await waitForLockRelease(tmpDir)
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('judge throws → faithful:true (fail-open) AND transparency.log records skip', async () => {
+    const { pi, fire, steerPrompts } = makeMockPi()
+    const transparency = makeNullTransparency()
+
+    // boundedExec: always RED (passes D1 gate, no harness error)
+    const boundedExec: BoundedExec = {
+      run: vi.fn().mockResolvedValue({
+        passed: false,
+        exitCode: 1,
+        output: 'AssertionError: expected true to be false',
+        timedOut: false,
+        blocked: false,
+      }),
+    }
+
+    // judge throws on isDone — simulates misconfigured judge
+    const judge: Judge = {
+      isDone: vi.fn().mockRejectedValue(new Error('judge service unavailable')),
+      isStillRight: vi.fn().mockResolvedValue({ aligned: true }),
+    }
+
+    const reproArtifact = path.join(tmpDir, 'tests', 'debug', 'repro-auth.test.ts')
+
+    // gitOps: changedFiles returns fix file only (so D3 anti-cheat passes once we reach it)
+    const gitOps = makeNullGitOps()
+    ;(gitOps.changedFiles as ReturnType<typeof vi.fn>).mockResolvedValue(['src/auth/validate.ts'])
+
+    let boundedExecCallCount = 0
+    ;(boundedExec.run as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      boundedExecCallCount++
+      // First 3 calls (D1 gate): RED; next 3 (D4 gate): GREEN
+      const isGreen = boundedExecCallCount > 3
+      return {
+        passed: isGreen,
+        exitCode: isGreen ? 0 : 1,
+        output: isGreen ? 'PASS' : 'AssertionError: expected true to be false',
+        timedOut: false,
+        blocked: false,
+      }
+    })
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps,
+      judge,
+      transparency,
+      steerTimeoutMs: 5_000,
+      boundedExec,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    const steerDriver: SteerDriver = async (idx, _prompt, dir) => {
+      await fs.mkdir(dir, { recursive: true })
+      if (idx === 0) {
+        const d1Data: D1Output = {
+          reproSummary: 'Repro that fails on auth token validation',
+          reproCommand: `npx vitest run ${reproArtifact}`,
+          reproArtifact,
+        }
+        await fs.mkdir(path.dirname(reproArtifact), { recursive: true })
+        await fs.writeFile(reproArtifact, '// repro test')
+        await fs.writeFile(path.join(dir, 'd1-reproduce.json'), JSON.stringify(d1Data))
+      } else if (idx === 1) {
+        const d2Data: D2Output = {
+          hypotheses: [
+            { claim: 'Regex wrong', evidenceFor: 'e1', evidenceAgainst: 'a1' },
+            { claim: 'TTL missing', evidenceFor: 'e2', evidenceAgainst: 'a2' },
+          ],
+          rootCause: 'Regex rejects valid chars',
+          rootCauseLocation: 'src/auth/validate.ts:23',
+        }
+        await fs.writeFile(path.join(dir, 'd2-root-cause.json'), JSON.stringify(d2Data))
+      } else if (idx === 2) {
+        const d3Data: D3Output = {
+          fixSummary: 'Updated regex',
+          filesChanged: ['src/auth/validate.ts'],
+        }
+        await fs.writeFile(path.join(dir, 'd3-fix.json'), JSON.stringify(d3Data))
+      }
+    }
+
+    void fire('input', makeInputEvent('debug: tests fail in the auth module'), ctx)
+    await driveDebugSteers(pi, fire, ctx, steerPrompts, steerDriver, 5, 15_000, tmpDir)
+    await waitForLockRelease(tmpDir)
+
+    // Lock released
+    const lockPath = path.join(tmpDir, '.autodev', 'running.lock')
+    expect(await fs.access(lockPath).then(() => true).catch(() => false)).toBe(false)
+
+    // Judge threw → fail-open (did not escalate on faithfulness)
+    expect(transparency.log).not.toHaveBeenCalledWith(expect.stringContaining('faithfulness check failed'))
+
+    // Skip MUST be journalled via transparency.log
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('faithfulness check skipped'))
+
+    // Run proceeded: ALL DONE (reached D5) because judge failure is fail-open
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('ALL DONE (debug track)'))
+  }, 30_000)
+})
+
+// ── MEDIUM: D4 harness-error → distinct escalate ──────────────────────────────
+
+describe('C-1 debug track: D4 harness-error during fix → escalate harness broken', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'c1-d4harness-'))
+  })
+
+  afterEach(async () => {
+    await waitForLockRelease(tmpDir)
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('D4 gate: fix breaks imports → ESCALATE harness broken during fix (not "did not converge")', async () => {
+    const { pi, fire, steerPrompts } = makeMockPi()
+    const transparency = makeNullTransparency()
+
+    let callCount = 0
+    const boundedExec: BoundedExec = {
+      run: vi.fn().mockImplementation(async () => {
+        callCount++
+        if (callCount <= 3) {
+          // D1 gate: RED (assertion failure) — repro confirmed red
+          return { passed: false, exitCode: 1, output: 'AssertionError: expected 1 to equal 2', timedOut: false, blocked: false }
+        }
+        // D4 gate: harness error — fix broke the imports
+        return {
+          passed: false,
+          exitCode: 1,
+          output: 'TS2304: Cannot find name "brokenExport"',
+          timedOut: false,
+          blocked: false,
+        }
+      }),
+    }
+
+    const reproArtifact = path.join(tmpDir, 'tests', 'debug', 'repro-auth.test.ts')
+    const gitOps = makeNullGitOps()
+    ;(gitOps.changedFiles as ReturnType<typeof vi.fn>).mockResolvedValue(['src/auth/validate.ts'])
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps,
+      judge: makeNullJudge(),
+      transparency,
+      steerTimeoutMs: 5_000,
+      boundedExec,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    let steerCallCount = 0
+    const steerDriver: SteerDriver = async (_idx, _prompt, dir) => {
+      steerCallCount++
+      await fs.mkdir(dir, { recursive: true })
+      if (steerCallCount === 1) {
+        const d1Data: D1Output = {
+          reproSummary: 'Repro',
+          reproCommand: `npx vitest run ${reproArtifact}`,
+          reproArtifact,
+        }
+        await fs.mkdir(path.dirname(reproArtifact), { recursive: true })
+        await fs.writeFile(reproArtifact, '// repro')
+        await fs.writeFile(path.join(dir, 'd1-reproduce.json'), JSON.stringify(d1Data))
+      } else if (steerCallCount === 2) {
+        const d2Data: D2Output = {
+          hypotheses: [
+            { claim: 'H1', evidenceFor: 'e1', evidenceAgainst: 'a1' },
+            { claim: 'H2', evidenceFor: 'e2', evidenceAgainst: 'a2' },
+          ],
+          rootCause: 'Root cause',
+          rootCauseLocation: 'src/x.ts:1',
+        }
+        await fs.writeFile(path.join(dir, 'd2-root-cause.json'), JSON.stringify(d2Data))
+      } else if (steerCallCount === 3) {
+        const d3Data: D3Output = {
+          fixSummary: 'Attempted fix',
+          filesChanged: ['src/auth/validate.ts'],
+        }
+        await fs.writeFile(path.join(dir, 'd3-fix.json'), JSON.stringify(d3Data))
+      }
+    }
+
+    void fire('input', makeInputEvent('debug: tests fail in the auth module'), ctx)
+    await driveDebugSteers(pi, fire, ctx, steerPrompts, steerDriver, 5, 15_000, tmpDir)
+    await waitForLockRelease(tmpDir)
+
+    const lockPath = path.join(tmpDir, '.autodev', 'running.lock')
+    expect(await fs.access(lockPath).then(() => true).catch(() => false)).toBe(false)
+
+    // MUST escalate with 'harness broken' — NOT 'did not converge'
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('ESCALATE'))
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('harness broken'))
+    expect(transparency.log).not.toHaveBeenCalledWith(expect.stringContaining('did not converge'))
+  }, 25_000)
+})
+
+// ── LOW: anti-cheat basename fix ──────────────────────────────────────────────
+
+describe('C-1 debug track: D3 anti-cheat — exact path match, not basename', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'c1-basename-'))
+  })
+
+  afterEach(async () => {
+    await waitForLockRelease(tmpDir)
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('D3 anti-cheat: same-basename file in different dir is NOT flagged as repro-modified', async () => {
+    const { pi, fire, steerPrompts } = makeMockPi()
+    const transparency = makeNullTransparency()
+
+    let boundedExecCallCount = 0
+    const boundedExec: BoundedExec = {
+      run: vi.fn().mockImplementation(async () => {
+        boundedExecCallCount++
+        const isGreen = boundedExecCallCount > 3
+        return {
+          passed: isGreen,
+          exitCode: isGreen ? 0 : 1,
+          output: isGreen ? 'PASS' : 'AssertionError: fail',
+          timedOut: false,
+          blocked: false,
+        }
+      }),
+    }
+
+    // reproArtifact is at tests/debug/repro-auth.test.ts
+    // changedFiles includes tests/unit/repro-auth.test.ts (same basename, different dir)
+    // The fix — dropping f.endsWith(reproName) — means this should NOT be flagged
+    const reproArtifact = path.join(tmpDir, 'tests', 'debug', 'repro-auth.test.ts')
+    const differentDirSameBasename = path.join(tmpDir, 'tests', 'unit', 'repro-auth.test.ts')
+
+    const gitOps = makeNullGitOps()
+    ;(gitOps.changedFiles as ReturnType<typeof vi.fn>).mockResolvedValue([
+      'src/auth/validate.ts',
+      differentDirSameBasename, // same basename as repro but different directory
+    ])
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps,
+      judge: makeNullJudge(),
+      transparency,
+      steerTimeoutMs: 5_000,
+      boundedExec,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    const steerDriver: SteerDriver = async (idx, _prompt, dir) => {
+      await fs.mkdir(dir, { recursive: true })
+      if (idx === 0) {
+        const d1Data: D1Output = {
+          reproSummary: 'Repro',
+          reproCommand: `npx vitest run ${reproArtifact}`,
+          reproArtifact,
+        }
+        await fs.mkdir(path.dirname(reproArtifact), { recursive: true })
+        await fs.writeFile(reproArtifact, '// repro')
+        await fs.writeFile(path.join(dir, 'd1-reproduce.json'), JSON.stringify(d1Data))
+      } else if (idx === 1) {
+        const d2Data: D2Output = {
+          hypotheses: [
+            { claim: 'H1', evidenceFor: 'e1', evidenceAgainst: 'a1' },
+            { claim: 'H2', evidenceFor: 'e2', evidenceAgainst: 'a2' },
+          ],
+          rootCause: 'Root cause',
+          rootCauseLocation: 'src/x.ts:1',
+        }
+        await fs.writeFile(path.join(dir, 'd2-root-cause.json'), JSON.stringify(d2Data))
+      } else if (idx === 2) {
+        const d3Data: D3Output = {
+          fixSummary: 'Fixed the issue',
+          filesChanged: ['src/auth/validate.ts'],
+        }
+        await fs.writeFile(path.join(dir, 'd3-fix.json'), JSON.stringify(d3Data))
+      }
+    }
+
+    void fire('input', makeInputEvent('debug: tests fail in the auth module'), ctx)
+    await driveDebugSteers(pi, fire, ctx, steerPrompts, steerDriver, 5, 15_000, tmpDir)
+    await waitForLockRelease(tmpDir)
+
+    const lockPath = path.join(tmpDir, '.autodev', 'running.lock')
+    expect(await fs.access(lockPath).then(() => true).catch(() => false)).toBe(false)
+
+    // MUST NOT have escalated on anti-cheat (same-basename in different dir is fine)
+    expect(transparency.log).not.toHaveBeenCalledWith(expect.stringContaining('repro was modified'))
+
+    // MUST have succeeded (D5 commit called)
+    expect(gitOps.scopedCommit).toHaveBeenCalled()
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('ALL DONE (debug track)'))
+  }, 30_000)
 })

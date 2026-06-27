@@ -79,6 +79,47 @@ describe('validateD1Output', () => {
   it('accepts reproArtifact with path separator', () => {
     expect(validateD1Output({ ...valid, reproArtifact: 'tests/repro' })).toBe(true)
   })
+
+  // MEDIUM: shell-metachar bypass fix
+  it('rejects reproCommand containing semicolon (shell metachar)', () => {
+    expect(validateD1Output({ ...valid, reproCommand: 'npx vitest run tests/repro.test.ts; node -e "evil"' })).toBe(false)
+  })
+
+  it('rejects reproCommand containing &&', () => {
+    expect(validateD1Output({ ...valid, reproCommand: 'npx vitest run tests/repro.test.ts && rm -rf /' })).toBe(false)
+  })
+
+  it('rejects reproCommand containing ||', () => {
+    expect(validateD1Output({ ...valid, reproCommand: 'npx vitest run tests/repro.test.ts || evil' })).toBe(false)
+  })
+
+  it('rejects reproCommand containing pipe |', () => {
+    expect(validateD1Output({ ...valid, reproCommand: 'npx vitest run tests/repro.test.ts | cat' })).toBe(false)
+  })
+
+  it('rejects reproCommand containing backtick', () => {
+    expect(validateD1Output({ ...valid, reproCommand: 'npx vitest run `echo evil`' })).toBe(false)
+  })
+
+  it('rejects reproCommand containing $( substitution', () => {
+    expect(validateD1Output({ ...valid, reproCommand: 'npx vitest run $(echo tests/repro.test.ts)' })).toBe(false)
+  })
+
+  it('rejects reproCommand containing output redirect >', () => {
+    expect(validateD1Output({ ...valid, reproCommand: 'npx vitest run tests/repro.test.ts > /tmp/out' })).toBe(false)
+  })
+
+  it('rejects reproCommand containing input redirect <', () => {
+    expect(validateD1Output({ ...valid, reproCommand: 'npx vitest run tests/repro.test.ts < input' })).toBe(false)
+  })
+
+  it('rejects reproCommand containing background & operator', () => {
+    expect(validateD1Output({ ...valid, reproCommand: 'npx vitest run tests/repro.test.ts &' })).toBe(false)
+  })
+
+  it('accepts clean reproCommand with no metacharacters', () => {
+    expect(validateD1Output({ ...valid, reproCommand: 'npx vitest run tests/debug/repro-auth.test.ts' })).toBe(true)
+  })
 })
 
 // ── D2 ────────────────────────────────────────────────────────────────────────
