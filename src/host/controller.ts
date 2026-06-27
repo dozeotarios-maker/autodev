@@ -742,8 +742,11 @@ export class Controller {
       // ── Run-start: default tier M (or forced tier from prefix override) ──────
       this.currentRunId = `run-${crypto.randomUUID()}`
       this._terminalStored = false // Fix #1: reset per-run so consecutive runs don't share state
-      // B3a: phaseByPhase already set from _onInput (parsed.phaseByPhase); reset adjust counters
-      // per-phase adjust counters are local vars in the phase blocks, no instance field needed
+      // B3a: phaseByPhase is NOT reset here — it is unconditionally reassigned from
+      // parsed.phaseByPhase in _onInput's lock-won block (line ~578) on every new input
+      // event, which is sufficient: each run always reflects the most-recent input's
+      // step: prefix state, with no risk of stale carry-over between consecutive runs.
+      // per-phase adjust counters are local vars in _runPhaseGate, no instance field needed
       const pi = this.pi as unknown as { setThinkingLevel?: (level: string) => void }
       if (this.currentForcedTier) {
         // B1: forced tier from quick:/mid:/full: prefix — use directly, skip rescore later
@@ -820,18 +823,7 @@ export class Controller {
 
       // B3a: phase-by-phase gate after P1 (forward edge; no-op when phaseByPhase=false)
       if (this.phaseByPhase) {
-        const g = await this._runPhaseGate('P1', ctx, async (note) => {
-          const r = new P1Discover(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
-          const res = await r.execute({
-            phase: 'P1', idea: this.currentIdea, sizing: this.currentSizing,
-            memoryStore: this.opts.memoryStore, embedder: this.opts.embedder,
-            screenContent: this.opts.securityLane ? (t, s) => this.opts.securityLane!.screenContent(t, s) : undefined,
-          })
-          if (!res.ok || !res.output) { await this._escalate('P1', res.reason ?? 'P1 re-run failed'); return false }
-          this.phaseStore.p1 = res.output
-          if (note) await this.journal.write({ type: 'decision', phase: 'P1', action: `adjust note: ${note.slice(0, 200)}` })
-          return true
-        })
+        const g = await this._runPhaseGate('P1', ctx, (note) => this._rerunP1(note))
         if (g === 'stop') { await this._operatorBrief('P1', 'phase-by-phase: human chose stop'); return }
         if (g === 'escalated') return
       }
@@ -858,14 +850,7 @@ export class Controller {
 
       // B3a: phase-by-phase gate after P2
       if (this.phaseByPhase) {
-        const g = await this._runPhaseGate('P2', ctx, async (note) => {
-          const r = new P2Elaborate(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
-          const res = await r.execute({ phase: 'P2', p1: this.phaseStore.p1!, sizing: this.currentSizing })
-          if (!res.ok || !res.output) { await this._escalate('P2', res.reason ?? 'P2 re-run failed'); return false }
-          this.phaseStore.p2 = res.output
-          if (note) await this.journal.write({ type: 'decision', phase: 'P2', action: `adjust note: ${note.slice(0, 200)}` })
-          return true
-        })
+        const g = await this._runPhaseGate('P2', ctx, (note) => this._rerunP2(note))
         if (g === 'stop') { await this._operatorBrief('P2', 'phase-by-phase: human chose stop'); return }
         if (g === 'escalated') return
       }
@@ -904,19 +889,7 @@ export class Controller {
 
       // B3a: phase-by-phase gate after P3
       if (this.phaseByPhase) {
-        const g = await this._runPhaseGate('P3', ctx, async (note) => {
-          const r = new P3Plan(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
-          const res = await r.execute({ phase: 'P3', p1: this.phaseStore.p1!, p2: this.phaseStore.p2!, sizing: this.currentSizing })
-          if (!res.ok || !res.output) {
-            const f = res as { ok: false; reason?: string; operatorBrief?: unknown }
-            const brief = f.operatorBrief ? JSON.stringify(f.operatorBrief, null, 2) : undefined
-            if (brief) { await this._operatorBrief('P3', brief) } else { await this._escalate('P3', f.reason ?? 'P3 re-run failed') }
-            return false
-          }
-          this.phaseStore.p3 = res.output
-          if (note) await this.journal.write({ type: 'decision', phase: 'P3', action: `adjust note: ${note.slice(0, 200)}` })
-          return true
-        })
+        const g = await this._runPhaseGate('P3', ctx, (note) => this._rerunP3(note))
         if (g === 'stop') { await this._operatorBrief('P3', 'phase-by-phase: human chose stop'); return }
         if (g === 'escalated') return
       }
@@ -943,14 +916,7 @@ export class Controller {
 
       // B3a: phase-by-phase gate after P4
       if (this.phaseByPhase) {
-        const g = await this._runPhaseGate('P4', ctx, async (note) => {
-          const r = new P4Build(this.hostAgent, this.outputDir, this.subagentDriver, this.opts.steerTimeoutMs)
-          const res = await r.execute({ phase: 'P4', p3: this.phaseStore.p3!, sizing: this.currentSizing, repoRoot: this.repoRoot })
-          if (!res.ok || !res.output) { await this._escalate('P4', res.reason ?? 'P4 re-run failed'); return false }
-          this.phaseStore.p4 = res.output
-          if (note) await this.journal.write({ type: 'decision', phase: 'P4', action: `adjust note: ${note.slice(0, 200)}` })
-          return true
-        })
+        const g = await this._runPhaseGate('P4', ctx, (note) => this._rerunP4(note))
         if (g === 'stop') { await this._operatorBrief('P4', 'phase-by-phase: human chose stop'); return }
         if (g === 'escalated') return
       }
@@ -1019,14 +985,7 @@ export class Controller {
 
       // B3a: phase-by-phase gate after P5 (forward path only; H9 backedge branch above has no gate)
       if (this.phaseByPhase) {
-        const g = await this._runPhaseGate('P5', ctx, async (note) => {
-          const r = new P5Verify(this.hostAgent, this.outputDir, this.opts.verifier, this.opts.judge, this.repoRoot, this.opts.steerTimeoutMs)
-          const res = await r.execute({ phase: 'P5', p3: this.phaseStore.p3!, p4: this.phaseStore.p4!, sizing: this.currentSizing, repoRoot: this.repoRoot })
-          if (!res.ok || !res.output) { await this._escalate('P5', res.reason ?? 'P5 re-run failed'); return false }
-          this.phaseStore.p5 = res.output
-          if (note) await this.journal.write({ type: 'decision', phase: 'P5', action: `adjust note: ${note.slice(0, 200)}` })
-          return true
-        })
+        const g = await this._runPhaseGate('P5', ctx, (note) => this._rerunP5(note))
         if (g === 'stop') { await this._operatorBrief('P5', 'phase-by-phase: human chose stop'); return }
         if (g === 'escalated') return
       }
@@ -1741,6 +1700,65 @@ export class Controller {
     return { files, novelty, blastRadius, irreversibility }
   }
 
+  // ── B3a: per-phase rerun helpers ─────────────────────────────────────────────
+  // One method per phase so the gate closure and the primary phase path share a
+  // single construction site. Called exclusively from _runPhaseGate rerunPhase
+  // callbacks. Returns true on success, false when escalation already fired.
+
+  private async _rerunP1(note: string | undefined): Promise<boolean> {
+    const r = new P1Discover(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
+    const res = await r.execute({
+      phase: 'P1', idea: this.currentIdea, sizing: this.currentSizing,
+      memoryStore: this.opts.memoryStore, embedder: this.opts.embedder,
+      screenContent: this.opts.securityLane ? (t, s) => this.opts.securityLane!.screenContent(t, s) : undefined,
+    })
+    if (!res.ok || !res.output) { await this._escalate('P1', res.reason ?? 'P1 re-run failed'); return false }
+    this.phaseStore.p1 = res.output
+    if (note) await this.journal.write({ type: 'decision', phase: 'P1', action: `adjust note: ${note.slice(0, 200)}` })
+    return true
+  }
+
+  private async _rerunP2(note: string | undefined): Promise<boolean> {
+    const r = new P2Elaborate(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
+    const res = await r.execute({ phase: 'P2', p1: this.phaseStore.p1!, sizing: this.currentSizing })
+    if (!res.ok || !res.output) { await this._escalate('P2', res.reason ?? 'P2 re-run failed'); return false }
+    this.phaseStore.p2 = res.output
+    if (note) await this.journal.write({ type: 'decision', phase: 'P2', action: `adjust note: ${note.slice(0, 200)}` })
+    return true
+  }
+
+  private async _rerunP3(note: string | undefined): Promise<boolean> {
+    const r = new P3Plan(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
+    const res = await r.execute({ phase: 'P3', p1: this.phaseStore.p1!, p2: this.phaseStore.p2!, sizing: this.currentSizing })
+    if (!res.ok || !res.output) {
+      const f = res as { ok: false; reason?: string; operatorBrief?: unknown }
+      const brief = f.operatorBrief ? JSON.stringify(f.operatorBrief, null, 2) : undefined
+      if (brief) { await this._operatorBrief('P3', brief) } else { await this._escalate('P3', f.reason ?? 'P3 re-run failed') }
+      return false
+    }
+    this.phaseStore.p3 = res.output
+    if (note) await this.journal.write({ type: 'decision', phase: 'P3', action: `adjust note: ${note.slice(0, 200)}` })
+    return true
+  }
+
+  private async _rerunP4(note: string | undefined): Promise<boolean> {
+    const r = new P4Build(this.hostAgent, this.outputDir, this.subagentDriver, this.opts.steerTimeoutMs)
+    const res = await r.execute({ phase: 'P4', p3: this.phaseStore.p3!, sizing: this.currentSizing, repoRoot: this.repoRoot })
+    if (!res.ok || !res.output) { await this._escalate('P4', res.reason ?? 'P4 re-run failed'); return false }
+    this.phaseStore.p4 = res.output
+    if (note) await this.journal.write({ type: 'decision', phase: 'P4', action: `adjust note: ${note.slice(0, 200)}` })
+    return true
+  }
+
+  private async _rerunP5(note: string | undefined): Promise<boolean> {
+    const r = new P5Verify(this.hostAgent, this.outputDir, this.opts.verifier, this.opts.judge, this.repoRoot, this.opts.steerTimeoutMs)
+    const res = await r.execute({ phase: 'P5', p3: this.phaseStore.p3!, p4: this.phaseStore.p4!, sizing: this.currentSizing, repoRoot: this.repoRoot })
+    if (!res.ok || !res.output) { await this._escalate('P5', res.reason ?? 'P5 re-run failed'); return false }
+    this.phaseStore.p5 = res.output
+    if (note) await this.journal.write({ type: 'decision', phase: 'P5', action: `adjust note: ${note.slice(0, 200)}` })
+    return true
+  }
+
   // ── B3a: phase gate ───────────────────────────────────────────────────────────
 
   /**
@@ -1806,11 +1824,14 @@ export class Controller {
         ? await uiAny.input('What to adjust?', '')
         : undefined
 
-      // Backedge FSM to phase, re-run it, then advance back
-      await this.fsm.backedge(phaseName as Parameters<FSM['backedge']>[0])
+      // Re-run the phase in-place. The FSM is already at the NEXT phase (advanced
+      // in _runPhases before calling _runPhaseGate) and must stay there — do NOT
+      // call fsm.backedge or fsm.advance here. Those calls would desync the FSM,
+      // produce phantom "FSM → Pn" journal entries, and (for P3 gate) illegitimately
+      // increment backedgeCount (polluting H9 accounting). rerunPhase re-executes the
+      // phase object directly and stores fresh output into phaseStore; it is FSM-independent.
       const ok = await rerunPhase(note)
       if (!ok) return 'escalated'
-      await this.fsm.advance()
 
       decision = await this._phaseGate(phaseName, ctx)
     }

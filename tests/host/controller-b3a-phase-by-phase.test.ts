@@ -653,13 +653,12 @@ describe('B3a Task3: adjust → re-runs phase, capped at 3 then continues', () =
       }))
     })
 
-    let selectCallCount = 0
-    // Return 'adjust' 4 times — cap is 3, so 4th adjust is force-continued without calling select a 4th time
-    const selectMock = vi.fn(async () => {
-      selectCallCount++
-      if (selectCallCount <= 4) return 'adjust'
-      return 'continue'
-    })
+    // Return 'adjust' on every call. The cap is 3 re-runs:
+    // _runPhaseGate calls _phaseGate once upfront, then loops while 'adjust':
+    //   iter1 (adjustCount=0→1): re-run, call #2; iter2 (adjustCount=1→2): re-run, call #3;
+    //   iter3 (adjustCount=2→3): re-run, call #4; iter4 (adjustCount=3 >= MAX_ADJUST=3): journal+break.
+    // So select is called exactly 4 times; P1 re-runs exactly 3 times (steerCount = 1+3 = 4).
+    const selectMock = vi.fn(async () => 'adjust')
 
     const ctrl = new Controller(pi, {
       repoRoot: tmpDir,
@@ -704,8 +703,18 @@ describe('B3a Task3: adjust → re-runs phase, capped at 3 then continues', () =
     driverRunning.stop = true
     await driverDone
 
-    // P1 must have run more than once (initial + at least 1 re-run due to adjust)
-    expect(steerCount).toBeGreaterThanOrEqual(2)
+    // P1 ran exactly 4 times (1 initial + 3 re-runs). After cap the run continues
+    // to P2+ phases (each with up to 3 steer retries via PhaseExecutor) before
+    // steerTimeout kills them and the run escalates. Total steers >= 4.
+    expect(steerCount).toBeGreaterThanOrEqual(4)
+
+    // select called exactly 4 times (1 upfront + 3 in loop, cap fires on 4th iteration without a 4th re-run)
+    expect(selectMock).toHaveBeenCalledTimes(4)
+
+    // Lock must be released (run terminates cleanly after cap hit)
+    const lockPath = path.join(tmpDir, '.autodev', 'running.lock')
+    const locked = await fs.access(lockPath).then(() => true).catch(() => false)
+    expect(locked).toBe(false)
 
     // Journal must record "adjust limit reached" (hit after 3 adjusts)
     const journalPath = path.join(tmpDir, '.autodev', 'journal.jsonl')
@@ -713,6 +722,21 @@ describe('B3a Task3: adjust → re-runs phase, capped at 3 then continues', () =
     expect(journalExists).toBe(true)
     const journalText = await fs.readFile(journalPath, 'utf-8')
     expect(journalText).toContain('adjust limit')
+
+    // No phantom forward FSM transition emitted from the adjust gate path.
+    // The CRITICAL bug (fsm.backedge + fsm.advance inside _runPhaseGate) would produce a
+    // spurious "FSM → Pn" journal entry for each re-run (via the FSM onJournal callback).
+    // After the P1 gate (FSM already at P2), each buggy adjust loop iteration calls
+    // fsm.advance() → P2→P3 advance → "FSM → P3" entry. With 3 re-runs that's 3 spurious entries.
+    // After fix: zero extra FSM transitions from gate path. Only the one legitimate advance
+    // (P1→P2, before the gate) appears — so total FSM entries = 1.
+    const journalLines = journalText.split('\n').filter(Boolean)
+    const fsmTransitionLines = journalLines.filter(line => {
+      try { return (JSON.parse(line) as { action?: string }).action?.startsWith('FSM →') } catch { return false }
+    })
+    // Bug present: 1 (legitimate P1→P2) + 3 (spurious P2→P3 from advance in adjust loop) = 4 entries.
+    // Bug fixed: exactly 1 (the legitimate P1→P2 advance only).
+    expect(fsmTransitionLines).toHaveLength(1)
   }, 35_000)
 })
 
