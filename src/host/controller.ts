@@ -1196,7 +1196,6 @@ export class Controller {
       // ── P4 BUILD (XS sizing, laneCap 1) ──────────────────────────────────
       if (await this._isPaused()) { await this._waitResume() }
 
-      const { P4Build } = await import('../phases/p4-build.js')
       const p4 = new P4Build(this.hostAgent, this.outputDir, this.subagentDriver, this.opts.steerTimeoutMs)
       const p4Result = await p4.execute({
         phase: 'P4',
@@ -1219,7 +1218,6 @@ export class Controller {
       // ── P5 VERIFY (XS sizing, reviewRounds 1) ─────────────────────────────
       if (await this._isPaused()) { await this._waitResume() }
 
-      const { P5Verify } = await import('../phases/p5-verify.js')
       const p5 = new P5Verify(
         this.hostAgent, this.outputDir, this.opts.verifier,
         this.opts.judge, this.repoRoot, this.opts.steerTimeoutMs
@@ -1246,7 +1244,6 @@ export class Controller {
       // ── P6 RELEASE ────────────────────────────────────────────────────────
       if (await this._isPaused()) { await this._waitResume() }
 
-      const { P6Release } = await import('../phases/p6-release.js')
       const p6 = new P6Release(this.hostAgent, this.outputDir, this.opts.gitOps, undefined, this.opts.steerTimeoutMs)
       const p6Result = await p6.execute({
         phase: 'P6',
@@ -1319,7 +1316,6 @@ export class Controller {
 
       this.opts.transparency.setHudStatus('P1', this.currentIdea.slice(0, 60), 'running', 'opus')
 
-      const { P1Discover } = await import('../phases/p1-discover.js')
       const p1 = new P1Discover(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
       const p1Result = await p1.execute({
         phase: 'P1',
@@ -1387,7 +1383,6 @@ export class Controller {
       // ── P3 PLAN ──────────────────────────────────────────────────────────
       if (await this._isPaused()) { await this._waitResume() }
 
-      const { P3Plan } = await import('../phases/p3-plan.js')
       const p3 = new P3Plan(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
       const p3Result = await p3.execute({
         phase: 'P3',
@@ -1417,9 +1412,8 @@ export class Controller {
       // ── P4 BUILD ─────────────────────────────────────────────────────────
       if (await this._isPaused()) { await this._waitResume() }
 
-      const { P4Build } = await import('../phases/p4-build.js')
-      const p4 = new P4Build(this.hostAgent, this.outputDir, this.subagentDriver, this.opts.steerTimeoutMs)
-      const p4Result = await p4.execute({
+      const p4m = new P4Build(this.hostAgent, this.outputDir, this.subagentDriver, this.opts.steerTimeoutMs)
+      const p4Result = await p4m.execute({
         phase: 'P4',
         p3: this.phaseStore.p3!,
         sizing: this.currentSizing,
@@ -1440,12 +1434,11 @@ export class Controller {
       // ── P5 VERIFY ────────────────────────────────────────────────────────
       if (await this._isPaused()) { await this._waitResume() }
 
-      const { P5Verify } = await import('../phases/p5-verify.js')
-      const p5 = new P5Verify(
+      const p5m = new P5Verify(
         this.hostAgent, this.outputDir, this.opts.verifier,
         this.opts.judge, this.repoRoot, this.opts.steerTimeoutMs
       )
-      const p5Result = await p5.execute({
+      const p5Result = await p5m.execute({
         phase: 'P5',
         p3: this.phaseStore.p3!,
         p4: this.phaseStore.p4!,
@@ -1467,22 +1460,21 @@ export class Controller {
       // ── P6 RELEASE ───────────────────────────────────────────────────────
       if (await this._isPaused()) { await this._waitResume() }
 
-      const { P6Release } = await import('../phases/p6-release.js')
-      const p6 = new P6Release(this.hostAgent, this.outputDir, this.opts.gitOps, undefined, this.opts.steerTimeoutMs)
-      const p6Result = await p6.execute({
+      const p6m = new P6Release(this.hostAgent, this.outputDir, this.opts.gitOps, undefined, this.opts.steerTimeoutMs)
+      const p6mResult = await p6m.execute({
         phase: 'P6',
         p5: this.phaseStore.p5!,
         sizing: this.currentSizing,
         repoRoot: this.repoRoot,
       })
-      if (!p6Result.ok || !p6Result.output) {
-        await this._escalate('P6', p6Result.reason ?? 'P6 failed')
+      if (!p6mResult.ok || !p6mResult.output) {
+        await this._escalate('P6', p6mResult.reason ?? 'P6 failed')
         return
       }
-      await this.journal.write({ type: 'completion', phase: 'P6', action: `P6 release (middle gear): ${p6Result.output.commitSha}` })
+      await this.journal.write({ type: 'completion', phase: 'P6', action: `P6 release (middle gear): ${p6mResult.output.commitSha}` })
 
       // Retro: success
-      const successLesson = `[middle] ${this.currentIdea.slice(0, 120)} → ${p6Result.output.commitSha}`
+      const successLesson = `[middle] ${this.currentIdea.slice(0, 120)} → ${p6mResult.output.commitSha}`
       await this.opts.retroWriter?.write({
         runId: this.currentRunId, lesson: successLesson, bugPattern: 'none', convention: this.currentTier,
       })
@@ -1493,8 +1485,8 @@ export class Controller {
 
       await this.lifecycle.release()
       this._restoreCwd()
-      this.opts.transparency.setHudStatus('DONE', p6Result.output.commitSha, 'done', 'none')
-      await this.opts.transparency.log(`ALL DONE (middle gear): commit=${p6Result.output.commitSha}`)
+      this.opts.transparency.setHudStatus('DONE', p6mResult.output.commitSha, 'done', 'none')
+      await this.opts.transparency.log(`ALL DONE (middle gear): commit=${p6mResult.output.commitSha}`)
 
     } catch (err) {
       await this._escalate('MIDDLE', `Unexpected error: ${String(err)}`)
