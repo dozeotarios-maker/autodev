@@ -42,7 +42,7 @@ import { P4Build } from '../phases/p4-build.js'
 import { P5Verify } from '../phases/p5-verify.js'
 import { P6Release } from '../phases/p6-release.js'
 import type { P1Output, P2Output, P3Output, P4Output, P5Output } from '../phases/phase-output.js'
-import { scoreComplexity, tierSizing, DEFAULT_SIZING } from '../engine/complexity.js'
+import { scoreComplexity, tierSizing, DEFAULT_SIZING, isValidComplexityInput } from '../engine/complexity.js'
 import type { Sizing, ComplexityInput, ComplexityTier } from '../engine/complexity.js'
 import type { RetroWriter } from '../engine/retro.js'
 import { resolveProjectDir } from '../project/resolver.js'
@@ -666,8 +666,19 @@ export class Controller {
       }
       this.phaseStore.p1 = p1Result.output
 
-      // ── Post-P1 rescore: update tier+sizing from the spec text ────────────
-      const rescoreInput = this._rescoreFromSpec(this.phaseStore.p1.spec)
+      // ── Post-P1 rescore: prefer p1.complexity (B1); fall back to keyword heuristic ──
+      const assessed = this.phaseStore.p1.complexity
+      const usingAssessment = assessed !== undefined && isValidComplexityInput(assessed)
+      const rescoreInput: ComplexityInput = usingAssessment
+        ? assessed
+        : this._rescoreFromSpec(this.phaseStore.p1.spec)
+      await this.journal.write({
+        type: 'decision',
+        phase: 'P1',
+        action: usingAssessment
+          ? 'tier rescore via p1.complexity (host self-assessment)'
+          : 'tier rescore via keyword heuristic (no p1.complexity)',
+      })
       const rescoreResult = scoreComplexity(rescoreInput)
       const newSizing = tierSizing(rescoreResult.tier)
       if (rescoreResult.tier !== this.currentTier) {

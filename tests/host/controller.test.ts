@@ -2169,3 +2169,135 @@ describe('A1: shouldCompact — skips low-usage, runs high-usage', () => {
     expect(COMPACT_TIMEOUT_MS).toBeGreaterThan(0)
   })
 })
+
+// ── B1 Task 4: post-P1 rescore uses p1.complexity when valid ─────────────────
+
+describe('B1 Task4: post-P1 rescore — p1.complexity vs keyword fallback', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'b1t4-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  /** Helper: run through P1, write a p1 output file, fire agent_end, poll journal for a string. */
+  async function runP1AndPollJournal(
+    pi: ReturnType<typeof makeMockPi>['pi'],
+    fire: ReturnType<typeof makeMockPi>['fire'],
+    p1Output: Record<string, unknown>,
+    waitForJournalText: string,
+    timeoutMs = 4_000,
+  ): Promise<string> {
+    const outputDir = path.join(tmpDir, '.autodev', 'phase-output')
+    await fs.mkdir(outputDir, { recursive: true })
+    await fs.writeFile(path.join(outputDir, 'p1-spec.json'), JSON.stringify(p1Output))
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+    void fire('input', makeInputEvent('add a single utility function to config'), ctx)
+
+    // Wait for P1 steer to be in-flight
+    await new Promise<void>((resolve) => {
+      const check = () => {
+        const calls = (pi.sendUserMessage as ReturnType<typeof vi.fn>).mock.calls
+        if (calls.length >= 1) resolve()
+        else setTimeout(check, 10)
+      }
+      check()
+    })
+
+    fire('agent_end', makeAgentEndEvent('P1 output written'), ctx)
+
+    const journalPath = path.join(tmpDir, '.autodev', 'journal.jsonl')
+    await new Promise<void>((resolve, reject) => {
+      const deadline = Date.now() + timeoutMs
+      const check = async () => {
+        if (Date.now() > deadline) { reject(new Error(`journal did not contain "${waitForJournalText}" within ${timeoutMs}ms`)); return }
+        const exists = await fs.access(journalPath).then(() => true).catch(() => false)
+        if (exists) {
+          const content = await fs.readFile(journalPath, 'utf-8')
+          if (content.includes(waitForJournalText)) { resolve(); return }
+        }
+        setTimeout(check, 20)
+      }
+      void check()
+    })
+
+    return fs.readFile(journalPath, 'utf-8')
+  }
+
+  it('trivial p1.complexity (XS) rescores to XS — journal records "via p1.complexity"', async () => {
+    const { pi, fire } = makeMockPi()
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency: makeNullTransparency(),
+      steerTimeoutMs: 500,
+    })
+    ctrl.wire()
+
+    const journal = await runP1AndPollJournal(pi, fire, {
+      phase: 'P1',
+      spec: 'Add a single utility function to the configuration module',
+      stackAdr: 'TypeScript, existing codebase',
+      webResearch: [],
+      complexity: { files: 1, novelty: 'low', blastRadius: 1, irreversibility: 'low', rationale: 'trivial' },
+    }, 'p1.complexity')
+
+    expect(journal).toContain('p1.complexity')
+    // Tier must have changed to XS (from default M)
+    expect(journal).toContain('XS')
+  }, 10_000)
+
+  it('absent p1.complexity falls back to keyword heuristic — journal records "keyword heuristic"', async () => {
+    const { pi, fire } = makeMockPi()
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency: makeNullTransparency(),
+      steerTimeoutMs: 500,
+    })
+    ctrl.wire()
+
+    const journal = await runP1AndPollJournal(pi, fire, {
+      phase: 'P1',
+      spec: 'Add a single config constant value to src/config.ts',
+      stackAdr: 'TypeScript',
+      webResearch: [],
+      // no complexity field
+    }, 'keyword heuristic')
+
+    expect(journal).toContain('keyword heuristic')
+  }, 10_000)
+
+  it('malformed p1.complexity falls back to keyword heuristic — journal records "keyword heuristic"', async () => {
+    const { pi, fire } = makeMockPi()
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency: makeNullTransparency(),
+      steerTimeoutMs: 500,
+    })
+    ctrl.wire()
+
+    // validateP1Output drops malformed complexity → p1.complexity undefined → fallback
+    const journal = await runP1AndPollJournal(pi, fire, {
+      phase: 'P1',
+      spec: 'Add a single config constant value to src/config.ts',
+      stackAdr: 'TypeScript',
+      webResearch: [],
+      complexity: { files: 0, novelty: 'huge', blastRadius: 99, irreversibility: 'nope' },
+    }, 'keyword heuristic')
+
+    expect(journal).toContain('keyword heuristic')
+  }, 10_000)
+})
