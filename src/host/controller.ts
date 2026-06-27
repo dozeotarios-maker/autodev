@@ -42,8 +42,9 @@ import { P4Build } from '../phases/p4-build.js'
 import { P5Verify } from '../phases/p5-verify.js'
 import { P6Release } from '../phases/p6-release.js'
 import type { P1Output, P2Output, P3Output, P4Output, P5Output } from '../phases/phase-output.js'
-import { scoreComplexity, tierSizing, DEFAULT_SIZING, isValidComplexityInput, tierFromOverride } from '../engine/complexity.js'
-import type { Sizing, ComplexityInput, ComplexityTier } from '../engine/complexity.js'
+import { validateP1Output, validateP3Output } from '../phases/phase-output.js'
+import { scoreComplexity, tierSizing, DEFAULT_SIZING, isValidComplexityInput, tierFromOverride, gearFromForced } from '../engine/complexity.js'
+import type { Sizing, ComplexityInput, ComplexityTier, Gear } from '../engine/complexity.js'
 import type { RetroWriter } from '../engine/retro.js'
 import { resolveProjectDir } from '../project/resolver.js'
 import type { ProjectRegistry } from '../project/registry.js'
@@ -249,6 +250,8 @@ export class Controller {
   private currentForcedTier: ComplexityTier | undefined
   /** B1: task type from prefix (build/debug/refactor). Default 'build'. */
   private currentTaskType = 'build' // B2-consumed: Stage B2 routing reads this; do not remove as "unused".
+  /** B2: gear derived from forced tier (quick/middle/full). Undefined = no prefix → full path. */
+  private currentGear: Gear | undefined
   private currentRunId = ''
   /** Fix #1: set true after the first terminal store so _escalate cannot double-store. */
   private _terminalStored = false
@@ -341,6 +344,7 @@ export class Controller {
           uptime: `${uptime}s`,
           repoRoot: this.repoRoot,
           activeProject: activeProject ?? '(none)',
+          gear: this.currentGear ?? 'full',
         }
         ctx.ui.notify(JSON.stringify(status, null, 2), 'info')
       },
@@ -556,18 +560,39 @@ export class Controller {
     this.currentIdea = idea
     this.currentForcedTier = parsed.forcedTier
     this.currentTaskType = parsed.taskType
+    // B2: derive gear from forced tier (undefined when no prefix → full path auto)
+    this.currentGear = gearFromForced(parsed.forcedTier)
     void this.journal.write({
       type: 'decision',
       phase: 'P1',
-      action: `overrides parsed: forcedTier=${parsed.forcedTier ?? 'none'} taskType=${parsed.taskType}`,
+      action: `overrides parsed: forcedTier=${parsed.forcedTier ?? 'none'} taskType=${parsed.taskType} gear: ${this.currentGear ?? 'full'} task-type: ${parsed.taskType}`,
     })
 
     // Re-root repoRoot to the resolved project dir (async, before _runPhases).
     // _resolveRepoRoot is a no-op when no registry is injected (preserves current behavior).
     await this._resolveRepoRoot(idea)
 
-    // Start P1 asynchronously within the extension event loop
-    void this._runPhases(ctx)
+    // B2: Task-type router — debug/refactor escalate with stub, no phase started.
+    if (this.currentTaskType === 'debug') {
+      void this._escalate('ROUTER', 'debug track not yet implemented — coming in Stage C (D1–D5). Re-run without debug: to use the build pipeline.')
+      return
+    }
+    if (this.currentTaskType === 'refactor') {
+      void this._escalate('ROUTER', 'refactor track not yet implemented. Re-run without refactor: to use the build pipeline.')
+      return
+    }
+
+    // B2: Gear dispatch — quick/middle gear methods fire ONLY on explicit prefix.
+    // No-prefix (currentGear===undefined) always runs the full _runPhases (unchanged).
+    // Auto-downshift is out of scope for B2.
+    if (this.currentGear === 'quick') {
+      void this._runPhasesQuick(ctx)
+    } else if (this.currentGear === 'middle') {
+      void this._runPhasesMiddle(ctx)
+    } else {
+      // full gear (explicit full: prefix) OR no prefix (undefined) → unchanged full path
+      void this._runPhases(ctx)
+    }
   }
 
   private _onToolCall(e: ToolCallEvent): ToolCallEventResult {
@@ -1062,6 +1087,417 @@ export class Controller {
         phase: this.fsm.getPhase(),
         action: `_restoreCwd: chdir back to ${target} failed (${String(e)}), continuing`,
       })
+    }
+  }
+
+  // ── B2: Quick gear — seed→P4→P5→P6 ──────────────────────────────────────────
+
+  /**
+   * Quick gear phase path: skips P1/P2/P3 ceremony.
+   * Issues one seed steer to produce minimal P1Output + P3Output, then runs P4→P5→P6.
+   * Full lifecycle bookends: pause-check at entry, compactAsync between steps,
+   * _escalate on failure, retro + lifecycle.release() + _restoreCwd on success.
+   * Lock is released on BOTH success and failure paths.
+   */
+  private async _runPhasesQuick(ctx: ExtensionContext): Promise<void> {
+    try {
+      this.currentRunId = `run-${crypto.randomUUID()}`
+      this._terminalStored = false
+      // Quick gear always uses XS sizing (forced by quick: prefix → XS tier)
+      this.currentTier = 'XS'
+      this.currentSizing = tierSizing('XS')
+      const pi = this.pi as unknown as { setThinkingLevel?: (level: string) => void }
+      pi.setThinkingLevel?.(this.currentSizing.thinkingLevel)
+
+      await this.journal.write({
+        type: 'decision', phase: 'QUICK', action: `gear: quick task-type: ${this.currentTaskType} — starting seed steer`,
+      })
+
+      // ── Pause check at entry ──────────────────────────────────────────────
+      if (await this._isPaused()) { await this._waitResume() }
+
+      // ── Seed steer: produce minimal P1Output + P3Output ───────────────────
+      const outputDir = this.outputDir
+      await fs.mkdir(outputDir, { recursive: true })
+      const p1File = path.join(outputDir, 'p1-spec.json')
+      const p3File = path.join(outputDir, 'p3-plan.json')
+
+      const seedInstruction = [
+        '## Role: Quick-Gear Seed Agent',
+        `You are the **quick gear** seed phase for pi-autodev. The idea is: "${this.currentIdea}"`,
+        '',
+        'Produce a MINIMAL build plan for this small task. Write TWO JSON files:',
+        '',
+        `**File 1 — \`${p1File}\`** (P1Output):`,
+        '```json',
+        '{"phase":"P1","spec":"<one paragraph spec>","stackAdr":"(quick gear — no ADR)","webResearch":[]}',
+        '```',
+        '',
+        `**File 2 — \`${p3File}\`** (P3Output):`,
+        '```json',
+        '{"phase":"P3","fileDAG":[{"file":"<path>","lane":0,"deps":[]}],"panelObjCount":0,"sprintContract":{"goal":"<goal>","successCriteria":["<criterion>"],"outOfScope":[]},"examplesTable":[{"scenario":"<name>","input":"<input>","expectedOutput":"<output>"}]}',
+        '```',
+        '',
+        'Rules: No web research. No alternatives. No personas. Write ONLY these two files. Keep it minimal.',
+      ].join('\n')
+
+      this.opts.transparency.setHudStatus('QUICK-SEED', this.currentIdea.slice(0, 60), 'running', 'opus')
+
+      // Steer the host to write both files
+      const hostAgent = this.hostAgent
+      let seedSteerResult
+      try {
+        seedSteerResult = await hostAgent.steer(seedInstruction, {
+          expectFile: p1File,
+          ...(this.opts.steerTimeoutMs !== undefined ? { timeoutMs: this.opts.steerTimeoutMs } : {}),
+        })
+      } catch (err) {
+        await this._escalate('QUICK-SEED', `Seed steer failed: ${String(err)}`)
+        return
+      }
+      void seedSteerResult
+
+      // Read + validate P1Output
+      let p1Raw: unknown
+      try {
+        p1Raw = JSON.parse(await fs.readFile(p1File, 'utf-8'))
+      } catch (err) {
+        await this._escalate('QUICK-SEED', `Seed P1 file read failed: ${String(err)}`)
+        return
+      }
+      if (!validateP1Output(p1Raw)) {
+        await this._escalate('QUICK-SEED', 'Seed P1Output failed schema validation')
+        return
+      }
+      this.phaseStore.p1 = p1Raw
+
+      // Read + validate P3Output
+      let p3Raw: unknown
+      try {
+        p3Raw = JSON.parse(await fs.readFile(p3File, 'utf-8'))
+      } catch (err) {
+        await this._escalate('QUICK-SEED', `Seed P3 file read failed: ${String(err)}`)
+        return
+      }
+      if (!validateP3Output(p3Raw)) {
+        await this._escalate('QUICK-SEED', 'Seed P3Output failed schema validation')
+        return
+      }
+      this.phaseStore.p3 = p3Raw
+
+      await this.journal.write({ type: 'completion', phase: 'QUICK-SEED', action: 'seed complete' })
+
+      // ── Compact between seed and P4 ───────────────────────────────────────
+      await compactAsync(ctx, COMPACT_TIMEOUT_MS, () => {
+        void this.journal.write({ type: 'decision', phase: 'QUICK-SEED', action: 'compaction skipped: 45s timeout' })
+      })
+      this.opts.transparency.setHudStatus('P4', this.currentIdea.slice(0, 60), 'running', 'opus')
+
+      // ── P4 BUILD (XS sizing, laneCap 1) ──────────────────────────────────
+      if (await this._isPaused()) { await this._waitResume() }
+
+      const { P4Build } = await import('../phases/p4-build.js')
+      const p4 = new P4Build(this.hostAgent, this.outputDir, this.subagentDriver, this.opts.steerTimeoutMs)
+      const p4Result = await p4.execute({
+        phase: 'P4',
+        p3: this.phaseStore.p3!,
+        sizing: this.currentSizing,
+        repoRoot: this.repoRoot,
+      })
+      if (!p4Result.ok || !p4Result.output) {
+        await this._escalate('P4', p4Result.reason ?? 'P4 failed')
+        return
+      }
+      this.phaseStore.p4 = p4Result.output
+      await this.journal.write({ type: 'completion', phase: 'P4', action: 'P4 complete (quick gear)' })
+
+      await compactAsync(ctx, COMPACT_TIMEOUT_MS, () => {
+        void this.journal.write({ type: 'decision', phase: 'P4', action: 'compaction skipped: 45s timeout' })
+      })
+      this.opts.transparency.setHudStatus('P5', this.currentIdea.slice(0, 60), 'running', 'opus')
+
+      // ── P5 VERIFY (XS sizing, reviewRounds 1) ─────────────────────────────
+      if (await this._isPaused()) { await this._waitResume() }
+
+      const { P5Verify } = await import('../phases/p5-verify.js')
+      const p5 = new P5Verify(
+        this.hostAgent, this.outputDir, this.opts.verifier,
+        this.opts.judge, this.repoRoot, this.opts.steerTimeoutMs
+      )
+      const p5Result = await p5.execute({
+        phase: 'P5',
+        p3: this.phaseStore.p3!,
+        p4: this.phaseStore.p4!,
+        sizing: this.currentSizing,
+        repoRoot: this.repoRoot,
+      })
+      if (!p5Result.ok || !p5Result.output) {
+        await this._escalate('P5', p5Result.reason ?? 'P5 failed')
+        return
+      }
+      this.phaseStore.p5 = p5Result.output
+      await this.journal.write({ type: 'completion', phase: 'P5', action: 'P5 complete (quick gear)' })
+
+      await compactAsync(ctx, COMPACT_TIMEOUT_MS, () => {
+        void this.journal.write({ type: 'decision', phase: 'P5', action: 'compaction skipped: 45s timeout' })
+      })
+      this.opts.transparency.setHudStatus('P6', this.currentIdea.slice(0, 60), 'running', 'opus')
+
+      // ── P6 RELEASE ────────────────────────────────────────────────────────
+      if (await this._isPaused()) { await this._waitResume() }
+
+      const { P6Release } = await import('../phases/p6-release.js')
+      const p6 = new P6Release(this.hostAgent, this.outputDir, this.opts.gitOps, undefined, this.opts.steerTimeoutMs)
+      const p6Result = await p6.execute({
+        phase: 'P6',
+        p5: this.phaseStore.p5!,
+        sizing: this.currentSizing,
+        repoRoot: this.repoRoot,
+      })
+      if (!p6Result.ok || !p6Result.output) {
+        await this._escalate('P6', p6Result.reason ?? 'P6 failed')
+        return
+      }
+      await this.journal.write({ type: 'completion', phase: 'P6', action: `P6 release (quick gear): ${p6Result.output.commitSha}` })
+
+      // Retro: success
+      const successLesson = `[quick] ${this.currentIdea.slice(0, 120)} → ${p6Result.output.commitSha}`
+      await this.opts.retroWriter?.write({
+        runId: this.currentRunId, lesson: successLesson, bugPattern: 'none', convention: this.currentTier,
+      })
+      this._terminalStored = true
+      try {
+        await this.opts.memoryStore?.store(this.currentRunId, successLesson, { tier: this.currentTier, outcome: 'success' })
+      } catch (e) { void this.opts.transparency.log(`memory store failed: ${e}`) }
+
+      await this.lifecycle.release()
+      this._restoreCwd()
+      this.opts.transparency.setHudStatus('DONE', p6Result.output.commitSha, 'done', 'none')
+      await this.opts.transparency.log(`ALL DONE (quick gear): commit=${p6Result.output.commitSha}`)
+
+    } catch (err) {
+      await this._escalate('QUICK', `Unexpected error: ${String(err)}`)
+    }
+  }
+
+  // ── B2: Middle gear — P1→(synth P2)→P3→P4→P5→P6 ─────────────────────────────
+
+  /**
+   * Middle gear phase path: runs P1 and P3 but skips P2 persona debate.
+   * A synthetic empty P2Output is passed to P3 so its type contract holds.
+   * Post-P1 rescore runs unless tier was forced (mid: prefix forces M, skips rescore).
+   * Full lifecycle bookends: pause-check, compactAsync, escalate, retro+release+restoreCwd.
+   * Lock is released on BOTH success and failure paths.
+   */
+  private async _runPhasesMiddle(ctx: ExtensionContext): Promise<void> {
+    try {
+      this.currentRunId = `run-${crypto.randomUUID()}`
+      this._terminalStored = false
+      const pi = this.pi as unknown as { setThinkingLevel?: (level: string) => void }
+
+      // Initialize sizing: forced tier or default M
+      if (this.currentForcedTier) {
+        this.currentTier = this.currentForcedTier
+        this.currentSizing = tierSizing(this.currentForcedTier)
+        await this.journal.write({
+          type: 'decision', phase: 'P1',
+          action: `tier forced to ${this.currentForcedTier} via prefix override (middle gear)`,
+        })
+      } else {
+        this.currentSizing = tierSizing('M')
+        this.currentTier = 'M'
+      }
+      pi.setThinkingLevel?.(this.currentSizing.thinkingLevel)
+
+      await this.journal.write({
+        type: 'decision', phase: 'P1',
+        action: `gear: middle task-type: ${this.currentTaskType} — starting P1 DISCOVER`,
+      })
+
+      // ── P1 DISCOVER ──────────────────────────────────────────────────────
+      if (await this._isPaused()) { await this._waitResume() }
+
+      this.opts.transparency.setHudStatus('P1', this.currentIdea.slice(0, 60), 'running', 'opus')
+
+      const { P1Discover } = await import('../phases/p1-discover.js')
+      const p1 = new P1Discover(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
+      const p1Result = await p1.execute({
+        phase: 'P1',
+        idea: this.currentIdea,
+        sizing: this.currentSizing,
+        memoryStore: this.opts.memoryStore,
+        embedder: this.opts.embedder,
+        screenContent: this.opts.securityLane
+          ? (t, s) => this.opts.securityLane!.screenContent(t, s)
+          : undefined,
+      })
+      if (!p1Result.ok || !p1Result.output) {
+        await this._escalate('P1', p1Result.reason ?? 'P1 failed')
+        return
+      }
+      this.phaseStore.p1 = p1Result.output
+
+      // ── Post-P1 rescore: skipped when tier is forced ──────────────────────
+      if (!this.currentForcedTier) {
+        const assessed = this.phaseStore.p1.complexity
+        const usingAssessment = assessed !== undefined && isValidComplexityInput(assessed)
+        const rescoreInput: ComplexityInput = usingAssessment
+          ? assessed
+          : this._rescoreFromSpec(this.phaseStore.p1.spec)
+        await this.journal.write({
+          type: 'decision', phase: 'P1',
+          action: usingAssessment
+            ? 'tier rescore via p1.complexity (host self-assessment)'
+            : 'tier rescore via keyword heuristic (no p1.complexity)',
+        })
+        const rescoreResult = scoreComplexity(rescoreInput)
+        const newSizing = tierSizing(rescoreResult.tier)
+        if (rescoreResult.tier !== this.currentTier) {
+          await this.journal.write({
+            type: 'decision', phase: 'P1',
+            action: `tier: ${this.currentTier} -> ${rescoreResult.tier} (post-P1 rescore)`,
+          })
+          this.currentTier = rescoreResult.tier
+          this.currentSizing = newSizing
+          pi.setThinkingLevel?.(this.currentSizing.thinkingLevel)
+        }
+      }
+
+      await this.journal.write({ type: 'completion', phase: 'P1', action: 'P1 complete (middle gear)' })
+      this.opts.transparency.setHudStatus('P1→P3', this.currentIdea.slice(0, 60), 'compacting', 'opus')
+
+      await compactAsync(ctx, COMPACT_TIMEOUT_MS, () => {
+        void this.journal.write({ type: 'decision', phase: 'P1', action: 'compaction skipped: 45s timeout' })
+      })
+
+      // ── Skip P2: synthesize empty P2Output so P3's type contract holds ────
+      const synthP2: import('../phases/phase-output.js').P2Output = {
+        phase: 'P2',
+        domainModel: '(middle gear — P2 skipped)',
+        personaDebate: [],
+      }
+      this.phaseStore.p2 = synthP2
+      await this.journal.write({
+        type: 'decision', phase: 'P2',
+        action: 'P2 skipped (middle gear) — synthetic empty P2Output injected',
+      })
+
+      this.opts.transparency.setHudStatus('P3', this.currentIdea.slice(0, 60), 'running', 'opus')
+
+      // ── P3 PLAN ──────────────────────────────────────────────────────────
+      if (await this._isPaused()) { await this._waitResume() }
+
+      const { P3Plan } = await import('../phases/p3-plan.js')
+      const p3 = new P3Plan(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
+      const p3Result = await p3.execute({
+        phase: 'P3',
+        p1: this.phaseStore.p1!,
+        p2: this.phaseStore.p2,
+        sizing: this.currentSizing,
+      })
+      if (!p3Result.ok || !p3Result.output) {
+        const failResult = p3Result as { ok: false; reason?: string; operatorBrief?: unknown }
+        const brief = failResult.operatorBrief ? JSON.stringify(failResult.operatorBrief, null, 2) : undefined
+        if (brief) {
+          await this._operatorBrief('P3', brief)
+        } else {
+          await this._escalate('P3', failResult.reason ?? 'P3 failed')
+        }
+        return
+      }
+      this.phaseStore.p3 = p3Result.output
+      await this.journal.write({ type: 'completion', phase: 'P3', action: 'P3 complete (middle gear)' })
+      this.opts.transparency.setHudStatus('P3→P4', this.currentIdea.slice(0, 60), 'compacting', 'opus')
+
+      await compactAsync(ctx, COMPACT_TIMEOUT_MS, () => {
+        void this.journal.write({ type: 'decision', phase: 'P3', action: 'compaction skipped: 45s timeout' })
+      })
+      this.opts.transparency.setHudStatus('P4', this.currentIdea.slice(0, 60), 'running', 'opus')
+
+      // ── P4 BUILD ─────────────────────────────────────────────────────────
+      if (await this._isPaused()) { await this._waitResume() }
+
+      const { P4Build } = await import('../phases/p4-build.js')
+      const p4 = new P4Build(this.hostAgent, this.outputDir, this.subagentDriver, this.opts.steerTimeoutMs)
+      const p4Result = await p4.execute({
+        phase: 'P4',
+        p3: this.phaseStore.p3!,
+        sizing: this.currentSizing,
+        repoRoot: this.repoRoot,
+      })
+      if (!p4Result.ok || !p4Result.output) {
+        await this._escalate('P4', p4Result.reason ?? 'P4 failed')
+        return
+      }
+      this.phaseStore.p4 = p4Result.output
+      await this.journal.write({ type: 'completion', phase: 'P4', action: 'P4 complete (middle gear)' })
+
+      await compactAsync(ctx, COMPACT_TIMEOUT_MS, () => {
+        void this.journal.write({ type: 'decision', phase: 'P4', action: 'compaction skipped: 45s timeout' })
+      })
+      this.opts.transparency.setHudStatus('P5', this.currentIdea.slice(0, 60), 'running', 'opus')
+
+      // ── P5 VERIFY ────────────────────────────────────────────────────────
+      if (await this._isPaused()) { await this._waitResume() }
+
+      const { P5Verify } = await import('../phases/p5-verify.js')
+      const p5 = new P5Verify(
+        this.hostAgent, this.outputDir, this.opts.verifier,
+        this.opts.judge, this.repoRoot, this.opts.steerTimeoutMs
+      )
+      const p5Result = await p5.execute({
+        phase: 'P5',
+        p3: this.phaseStore.p3!,
+        p4: this.phaseStore.p4!,
+        sizing: this.currentSizing,
+        repoRoot: this.repoRoot,
+      })
+      if (!p5Result.ok || !p5Result.output) {
+        await this._escalate('P5', p5Result.reason ?? 'P5 failed')
+        return
+      }
+      this.phaseStore.p5 = p5Result.output
+      await this.journal.write({ type: 'completion', phase: 'P5', action: 'P5 complete (middle gear)' })
+
+      await compactAsync(ctx, COMPACT_TIMEOUT_MS, () => {
+        void this.journal.write({ type: 'decision', phase: 'P5', action: 'compaction skipped: 45s timeout' })
+      })
+      this.opts.transparency.setHudStatus('P6', this.currentIdea.slice(0, 60), 'running', 'opus')
+
+      // ── P6 RELEASE ───────────────────────────────────────────────────────
+      if (await this._isPaused()) { await this._waitResume() }
+
+      const { P6Release } = await import('../phases/p6-release.js')
+      const p6 = new P6Release(this.hostAgent, this.outputDir, this.opts.gitOps, undefined, this.opts.steerTimeoutMs)
+      const p6Result = await p6.execute({
+        phase: 'P6',
+        p5: this.phaseStore.p5!,
+        sizing: this.currentSizing,
+        repoRoot: this.repoRoot,
+      })
+      if (!p6Result.ok || !p6Result.output) {
+        await this._escalate('P6', p6Result.reason ?? 'P6 failed')
+        return
+      }
+      await this.journal.write({ type: 'completion', phase: 'P6', action: `P6 release (middle gear): ${p6Result.output.commitSha}` })
+
+      // Retro: success
+      const successLesson = `[middle] ${this.currentIdea.slice(0, 120)} → ${p6Result.output.commitSha}`
+      await this.opts.retroWriter?.write({
+        runId: this.currentRunId, lesson: successLesson, bugPattern: 'none', convention: this.currentTier,
+      })
+      this._terminalStored = true
+      try {
+        await this.opts.memoryStore?.store(this.currentRunId, successLesson, { tier: this.currentTier, outcome: 'success' })
+      } catch (e) { void this.opts.transparency.log(`memory store failed: ${e}`) }
+
+      await this.lifecycle.release()
+      this._restoreCwd()
+      this.opts.transparency.setHudStatus('DONE', p6Result.output.commitSha, 'done', 'none')
+      await this.opts.transparency.log(`ALL DONE (middle gear): commit=${p6Result.output.commitSha}`)
+
+    } catch (err) {
+      await this._escalate('MIDDLE', `Unexpected error: ${String(err)}`)
     }
   }
 
