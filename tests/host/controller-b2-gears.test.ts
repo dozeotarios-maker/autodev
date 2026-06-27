@@ -272,7 +272,7 @@ describe('B2 Finding2: debug: after prior run escalates under a FRESH run-id', (
   }, 15_000)
 })
 
-describe('B2 Task2: refactor: → escalates with stub message, starts no phase', () => {
+describe('B2 Task2: refactor: → runs refactor track (R1 steer fires, no P1 steer)', () => {
   let tmpDir: string
 
   beforeEach(async () => {
@@ -284,8 +284,8 @@ describe('B2 Task2: refactor: → escalates with stub message, starts no phase',
     await fs.rm(tmpDir, { recursive: true, force: true })
   })
 
-  it('refactor: idea escalates with stub message and no P1 steer fires', async () => {
-    const { pi, fire } = makeMockPi()
+  it('refactor: idea enters refactor track (R1 steer fires), not the old stub escalation', async () => {
+    const { pi, fire, sendUserMessageCalls } = makeMockPi()
     const transparency = makeNullTransparency()
 
     const ctrl = new Controller(pi, {
@@ -294,7 +294,10 @@ describe('B2 Task2: refactor: → escalates with stub message, starts no phase',
       gitOps: makeNullGitOps(),
       judge: makeNullJudge(),
       transparency,
-      steerTimeoutMs: 500,
+      steerTimeoutMs: 500, // short timeout → R1 steer times out quickly → ESCALATE from track, not stub
+      boundedExec: {
+        run: vi.fn().mockResolvedValue({ passed: true, exitCode: 0, output: 'PASS', timedOut: false, blocked: false }),
+      },
     })
     ctrl.wire()
 
@@ -304,14 +307,26 @@ describe('B2 Task2: refactor: → escalates with stub message, starts no phase',
 
     await waitForLockRelease(tmpDir)
 
-    expect(transparency.log).toHaveBeenCalledWith(
+    // Stub message must NOT appear (refactor track replaced the stub)
+    expect(transparency.log).not.toHaveBeenCalledWith(
       expect.stringContaining('refactor track not yet implemented')
     )
-    expect(pi.sendUserMessage).not.toHaveBeenCalled()
+
+    // Lock released (refactor track ran and terminated)
     const lockPath = path.join(tmpDir, '.autodev', 'running.lock')
     const locked = await fs.access(lockPath).then(() => true).catch(() => false)
     expect(locked).toBe(false)
-  }, 10_000)
+
+    // R1 steer must have fired (sendUserMessage called with R1 CHARACTERIZE instruction)
+    // The short timeout causes R1 to escalate, but the steer WAS sent
+    expect(sendUserMessageCalls.some(p => p.includes('R1 CHARACTERIZE'))).toBe(true)
+
+    // build pipeline never entered
+    expect(sendUserMessageCalls.some(p => p.includes('P1 DISCOVER'))).toBe(false)
+
+    // The run terminated via ESCALATE (R1 steer timeout), not the old stub
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('ESCALATE'))
+  }, 15_000)
 })
 
 describe('B2 Task2: build:/no-prefix → proceeds normally (enters full _runPhases, P1 steer fires)', () => {
