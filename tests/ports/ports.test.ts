@@ -59,6 +59,7 @@ describe('M1: 10 port interfaces', () => {
       perPhasePush: async () => {},
       tierDGate: async () => true,
       scanSecrets: async () => ({ clean: true, findings: [] }),
+      changedFiles: async () => [],
     }
     expect(stub).toBeDefined()
   })

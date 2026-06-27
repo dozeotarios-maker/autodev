@@ -146,6 +146,7 @@ function makeCapturingGitOps(): GitOps & { capturedSha: string } {
     perPhasePush: vi.fn().mockResolvedValue(undefined),
     tierDGate: vi.fn().mockResolvedValue(true),
     scanSecrets: vi.fn().mockResolvedValue({ clean: true, findings: [] }),
+    changedFiles: vi.fn().mockResolvedValue([]),
   }
   return mock
 }

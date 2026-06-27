@@ -59,6 +59,7 @@ function makeNullGitOps(): GitOps {
     perPhasePush: vi.fn().mockResolvedValue(undefined),
     tierDGate: vi.fn().mockResolvedValue(true),
     scanSecrets: vi.fn().mockResolvedValue({ clean: true, findings: [] }),
+    changedFiles: vi.fn().mockResolvedValue([]),
   }
 }
 

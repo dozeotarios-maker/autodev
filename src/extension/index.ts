@@ -36,6 +36,7 @@ import { PerPhasePush } from '../git/per-phase-push.js'
 import { TierDGate } from '../git/tier-d-gate.js'
 import { GitleaksHook } from '../git/gitleaks-hook.js'
 import { TokenVaultImpl } from '../git/token-vault.js'
+import { ChangedFiles } from '../git/changed-files.js'
 
 // ── Lane E: Verify ────────────────────────────────────────────────────────────
 import { DeterministicVerifier } from '../verify/deterministic.js'
@@ -163,6 +164,8 @@ function buildGitOps(opts: AutodevExtensionOptions): ReRootableGitOps {
 
   // If an external gitOps is injected, wrap it so setRepoRoot is still present
   // (a no-op for the injected impl — it owns its own dir handling).
+  const changedFilesImpl = new ChangedFiles()
+
   if (opts.gitOps) {
     const injected = opts.gitOps
     return {
@@ -170,6 +173,7 @@ function buildGitOps(opts: AutodevExtensionOptions): ReRootableGitOps {
       perPhasePush: (branch) => injected.perPhasePush(branch),
       tierDGate: (action, brief) => injected.tierDGate(action, brief),
       scanSecrets: (staged) => injected.scanSecrets(staged),
+      changedFiles: (wdir) => injected.changedFiles(wdir),
       setRepoRoot: () => { /* injected gitOps manages its own dir */ },
     }
   }
@@ -179,6 +183,7 @@ function buildGitOps(opts: AutodevExtensionOptions): ReRootableGitOps {
     perPhasePush: (branch) => perPhasePush.perPhasePush(branch),
     tierDGate: (action, brief) => tierDGate.tierDGate(action, brief),
     scanSecrets: (staged) => gitleaksHook.scanSecrets(staged),
+    changedFiles: (wdir) => changedFilesImpl.changedFiles(wdir),
     setRepoRoot: (dir: string) => {
       cwd = dir
       scopedCommit = new ScopedCommit(cwd)

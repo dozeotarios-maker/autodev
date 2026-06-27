@@ -37,6 +37,7 @@ export interface GitOps {
     brief: { change: string; why: string; risk: string; rollback: string }
   ): Promise<boolean>
   scanSecrets(staged: boolean): Promise<{ clean: boolean; findings: string[] }>
+  changedFiles(cwd: string): Promise<string[]>
 }
 
 export interface MetricEntry {
