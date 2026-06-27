@@ -92,3 +92,15 @@ export interface Resurrection {
   ): Promise<{ resumed: boolean; report: string }>
   isIdempotentSafe(action: string, ledgerPath: string): Promise<boolean>
 }
+
+export interface BoundedExecResult {
+  passed: boolean
+  exitCode: number | null
+  output: string
+  timedOut: boolean
+  blocked: boolean
+}
+
+export interface BoundedExec {
+  run(cmd: string, cwd: string, opts: { timeoutMs: number }): Promise<BoundedExecResult>
+}

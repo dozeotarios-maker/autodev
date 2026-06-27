@@ -41,6 +41,8 @@ import { TokenVaultImpl } from '../git/token-vault.js'
 import { DeterministicVerifier } from '../verify/deterministic.js'
 import { MutationGate } from '../verify/mutation.js'
 import { HoldoutVerifier } from '../verify/holdout.js'
+import { BoundedExecImpl } from '../verify/bounded-exec.js'
+import { ActionMonitor } from '../safety/action-monitor.js'
 
 // ── S2-M8: Real concretes wired here ─────────────────────────────────────────
 import { SubagentJudge } from '../verify/subagent-judge.js'
@@ -408,6 +410,8 @@ export default function autodevExtension(pi: ExtensionAPI): void {
 
   const registry = new ProjectRegistry()
 
+  const boundedExec = new BoundedExecImpl(new ActionMonitor([repoRoot]))
+
   const controller = new Controller(pi, {
     repoRoot,
     verifier,
@@ -419,6 +423,7 @@ export default function autodevExtension(pi: ExtensionAPI): void {
     codebaseMemory,
     securityLane,
     registry,
+    boundedExec,
   })
 
   controller.wire()

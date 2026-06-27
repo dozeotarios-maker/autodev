@@ -26,7 +26,7 @@ import type {
   ToolCallEventResult,
   SessionBeforeCompactEvent,
 } from '@earendil-works/pi-coding-agent'
-import type { Verifier, GitOps, Judge, Transparency, MemoryStore, Embedder, SecurityLane } from '../ports.js'
+import type { Verifier, GitOps, Judge, Transparency, MemoryStore, Embedder, SecurityLane, BoundedExec } from '../ports.js'
 import { HostAgent } from './host-agent.js'
 import { SubagentDriver } from './subagent-driver.js'
 import { FSM } from '../engine/fsm.js'
@@ -182,6 +182,8 @@ export interface ControllerOptions {
   securityLane?: SecurityLane
   /** Optional project registry — when injected, _resolveRepoRoot re-roots the build dir from the idea. */
   registry?: ProjectRegistry
+  /** Optional bounded executor — runs untrusted repro commands with timeout + action-monitor gate. */
+  boundedExec?: BoundedExec
 }
 
 // ── B1: Override-prefix parser ────────────────────────────────────────────────
