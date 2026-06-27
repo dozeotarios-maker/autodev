@@ -832,12 +832,15 @@ describe('B3b Task3 (integration): intent gate threads into P1 on new project ru
     await fire('session_start', makeSessionStartEvent(), ctx)
     void fire('input', makeInputEvent('Build a brand new wiring test project'), ctx)
 
-    // Wait for P1 steer to fire
-    await new Promise<void>((resolve) => {
-      const deadline = Date.now() + 6_000
+    // Wait for P1 steer to fire. Reject (not resolve) on the deadline so a genuine
+    // timeout fails LOUD with a clear message rather than asserting on an empty
+    // steerCalls under load (the B1 deflake pattern). 15s sits under the 20s test budget.
+    await new Promise<void>((resolve, reject) => {
+      const deadline = Date.now() + 15_000
       const check = () => {
-        if (steerCalls.length >= 1 || Date.now() > deadline) resolve()
-        else setTimeout(check, 20)
+        if (steerCalls.length >= 1) { resolve(); return }
+        if (Date.now() > deadline) { reject(new Error('wiring test: P1 steer not seen within 15s')); return }
+        setTimeout(check, 20)
       }
       check()
     })
