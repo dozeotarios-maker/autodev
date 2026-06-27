@@ -17,8 +17,13 @@
  *   - Classic Node module-not-found
  *   - Vite/esbuild ENOENT
  */
+// NOTE: deliberately does NOT include bare `error: cannot` or `import.*error` —
+// those over-match the most common REAL failures a debug fix targets (e.g.
+// `TypeError: Cannot read properties of undefined`, `Error: Cannot connect to DB`),
+// which would misroute a genuinely still-RED repro into "harness broken". The
+// specific module/name/import-resolution patterns below cover real harness breakage.
 const HARNESS_ERROR_PATTERN =
-  /no test (suite )?found|does not provide an export|failed to resolve import|transform failed|ts\d{4,}:|cannot find name|cannot find module|failed to load|error: cannot|import.*error|syntaxerror|enoent/i
+  /no test (suite )?found|does not provide an export|failed to resolve import|transform failed|ts\d{4,}:|cannot find name|cannot find module|failed to load|syntaxerror|enoent/i
 
 /**
  * Returns true when `output` contains a harness-level error that prevented the
