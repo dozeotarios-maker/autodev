@@ -5,6 +5,7 @@
 import type { BoundedExec } from '../ports.js'
 import type { Verifier } from '../ports.js'
 import type { D1Output } from './debug-output.js'
+import { isHarnessError } from './harness-error.js'
 
 export interface D4GateResult {
   reproGreen: boolean
@@ -13,6 +14,11 @@ export interface D4GateResult {
   reproOutput: string
   /** Output from the suite run (for diagnosis). */
   suiteOutput: string
+  /**
+   * True when a harness-level error (import failure, no test suite found, etc.)
+   * prevented the repro from running at all. Distinct from a real assertion failure.
+   */
+  harnessError?: boolean
 }
 
 const REPRO_TIMEOUT_MS = 60_000
@@ -36,8 +42,27 @@ export async function runD4Gate(
   for (let i = 0; i < RUNS; i++) {
     const result = await boundedExec.run(d1.reproCommand, repoRoot, { timeoutMs: REPRO_TIMEOUT_MS })
     lastReproOutput = result.output
-    if (!result.passed || result.timedOut || result.blocked) {
-      // Not consistently green
+    if (result.timedOut || result.blocked) {
+      return {
+        reproGreen: false,
+        suiteGreen: false,
+        reproOutput: lastReproOutput,
+        suiteOutput: '',
+      }
+    }
+    // Distinguish import/collection error from a real assertion failure.
+    // A harness error means we cannot tell if the fix works — surface distinctly.
+    if (!result.passed && isHarnessError(result.output)) {
+      return {
+        reproGreen: false,
+        suiteGreen: false,
+        reproOutput: lastReproOutput,
+        suiteOutput: '',
+        harnessError: true,
+      }
+    }
+    if (!result.passed) {
+      // Not consistently green (still failing with an assertion error)
       return {
         reproGreen: false,
         suiteGreen: false,

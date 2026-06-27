@@ -42,6 +42,8 @@ export async function runD5Ship(
 
   // Paths to commit: fix files + the repro test (both go in the same commit)
   const allowedPaths = [...d3.filesChanged, d1.reproArtifact]
+    // Strip blank/whitespace-only entries so a bogus [''] doesn't pass the length guard
+    .filter(p => p && p.trim())
     // Deduplicate (repro should not be in filesChanged, but guard anyway)
     .filter((p, i, arr) => arr.indexOf(p) === i)
 

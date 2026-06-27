@@ -6,6 +6,8 @@ import type { Judge } from '../ports.js'
 export interface FaithfulnessResult {
   faithful: boolean
   reason?: string
+  /** True when the judge threw and the check was skipped (fail-open). */
+  skipped?: boolean
 }
 
 /**
@@ -37,7 +39,8 @@ export async function checkReproFaithfulness(
     }
     return { faithful: true }
   } catch {
-    // Judge infra error — fail-open (don't block on infrastructure failure)
-    return { faithful: true }
+    // Judge infra error — fail-open (don't block on infrastructure failure).
+    // Mark skipped so callers can journal the skip for visibility.
+    return { faithful: true, skipped: true, reason: 'judge threw — faithfulness check skipped' }
   }
 }

@@ -10,6 +10,7 @@
 //
 // Port interfaces only for Verifier, GitOps, Judge — no concrete imports from src/verify, src/git.
 
+import * as crypto from 'crypto'
 import * as fs from 'fs/promises'
 import * as os from 'os'
 import * as path from 'path'
@@ -49,6 +50,7 @@ import { D3Fix } from '../debug/d3-fix.js'
 import { runD4Gate } from '../debug/d4-verify.js'
 import { runD5Ship } from '../debug/d5-ship.js'
 import { checkReproFaithfulness } from '../debug/faithfulness-check.js'
+import { isHarnessError } from '../debug/harness-error.js'
 import type { D1Output, D2Output, D3Output } from '../debug/debug-output.js'
 import { MAX_DEBUG_ROUNDS } from '../debug/debug-output.js'
 import { scoreComplexity, tierSizing, DEFAULT_SIZING, isValidComplexityInput, tierFromOverride, gearFromForced } from '../engine/complexity.js'
@@ -1679,6 +1681,10 @@ export class Controller {
         return
       }
 
+      // Arm allowedPaths so boundedExec path-guard works even when _resolveRepoRoot
+      // was not called (e.g. repoRoot supplied directly via opts).
+      boundedExec.setRepoRoot?.(repoRoot)
+
       // ── D1: REPRODUCE ────────────────────────────────────────────────────
       this.currentDebugStep = 'D1'
       this.opts.transparency.setHudStatus('D1', bugReport.slice(0, 60), 'running', 'opus')
@@ -1695,7 +1701,7 @@ export class Controller {
       // ── D1 gate: run reproCommand 3× — require consistent RED ────────────
       const REPRO_TIMEOUT_MS = 60_000
       const RUNS = 3
-      let reproOutputs: string[] = []
+      const reproOutputs: string[] = []
       let allRed = true
 
       for (let i = 0; i < RUNS; i++) {
@@ -1710,9 +1716,11 @@ export class Controller {
           await this._escalate('D1', `reproCommand timed out after ${REPRO_TIMEOUT_MS}ms — repro hangs`)
           return
         }
-        // Distinguish assertion-failure from import/collection error
-        if (run.output && /cannot find module|failed to load|error: cannot|import.*error|syntaxerror|enoent/i.test(run.output)) {
-          await this._escalate('D1', 'repro harness broken — import/collection error (not an assertion failure)')
+        // Distinguish harness-level failure (import/collection/TS error) from a real assertion failure.
+        // isHarnessError covers: no test suite found, failed to resolve import, transform failed,
+        // TS\d{4,}, cannot find name, cannot find module, failed to load, enoent, syntaxerror, etc.
+        if (run.output && isHarnessError(run.output)) {
+          await this._escalate('D1', 'repro harness broken — test suite could not be collected (not an assertion failure)')
           return
         }
         if (run.passed) {
@@ -1734,6 +1742,10 @@ export class Controller {
         await this._escalate('D1', `repro faithfulness check failed: ${faithfulness.reason ?? 'repro does not demonstrate the reported bug'}`)
         return
       }
+      if (faithfulness.skipped) {
+        await this.journal.write({ type: 'decision', phase: 'D1', action: 'faithfulness check skipped (judge error) — proceeding fail-open' })
+        await this.opts.transparency.log('faithfulness check skipped (judge error)')
+      }
 
       // ── D1 hash snapshot — for D3/D4 anti-cheat ─────────────────────────
       let reproHashSnapshot: string
@@ -1742,8 +1754,8 @@ export class Controller {
           d1.reproArtifact.startsWith('/') ? d1.reproArtifact : path.join(repoRoot, d1.reproArtifact),
           'utf-8'
         )
-        // Simple hash: length + first 512 chars (sufficient for change detection without crypto import)
-        reproHashSnapshot = `${reproContent.length}:${reproContent.slice(0, 512)}`
+        // SHA-256 hash for reliable change detection (crypto already imported via randomUUID)
+        reproHashSnapshot = crypto.createHash('sha256').update(reproContent).digest('hex')
       } catch (err) {
         await this._escalate('D1', `Could not read reproArtifact for hash snapshot: ${String(err)}`)
         return
@@ -1815,24 +1827,26 @@ export class Controller {
           return
         }
 
-        // Guard: reproArtifact must NOT be in changedFiles
-        const reproName = path.basename(d1.reproArtifact)
+        // Guard: reproArtifact must NOT be in changedFiles.
+        // Use exact-path and path.resolve comparison only — basename match is over-broad
+        // and would false-reject a real fix to a same-basename file in another directory.
+        const reproAbsolute = path.resolve(repoRoot, d1.reproArtifact)
         const reproModified = changedFiles.some(f =>
-          f === d1.reproArtifact || f.endsWith(reproName) || path.resolve(repoRoot, f) === path.resolve(repoRoot, d1.reproArtifact)
+          f === d1.reproArtifact || path.resolve(repoRoot, f) === reproAbsolute
         )
         if (reproModified) {
           await this._escalate('D3', `repro was modified during fix — anti-cheat failed: ${d1.reproArtifact} appears in changedFiles`)
           return
         }
 
-        // Guard: reproArtifact content hash unchanged
+        // Guard: reproArtifact content hash unchanged (SHA-256 for post-512-byte safety)
         let currentHash: string
         try {
           const currentContent = await fs.readFile(
             d1.reproArtifact.startsWith('/') ? d1.reproArtifact : path.join(repoRoot, d1.reproArtifact),
             'utf-8'
           )
-          currentHash = `${currentContent.length}:${currentContent.slice(0, 512)}`
+          currentHash = crypto.createHash('sha256').update(currentContent).digest('hex')
         } catch (err) {
           await this._escalate('D3', `Could not re-read reproArtifact for hash check: ${String(err)}`)
           return
@@ -1851,6 +1865,12 @@ export class Controller {
         await this.journal.write({ type: 'pre-action', phase: 'D4', action: `starting D4 VERIFY (round ${round})` })
 
         const d4Gate = await runD4Gate(d1, repoRoot, boundedExec, this.opts.verifier)
+
+        if (d4Gate.harnessError) {
+          // Fix broke the repro's imports/collection — distinct from "fix didn't work"
+          await this._escalate('D4', `harness broken during fix — test suite could not be collected after D3 (round ${round}): ${d4Gate.reproOutput.slice(0, 300)}`)
+          return
+        }
 
         if (d4Gate.reproGreen && d4Gate.suiteGreen) {
           // Both gates pass — proceed to D5

@@ -46,6 +46,10 @@ export function validateD1Output(raw: unknown): raw is D1Output {
   const firstToken = (o['reproCommand'] as string).trim().split(/\s+/)[0] ?? ''
   if (!ALLOWED_BINARIES.has(firstToken)) return false
 
+  // reproCommand must not contain shell metacharacters (plan mandates vitest-only repros;
+  // metacharacters have no legit use and allow shell injection via shell:true in boundedExec)
+  if (/[;&|`$><]|\$\(/.test(o['reproCommand'] as string)) return false
+
   // reproArtifact must look like a file path (contains path separator or has an extension)
   const artifact = (o['reproArtifact'] as string).trim()
   if (!artifact.includes('/') && !artifact.includes('\\') && !/\.[a-z]+$/i.test(artifact)) {
