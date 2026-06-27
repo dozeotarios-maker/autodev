@@ -105,7 +105,10 @@ export class Lifecycle {
     if (!Number.isNaN(startedAt) && Date.now() - startedAt > MAX_LOCK_AGE_MS) return true
     const pid = content.pid
     if (typeof pid !== 'number') return true
-    if (pid === process.pid) return true // our own leftover — reclaim
+    // NOTE: do NOT treat pid===process.pid as stale. A closed/crashed session exits the
+    // process, so its leftover lock carries a now-DEAD pid → caught by ESRCH below. The
+    // only time the lock's pid equals ours is when this same live process already holds
+    // it (a genuine second concurrent session) — that must stay BLOCKED, not reclaimed.
     try {
       process.kill(pid, 0) // signal 0 = existence check only, sends nothing
       return false // owner alive — a live lock
