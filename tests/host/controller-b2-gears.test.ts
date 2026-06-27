@@ -146,9 +146,11 @@ async function waitForLockRelease(tmpDir: string, timeoutMs = 6_000): Promise<vo
   await new Promise((r) => setTimeout(r, 25))
 }
 
-// ── Task 2: task-type router stubs ────────────────────────────────────────────
+// ── Task 2: task-type router — debug: now enters _runDebugTrack ──────────────
+// REPLACED: the old stub test ('debug track not yet implemented') is no longer
+// valid — debug: now invokes _runDebugTrack instead of the stub escalation.
 
-describe('B2 Task2: debug: → escalates with stub message, starts no phase', () => {
+describe('B2 Task2: debug: → enters _runDebugTrack (not old stub), no build-pipeline phase', () => {
   let tmpDir: string
 
   beforeEach(async () => {
@@ -160,17 +162,21 @@ describe('B2 Task2: debug: → escalates with stub message, starts no phase', ()
     await fs.rm(tmpDir, { recursive: true, force: true })
   })
 
-  it('debug: idea escalates with stub message and no P1 steer fires', async () => {
+  it('debug: enters _runDebugTrack — no old stub msg, no P1 DISCOVER steer, lock released', async () => {
     const { pi, fire } = makeMockPi()
     const transparency = makeNullTransparency()
 
+    // steerTimeoutMs=50 → D1 steer times out → escalates quickly
     const ctrl = new Controller(pi, {
       repoRoot: tmpDir,
       verifier: makeNullVerifier(),
       gitOps: makeNullGitOps(),
       judge: makeNullJudge(),
       transparency,
-      steerTimeoutMs: 500,
+      steerTimeoutMs: 50,
+      boundedExec: {
+        run: vi.fn().mockResolvedValue({ passed: false, exitCode: 1, output: '', timedOut: false, blocked: false }),
+      },
     })
     ctrl.wire()
 
@@ -178,20 +184,23 @@ describe('B2 Task2: debug: → escalates with stub message, starts no phase', ()
     await fire('session_start', makeSessionStartEvent(), ctx)
     void fire('input', makeInputEvent('debug: tests fail in the auth module'), ctx)
 
-    // Wait for escalation to complete
     await waitForLockRelease(tmpDir)
 
-    // Must escalate with the stub message
-    expect(transparency.log).toHaveBeenCalledWith(
-      expect.stringContaining('debug track not yet implemented')
-    )
-    // Must NOT have steered P1 (no sendUserMessage calls)
-    expect(pi.sendUserMessage).not.toHaveBeenCalled()
-    // Lock must be released (escalate path calls lifecycle.release)
+    // Must NOT emit the old stub message
+    const logCalls = (transparency.log as ReturnType<typeof vi.fn>).mock.calls as [string][]
+    expect(logCalls.some(([m]) => m.includes('debug track not yet implemented'))).toBe(false)
+
+    // Must NOT have steered P1 DISCOVER (build pipeline not entered)
+    const steerCalls = (pi.sendUserMessage as ReturnType<typeof vi.fn>).mock.calls as [string][]
+    expect(steerCalls.some(([m]) => m.includes('P1 DISCOVER'))).toBe(false)
+
+    // Lock released (debug track terminated via escalation)
     const lockPath = path.join(tmpDir, '.autodev', 'running.lock')
-    const locked = await fs.access(lockPath).then(() => true).catch(() => false)
-    expect(locked).toBe(false)
-  }, 10_000)
+    expect(await fs.access(lockPath).then(() => true).catch(() => false)).toBe(false)
+
+    // ESCALATE fired (debug track ran and hit a terminal)
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('ESCALATE'))
+  }, 15_000)
 })
 
 describe('B2 Finding2: debug: after prior run escalates under a FRESH run-id', () => {
@@ -224,8 +233,12 @@ describe('B2 Finding2: debug: after prior run escalates under a FRESH run-id', (
       gitOps: makeNullGitOps(),
       judge: makeNullJudge(),
       transparency,
-      steerTimeoutMs: 50, // short: quick run times out immediately
+      steerTimeoutMs: 50, // short: quick run times out immediately; debug D1 steer also times out
       retroWriter,
+      // boundedExec required by debug track (D1 gate); won't be called because D1 steer times out first
+      boundedExec: {
+        run: vi.fn().mockResolvedValue({ passed: false, exitCode: 1, output: '', timedOut: false, blocked: false }),
+      },
     })
     ctrl.wire()
 
@@ -240,7 +253,7 @@ describe('B2 Finding2: debug: after prior run escalates under a FRESH run-id', (
     const firstRunId = retroRunIds[0]
     expect(firstRunId).toMatch(/^run-/)
 
-    // ── Second run: debug: router path (retroWriter.write called with run-id 2) ──
+    // ── Second run: debug: → _runDebugTrack (D1 steer times out → escalates with fresh run-id) ──
     void fire('input', makeInputEvent('debug: tests fail in the auth module'), ctx)
     await waitForLockRelease(tmpDir)
 
@@ -254,7 +267,8 @@ describe('B2 Finding2: debug: after prior run escalates under a FRESH run-id', (
     const lockPath = path.join(tmpDir, '.autodev', 'running.lock')
     const locked = await fs.access(lockPath).then(() => true).catch(() => false)
     expect(locked).toBe(false)
-    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('debug track not yet implemented'))
+    // debug track now ESCALATEs (D1 steer timeout) instead of emitting old stub
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('ESCALATE'))
   }, 15_000)
 })
 

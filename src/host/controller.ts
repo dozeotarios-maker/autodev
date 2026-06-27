@@ -43,6 +43,14 @@ import { P5Verify } from '../phases/p5-verify.js'
 import { P6Release } from '../phases/p6-release.js'
 import type { P1Output, P2Output, P3Output, P4Output, P5Output } from '../phases/phase-output.js'
 import { validateP1Output, validateP3Output } from '../phases/phase-output.js'
+import { D1Reproduce } from '../debug/d1-reproduce.js'
+import { D2RootCause } from '../debug/d2-root-cause.js'
+import { D3Fix } from '../debug/d3-fix.js'
+import { runD4Gate } from '../debug/d4-verify.js'
+import { runD5Ship } from '../debug/d5-ship.js'
+import { checkReproFaithfulness } from '../debug/faithfulness-check.js'
+import type { D1Output, D2Output, D3Output } from '../debug/debug-output.js'
+import { MAX_DEBUG_ROUNDS } from '../debug/debug-output.js'
 import { scoreComplexity, tierSizing, DEFAULT_SIZING, isValidComplexityInput, tierFromOverride, gearFromForced } from '../engine/complexity.js'
 import type { Sizing, ComplexityInput, ComplexityTier, Gear } from '../engine/complexity.js'
 import type { RetroWriter } from '../engine/retro.js'
@@ -276,6 +284,8 @@ export class Controller {
   private resolvedIsNew = false
   /** B3b: intent gathered from the intent gate; undefined when gate skipped or no input given. */
   private currentIntent: { useCase?: string; scale?: string; audience?: string } | undefined
+  /** C-1: active debug-track step label (e.g. 'D1', 'D2', 'D3', 'D4', 'D5'). Undefined when not in debug track. */
+  private currentDebugStep: string | undefined
 
   constructor(
     private readonly pi: ExtensionAPI,
@@ -368,6 +378,7 @@ export class Controller {
           gear: this.currentGear ?? 'full',
           phaseByPhase: this.phaseByPhase,
           intentCaptured: this.currentIntent !== undefined,
+          debugStep: this.currentDebugStep ?? null,
         }
         ctx.ui.notify(JSON.stringify(status, null, 2), 'info')
       },
@@ -597,13 +608,14 @@ export class Controller {
     // _resolveRepoRoot is a no-op when no registry is injected (preserves current behavior).
     await this._resolveRepoRoot(idea)
 
-    // B2: Task-type router — debug/refactor escalate with stub, no phase started.
+    // B2: Task-type router — debug runs _runDebugTrack; refactor escalates with stub.
     // Finding 2 fix: reset currentRunId + _terminalStored here, mirroring the phase-method
     // preamble, so _escalate tags this escalation under a fresh run id (not the previous run's).
     if (this.currentTaskType === 'debug') {
       this.currentRunId = `run-${crypto.randomUUID()}`
       this._terminalStored = false
-      void this._escalate('ROUTER', 'debug track not yet implemented — coming in Stage C (D1–D5). Re-run without debug: to use the build pipeline.')
+      this.currentDebugStep = undefined
+      void this._runDebugTrack(ctx)
       return
     }
     if (this.currentTaskType === 'refactor') {
@@ -1623,6 +1635,293 @@ export class Controller {
 
     } catch (err) {
       await this._escalate('MIDDLE', `Unexpected error: ${String(err)}`)
+    }
+  }
+
+  // ── C-1: Debug track D1→D5 ───────────────────────────────────────────────────
+
+  /**
+   * _runDebugTrack: linear D1→D5 debug execution.
+   *
+   * Independent of the P1-P6 FSM — uses its own D-step counter.
+   * Debug runs are NON-resurrectable in v1 (no P-phase vocabulary in resurrection.ts).
+   * Full lifecycle bookends: currentRunId + _terminalStored reset at entry;
+   * try/catch → _escalate; every terminal releases lock + restores cwd.
+   *
+   * Gates (all deterministic, no host self-report):
+   *   D1: reproCommand runs consistently RED 3× via boundedExec; faithfulness judge;
+   *       content-hash snapshot of reproArtifact.
+   *   D3: gitOps.changedFiles excludes reproArtifact AND hash unchanged AND changed
+   *       set is non-empty (guards against vacuous "fix" with no file writes).
+   *   D4: reproCommand runs consistently GREEN 3×; full suite via verifier.runDeterministic.
+   *       Loop D2/D3 capped MAX_DEBUG_ROUNDS; on cap → _operatorBrief.
+   *   D5: scopedCommit fix+repro, scanSecrets, perPhasePush. TierDGate skipped (debug v1).
+   */
+  private async _runDebugTrack(ctx: ExtensionContext): Promise<void> {
+    // ── Entry: reset per-run debug state ────────────────────────────────────
+    this.currentDebugStep = undefined
+
+    // Journal non-resurrectable marker
+    await this.journal.write({
+      type: 'decision', phase: 'DEBUG',
+      action: 'debug track started — NON-RESURRECTABLE in v1; D-steps journalled for post-mortem only',
+    })
+
+    try {
+      const bugReport = this.currentIdea
+      const repoRoot = this.repoRoot
+      const outputDir = this.outputDir
+
+      // boundedExec is required for the debug track
+      const boundedExec = this.opts.boundedExec
+      if (!boundedExec) {
+        await this._escalate('D1', 'boundedExec not injected — debug track requires BoundedExec')
+        return
+      }
+
+      // ── D1: REPRODUCE ────────────────────────────────────────────────────
+      this.currentDebugStep = 'D1'
+      this.opts.transparency.setHudStatus('D1', bugReport.slice(0, 60), 'running', 'opus')
+      await this.journal.write({ type: 'pre-action', phase: 'D1', action: 'starting D1 REPRODUCE' })
+
+      const d1Step = new D1Reproduce(this.hostAgent, outputDir, this.opts.steerTimeoutMs)
+      const d1Result = await d1Step.execute(bugReport, repoRoot)
+      if (!d1Result.ok || !d1Result.output) {
+        await this._escalate('D1', d1Result.reason ?? 'D1 failed')
+        return
+      }
+      const d1: D1Output = d1Result.output
+
+      // ── D1 gate: run reproCommand 3× — require consistent RED ────────────
+      const REPRO_TIMEOUT_MS = 60_000
+      const RUNS = 3
+      let reproOutputs: string[] = []
+      let allRed = true
+
+      for (let i = 0; i < RUNS; i++) {
+        const run = await boundedExec.run(d1.reproCommand, repoRoot, { timeoutMs: REPRO_TIMEOUT_MS })
+        reproOutputs.push(run.output)
+
+        if (run.blocked) {
+          await this._escalate('D1', `reproCommand blocked by action-monitor: ${d1.reproCommand}`)
+          return
+        }
+        if (run.timedOut) {
+          await this._escalate('D1', `reproCommand timed out after ${REPRO_TIMEOUT_MS}ms — repro hangs`)
+          return
+        }
+        // Distinguish assertion-failure from import/collection error
+        if (run.output && /cannot find module|failed to load|error: cannot|import.*error|syntaxerror|enoent/i.test(run.output)) {
+          await this._escalate('D1', 'repro harness broken — import/collection error (not an assertion failure)')
+          return
+        }
+        if (run.passed) {
+          // Repro is green — not consistently red
+          allRed = false
+          break
+        }
+      }
+
+      if (!allRed) {
+        await this._operatorBrief('D1', 'could not reproduce consistently — repro green or flaky')
+        return
+      }
+
+      // ── D1 faithfulness: judge confirms repro demonstrates the bug ────────
+      const reproOutput = reproOutputs[reproOutputs.length - 1] ?? ''
+      const faithfulness = await checkReproFaithfulness(bugReport, d1.reproSummary, reproOutput, this.opts.judge)
+      if (!faithfulness.faithful) {
+        await this._escalate('D1', `repro faithfulness check failed: ${faithfulness.reason ?? 'repro does not demonstrate the reported bug'}`)
+        return
+      }
+
+      // ── D1 hash snapshot — for D3/D4 anti-cheat ─────────────────────────
+      let reproHashSnapshot: string
+      try {
+        const reproContent = await fs.readFile(
+          d1.reproArtifact.startsWith('/') ? d1.reproArtifact : path.join(repoRoot, d1.reproArtifact),
+          'utf-8'
+        )
+        // Simple hash: length + first 512 chars (sufficient for change detection without crypto import)
+        reproHashSnapshot = `${reproContent.length}:${reproContent.slice(0, 512)}`
+      } catch (err) {
+        await this._escalate('D1', `Could not read reproArtifact for hash snapshot: ${String(err)}`)
+        return
+      }
+
+      await this.journal.write({ type: 'completion', phase: 'D1', action: `D1 complete — repro confirmed RED 3× (faithfulness ok); artifact=${d1.reproArtifact}` })
+
+      // ── D2/D3/D4 loop — capped at MAX_DEBUG_ROUNDS ───────────────────────
+      let d2: D2Output | undefined
+      let d3: D3Output | undefined
+      let round = 0
+
+      while (round < MAX_DEBUG_ROUNDS) {
+        round++
+
+        // ── D2: ROOT-CAUSE ─────────────────────────────────────────────────
+        this.currentDebugStep = 'D2'
+        this.opts.transparency.setHudStatus('D2', bugReport.slice(0, 60), 'running', 'opus')
+        await this.journal.write({ type: 'pre-action', phase: 'D2', action: `starting D2 ROOT-CAUSE (round ${round})` })
+
+        // Gather findCallers data when available
+        let callerData: Array<{ file: string; symbol?: string }> | undefined
+        try {
+          // Extract candidate symbols from repro output (simple heuristic: words near 'at ' stack frames)
+          const symbolMatch = reproOutput.match(/\bat\s+(\w+(?:\.\w+)*)\s/g)
+          const symbols = symbolMatch
+            ? [...new Set(symbolMatch.map(m => m.replace(/^at\s+/, '').replace(/\s.*/, '')))]
+            : []
+          if (symbols.length > 0 && this.opts.codebaseMemory?.findCallers) {
+            const callerResults = await Promise.allSettled(
+              symbols.slice(0, 3).map(sym => this.opts.codebaseMemory!.findCallers!(sym))
+            )
+            callerData = callerResults
+              .filter((r): r is PromiseFulfilledResult<Array<{ file: string; symbol?: string }>> => r.status === 'fulfilled')
+              .flatMap(r => r.value)
+          }
+        } catch {
+          // findCallers degraded — continue without it
+        }
+
+        const d2Step = new D2RootCause(this.hostAgent, outputDir, this.opts.steerTimeoutMs)
+        const d2Result = await d2Step.execute(bugReport, d1, reproOutput, callerData)
+        if (!d2Result.ok || !d2Result.output) {
+          await this._escalate('D2', d2Result.reason ?? 'D2 failed')
+          return
+        }
+        d2 = d2Result.output
+        await this.journal.write({ type: 'completion', phase: 'D2', action: `D2 complete — rootCause: ${d2.rootCause.slice(0, 80)}` })
+
+        // ── D3: FIX ────────────────────────────────────────────────────────
+        this.currentDebugStep = 'D3'
+        this.opts.transparency.setHudStatus('D3', bugReport.slice(0, 60), 'running', 'opus')
+        await this.journal.write({ type: 'pre-action', phase: 'D3', action: `starting D3 FIX (round ${round})` })
+
+        const d3Step = new D3Fix(this.hostAgent, outputDir, this.opts.steerTimeoutMs)
+        const d3Result = await d3Step.execute(bugReport, d1, d2)
+        if (!d3Result.ok || !d3Result.output) {
+          await this._escalate('D3', d3Result.reason ?? 'D3 failed')
+          return
+        }
+        d3 = d3Result.output
+
+        // ── D3 anti-cheat: deterministic changedFiles gate ──────────────────
+        const changedFiles = await this.opts.gitOps.changedFiles(repoRoot)
+
+        // Guard: changedFiles must be non-empty after fix steer
+        if (changedFiles.length === 0) {
+          await this._escalate('D3', 'no changes detected after fix — host wrote nothing to disk')
+          return
+        }
+
+        // Guard: reproArtifact must NOT be in changedFiles
+        const reproName = path.basename(d1.reproArtifact)
+        const reproModified = changedFiles.some(f =>
+          f === d1.reproArtifact || f.endsWith(reproName) || path.resolve(repoRoot, f) === path.resolve(repoRoot, d1.reproArtifact)
+        )
+        if (reproModified) {
+          await this._escalate('D3', `repro was modified during fix — anti-cheat failed: ${d1.reproArtifact} appears in changedFiles`)
+          return
+        }
+
+        // Guard: reproArtifact content hash unchanged
+        let currentHash: string
+        try {
+          const currentContent = await fs.readFile(
+            d1.reproArtifact.startsWith('/') ? d1.reproArtifact : path.join(repoRoot, d1.reproArtifact),
+            'utf-8'
+          )
+          currentHash = `${currentContent.length}:${currentContent.slice(0, 512)}`
+        } catch (err) {
+          await this._escalate('D3', `Could not re-read reproArtifact for hash check: ${String(err)}`)
+          return
+        }
+
+        if (currentHash !== reproHashSnapshot) {
+          await this._escalate('D3', 'repro was altered during fix — content hash changed (anti-cheat failed)')
+          return
+        }
+
+        await this.journal.write({ type: 'completion', phase: 'D3', action: `D3 complete — ${d3.filesChanged.length} file(s) changed; anti-cheat passed` })
+
+        // ── D4: VERIFY ────────────────────────────────────────────────────
+        this.currentDebugStep = 'D4'
+        this.opts.transparency.setHudStatus('D4', bugReport.slice(0, 60), 'running', 'opus')
+        await this.journal.write({ type: 'pre-action', phase: 'D4', action: `starting D4 VERIFY (round ${round})` })
+
+        const d4Gate = await runD4Gate(d1, repoRoot, boundedExec, this.opts.verifier)
+
+        if (d4Gate.reproGreen && d4Gate.suiteGreen) {
+          // Both gates pass — proceed to D5
+          await this.journal.write({ type: 'completion', phase: 'D4', action: `D4 complete — repro GREEN 3×, suite GREEN (round ${round})` })
+          break
+        }
+
+        // D4 failed — log and loop (if rounds remain)
+        await this.journal.write({
+          type: 'decision', phase: 'D4',
+          action: `D4 failed (round ${round}/${MAX_DEBUG_ROUNDS}) — reproGreen=${d4Gate.reproGreen} suiteGreen=${d4Gate.suiteGreen}; ${round < MAX_DEBUG_ROUNDS ? 'looping D2/D3' : 'cap reached'}`,
+        })
+
+        if (round >= MAX_DEBUG_ROUNDS) {
+          const evidence = [
+            `repro ${d4Gate.reproGreen ? 'GREEN' : 'RED'} after ${round} rounds`,
+            `suite ${d4Gate.suiteGreen ? 'GREEN' : 'RED'}`,
+            `last repro output: ${d4Gate.reproOutput.slice(0, 400)}`,
+          ].join('\n')
+          await this._operatorBrief('D4', `debug track did not converge after ${MAX_DEBUG_ROUNDS} rounds:\n${evidence}`)
+          return
+        }
+        // Continue loop (d2/d3 will be re-executed next iteration)
+      }
+
+      // d3 must be defined here (loop ran at least once and broke on D4 success)
+      if (!d3 || !d2) {
+        await this._escalate('DEBUG', 'internal error: D3/D2 undefined after loop — should not happen')
+        return
+      }
+
+      // ── D5: SHIP ──────────────────────────────────────────────────────────
+      this.currentDebugStep = 'D5'
+      this.opts.transparency.setHudStatus('D5', bugReport.slice(0, 60), 'running', 'opus')
+      await this.journal.write({ type: 'pre-action', phase: 'D5', action: 'starting D5 SHIP' })
+
+      const d5Result = await runD5Ship(d1, d2, d3, repoRoot, this.opts.gitOps)
+      if (!d5Result.ok || !d5Result.output) {
+        await this._escalate('D5', d5Result.reason ?? 'D5 failed')
+        return
+      }
+
+      await this.journal.write({
+        type: 'completion', phase: 'D5',
+        action: `D5 complete — commit=${d5Result.output.commitSha} push=${d5Result.output.pushResult}`,
+      })
+
+      // ── Success: retro + store + release ──────────────────────────────────
+      const successLesson = `[debug] ${bugReport.slice(0, 120)} → ${d5Result.output.commitSha}`
+      await this.opts.retroWriter?.write({
+        runId: this.currentRunId,
+        lesson: successLesson,
+        bugPattern: d2.rootCauseLocation,
+        convention: this.currentTier,
+      })
+      this._terminalStored = true
+      try {
+        await this.opts.memoryStore?.store(this.currentRunId, successLesson, {
+          tier: this.currentTier,
+          outcome: 'debug-success',
+        })
+      } catch (e) { void this.opts.transparency.log(`memory store failed: ${e}`) }
+
+      await this.lifecycle.release()
+      this._restoreCwd()
+      this.currentDebugStep = undefined
+      this.opts.transparency.setHudStatus('DONE', d5Result.output.commitSha, 'done', 'none')
+      await this.opts.transparency.log(`ALL DONE (debug track): commit=${d5Result.output.commitSha}`)
+
+    } catch (err) {
+      await this._escalate('DEBUG', `Unexpected error in debug track: ${String(err)}`)
     }
   }
 
