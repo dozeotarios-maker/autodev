@@ -171,6 +171,14 @@ function normalizeWriteToken(tokenRaw: string): string {
       t = t.slice(1, -1)
     }
   }
+  // (a2) cut at the first shell-control char. A redirect target tokenizes with any
+  // trailing separator attached when no space precedes it (e.g. `2>/dev/null;`,
+  // `>~/f&&x`, `>/tmp/a|tee`); the real write target is the path BEFORE that
+  // separator. Without this, `/dev/null;` misses the /dev/null safe-zone and is
+  // wrongly blocked. Conservative: a pathological quoted path containing a separator
+  // gets truncated (a false negative), which the design explicitly accepts.
+  const sepIdx = t.search(/[;&|()`]/)
+  if (sepIdx !== -1) t = t.slice(0, sepIdx)
   const home = os.homedir()
   // (b) leading tilde: `~` alone or `~/rest`
   if (t === '~') return home

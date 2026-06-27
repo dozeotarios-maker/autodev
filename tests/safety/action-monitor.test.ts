@@ -429,6 +429,22 @@ describe('CRITICAL: /dev path traversal escape blocked after normalize', () => {
     expect(m.checkBashCommand('echo x > /dev/null').allowed).toBe(true)
   })
 
+  // Live-run regression: a redirect target tokenizes with any trailing shell
+  // separator attached when no space precedes it (`2>/dev/null;`), so the extractor
+  // returned `/dev/null;` and missed the safe-zone, wrongly blocking normal commands.
+  it('allows redirect targets with a trailing shell separator (;, &&, |)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('find . -name x 2>/dev/null;').allowed).toBe(true)
+    expect(m.checkBashCommand('echo x > /dev/null;echo done').allowed).toBe(true)
+    expect(m.checkBashCommand('ls 2>/dev/null && echo ok').allowed).toBe(true)
+  })
+
+  it('separator strip does NOT open an escape — the path before the separator stays confined', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x >~/evil.sh && rm -rf .').allowed).toBe(false)
+    expect(m.checkBashCommand('echo x > /root/pollute.js;true').allowed).toBe(false)
+  })
+
   it('allows echo x > /dev/fd/2 (legitimate fd)', () => {
     const m = new ActionMonitor(['/tmp/proj'])
     expect(m.checkBashCommand('echo x > /dev/fd/2').allowed).toBe(true)
