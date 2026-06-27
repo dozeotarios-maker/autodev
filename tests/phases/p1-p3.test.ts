@@ -1062,3 +1062,97 @@ describe('B1 Task2: validateP1Output — optional complexity field', () => {
     expect(validateP1Output(raw)).toBe(false)
   })
 })
+
+// ── B1 Task 3: P1 instruction complexity self-assessment section ──────────────
+
+describe('B1 Task3: buildP1Instruction — complexity self-assessment section', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'p1-task3-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('instruction contains all four complexity field names', () => {
+    const ctx: P1Context = { phase: 'P1', idea: 'add a utility function' }
+    const instr = buildP1Instruction(ctx, '/tmp/p1-spec.json')
+    expect(instr).toContain('files')
+    expect(instr).toContain('novelty')
+    expect(instr).toContain('blastRadius')
+    expect(instr).toContain('irreversibility')
+  })
+
+  it('instruction mentions the complexity key in the output JSON', () => {
+    const ctx: P1Context = { phase: 'P1', idea: 'add a utility function' }
+    const instr = buildP1Instruction(ctx, '/tmp/p1-spec.json')
+    expect(instr).toContain('complexity')
+  })
+
+  it('instruction tells host not to inflate (calibration guard)', () => {
+    const ctx: P1Context = { phase: 'P1', idea: 'add a utility function' }
+    const instr = buildP1Instruction(ctx, '/tmp/p1-spec.json')
+    expect(instr).toMatch(/do not inflate|do NOT inflate/i)
+  })
+
+  it('instruction contains XS exemplar (single function → XS)', () => {
+    const ctx: P1Context = { phase: 'P1', idea: 'add a utility function' }
+    const instr = buildP1Instruction(ctx, '/tmp/p1-spec.json')
+    expect(instr).toContain('XS')
+  })
+
+  it('instruction for existing repo tells host to use recalled code for blastRadius', () => {
+    const mockStore = { recall: async () => [] } as unknown as import('../../src/ports.js').MemoryStore
+    const mockScreen = async () => ({ safe: true, threats: [] })
+    const ctx: P1Context = {
+      phase: 'P1',
+      idea: 'add a utility function',
+      memoryStore: mockStore,
+      screenContent: mockScreen,
+    }
+    // Async path — returns Promise<string>
+    const instrOrPromise = buildP1Instruction(ctx, '/tmp/p1-spec.json')
+    // Either sync or async, both must contain the blast radius codebase guidance
+    return Promise.resolve(instrOrPromise).then((instr) => {
+      expect(instr).toMatch(/blast.?[Rr]adius|blast radius/i)
+      expect(instr).toMatch(/recalled|codebase/i)
+    })
+  })
+
+  it('P1Discover executes and complexity field is parsed into output when host writes valid complexity', async () => {
+    const { agent } = makeMockHostAgent(async (expectFile) => {
+      await fs.mkdir(path.dirname(expectFile), { recursive: true })
+      await fs.writeFile(expectFile, JSON.stringify({
+        phase: 'P1',
+        spec: 'A comprehensive spec for a REST API with full CRUD operations',
+        stackAdr: 'Node.js + Express chosen for performance and ecosystem',
+        webResearch: [],
+        complexity: { files: 1, novelty: 'low', blastRadius: 1, irreversibility: 'low', rationale: 'single utility' },
+      }))
+    })
+    const p1 = new P1Discover(agent, tmpDir)
+    const result = await p1.execute({ phase: 'P1', idea: 'add a utility function' })
+    expect(result.ok).toBe(true)
+    expect(result.output?.complexity).toBeDefined()
+    expect(result.output?.complexity?.files).toBe(1)
+    expect(result.output?.complexity?.novelty).toBe('low')
+  })
+
+  it('P1Discover still succeeds when host omits complexity (back-compat)', async () => {
+    const { agent } = makeMockHostAgent(async (expectFile) => {
+      await fs.mkdir(path.dirname(expectFile), { recursive: true })
+      await fs.writeFile(expectFile, JSON.stringify({
+        phase: 'P1',
+        spec: 'A comprehensive spec for a REST API with full CRUD operations',
+        stackAdr: 'Node.js + Express chosen for performance and ecosystem',
+        webResearch: [],
+      }))
+    })
+    const p1 = new P1Discover(agent, tmpDir)
+    const result = await p1.execute({ phase: 'P1', idea: 'add a utility function' })
+    expect(result.ok).toBe(true)
+    expect(result.output?.complexity).toBeUndefined()
+  })
+})

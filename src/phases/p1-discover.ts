@@ -72,9 +72,34 @@ async function recallMemoryBlock(ctx: P1Context): Promise<string | undefined> {
   }
 }
 
+const COMPLEXITY_SECTION = `
+## Complexity self-assessment
+After writing the spec, assess this work's complexity honestly and add a \`complexity\` object to your P1 output JSON:
+- files: integer estimate of source files this will create or modify (1 for a single function/script).
+- novelty: "low" (routine) | "med" (integration/refactor) | "high" (novel architecture/distributed/ML).
+- blastRadius: 1 (isolated) … 5 (cross-service / schema migration / breaking change).
+- irreversibility: "low" | "med" (schema/rename) | "high" (data deletion/destructive).
+- rationale: one sentence explaining your assessment.
+
+Be calibrated: a small standalone utility is files:1, novelty:low, blastRadius:1, irreversibility:low → tier XS (panelPersonas:0). Do NOT inflate.`.trim()
+
+const COMPLEXITY_SECTION_REPO = `
+## Complexity self-assessment
+After writing the spec, assess this work's complexity honestly and add a \`complexity\` object to your P1 output JSON:
+- files: integer estimate of source files this will create or modify (1 for a single function/script).
+- novelty: "low" (routine) | "med" (integration/refactor) | "high" (novel architecture/distributed/ML).
+- blastRadius: 1 (isolated) … 5 (cross-service / schema migration / breaking change). For this existing codebase, base blastRadius on what the recalled code shows this change touches.
+- irreversibility: "low" | "med" (schema/rename) | "high" (data deletion/destructive).
+- rationale: one sentence explaining your assessment.
+
+Be calibrated: a small standalone utility is files:1, novelty:low, blastRadius:1, irreversibility:low → tier XS (panelPersonas:0). Do NOT inflate.`.trim()
+
 // Fix #7: collapsed to a single overload — the async path only activates when memoryStore
 // is present; callers that don't need to await can check ctx.memoryStore themselves.
 export function buildP1Instruction(ctx: P1Context, outputFile: string): string | Promise<string> {
+  const hasExistingRepo = !!ctx.memoryStore
+  const complexitySection = hasExistingRepo ? COMPLEXITY_SECTION_REPO : COMPLEXITY_SECTION
+
   const base = [
     ROLE_DIRECTIVES,
     '',
@@ -94,13 +119,22 @@ export function buildP1Instruction(ctx: P1Context, outputFile: string): string |
         webResearch: [
           { url: '<string>', title: '<string>', summary: '<string>' },
         ],
+        complexity: {
+          files: '<integer: 1–50>',
+          novelty: '<"low"|"med"|"high">',
+          blastRadius: '<integer: 1–5>',
+          irreversibility: '<"low"|"med"|"high">',
+          rationale: '<string: one sentence>',
+        },
       },
       null,
       2
     ),
     '```',
     '',
-    'Do NOT add extra fields. Write the file, then confirm "P1 output written."',
+    'Write the file, then confirm "P1 output written."',
+    '',
+    complexitySection,
   ].join('\n')
 
   // If no memory backend, return synchronously (preserves byte-identical baseline).
