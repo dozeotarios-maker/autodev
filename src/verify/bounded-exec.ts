@@ -2,13 +2,18 @@
 // Wraps spawn with: ActionMonitor gate, process-group kill on timeout, capped output buffer.
 
 import { spawn } from 'child_process'
-import type { ActionMonitor } from '../safety/action-monitor.js'
+import { ActionMonitor } from '../safety/action-monitor.js'
 import type { BoundedExec, BoundedExecResult } from '../ports.js'
 
 const OUTPUT_CAP = 10_000 // last 10k chars retained
 
 export class BoundedExecImpl implements BoundedExec {
-  constructor(private readonly actionMonitor: ActionMonitor) {}
+  constructor(private actionMonitor: ActionMonitor) {}
+
+  /** Re-root confinement to a new project dir (call alongside _resolveRepoRoot). */
+  setRepoRoot(dir: string): void {
+    this.actionMonitor = new ActionMonitor([dir])
+  }
 
   run(cmd: string, cwd: string, opts: { timeoutMs: number }): Promise<BoundedExecResult> {
     // 1. Action-monitor gate — NEVER exec a blocked command
@@ -72,6 +77,7 @@ export class BoundedExecImpl implements BoundedExec {
         settled = true
         clearTimeout(timer)
         resolve({
+          // `blocked` is intentionally omitted: blocked returns early above and never reaches this path.
           passed: code === 0 && !timedOut,
           exitCode: code,
           output: outputBuf,

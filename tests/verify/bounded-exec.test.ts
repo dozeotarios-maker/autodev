@@ -56,6 +56,27 @@ describe('BoundedExec', () => {
     }
   })
 
+  it('setRepoRoot: allows writes inside new dir and blocks writes outside it', async () => {
+    const dir1 = await fs.mkdtemp(path.join(os.tmpdir(), 'bounded-exec-root1-'))
+    const dir2 = await fs.mkdtemp(path.join(os.tmpdir(), 'bounded-exec-root2-'))
+    try {
+      // Start confined to dir1; a write to dir2 is blocked
+      const monitor = new ActionMonitor([dir1], [dir2])
+      const exec = new BoundedExecImpl(monitor)
+      const blockedBefore = await exec.run(`echo x > ${path.join(dir2, 'evil.txt')}`, dir1, { timeoutMs: 3000 })
+      expect(blockedBefore.blocked).toBe(true)
+
+      // Re-root to dir2; now writes inside dir2 are allowed, dir1 outside confinement
+      exec.setRepoRoot(dir2)
+      const allowedAfter = await exec.run(`echo ok > ${path.join(dir2, 'ok.txt')}`, dir2, { timeoutMs: 3000 })
+      expect(allowedAfter.blocked).toBe(false)
+      expect(allowedAfter.passed).toBe(true)
+    } finally {
+      await fs.rm(dir1, { recursive: true, force: true })
+      await fs.rm(dir2, { recursive: true, force: true })
+    }
+  })
+
   it('handles spawn error (ENOENT binary) without throwing', async () => {
     const monitor = new ActionMonitor([], [])
     const exec = new BoundedExecImpl(monitor)

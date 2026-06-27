@@ -1130,6 +1130,8 @@ export class Controller {
     const transparency = this.opts.transparency as { setRepoRoot?: (dir: string) => void }
     transparency.setRepoRoot?.(r.dir)
     this.opts.codebaseMemory?.setRepoRoot?.(r.dir)
+    const boundedExec = this.opts.boundedExec as { setRepoRoot?: (d: string) => void } | undefined
+    boundedExec?.setRepoRoot?.(r.dir)
 
     // Register in registry
     await this.opts.registry.register(r.name, r.dir, { lastRun: new Date().toISOString() })

@@ -22,7 +22,7 @@ import type {
   SessionStartEvent,
   InputEvent,
 } from '@earendil-works/pi-coding-agent'
-import type { Verifier, GitOps, Judge, Transparency } from '../../src/ports.js'
+import type { Verifier, GitOps, Judge, Transparency, BoundedExec } from '../../src/ports.js'
 import { ProjectRegistry } from '../../src/project/registry.js'
 
 // ── Mock factories ─────────────────────────────────────────────────────────────
@@ -322,5 +322,56 @@ describe('Controller _resolveRepoRoot: no-registry path does NOT chdir', () => {
     // Await termination so the run settles before afterEach cleanup.
     await transparency.terminated
     expect(process.cwd()).toBe(cwdBefore)
+  }, 10_000)
+})
+
+// ── Test 3: _resolveRepoRoot calls boundedExec.setRepoRoot with resolved dir ───
+
+describe('Controller _resolveRepoRoot: calls boundedExec.setRepoRoot with resolved dir', () => {
+  let tmpDir: string
+  let resolvedDir: string
+  let registryDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bounded-reroot-'))
+    resolvedDir = await fs.realpath(await fs.mkdtemp(path.join(tmpDir, 'resolved-')))
+    registryDir = path.join(tmpDir, 'registry')
+  })
+
+  afterEach(async () => {
+    await settleCwdToSafe()
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('calls boundedExec.setRepoRoot with the resolved project dir after chdir', async () => {
+    const registry = new ProjectRegistry(registryDir)
+    await registry.register('bounded-reroot-project', resolvedDir)
+    process.chdir(resolvedDir)
+
+    const setRepoRootCalls: string[] = []
+    const boundedExec: BoundedExec & { setRepoRoot: (d: string) => void } = {
+      run: vi.fn().mockResolvedValue({ passed: true, exitCode: 0, output: '', timedOut: false, blocked: false }),
+      setRepoRoot: vi.fn((d: string) => { setRepoRootCalls.push(d) }),
+    }
+
+    const transparency = makeAwaitableTransparency()
+    const { pi, fire } = makeMockPi()
+    const ctrl = makeController(pi, { repoRoot: tmpDir, registry, transparency, boundedExec })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+    void fire('input', makeInputEvent('Add bounded exec re-root test feature'), ctx)
+
+    // Wait until setRepoRoot has been called
+    for (let i = 0; i < 60 && setRepoRootCalls.length === 0; i++) {
+      await new Promise(r => setTimeout(r, 25))
+    }
+
+    expect(setRepoRootCalls.length).toBeGreaterThan(0)
+    expect(setRepoRootCalls[0]).toBe(resolvedDir)
+
+    await transparency.terminated
+    await waitForCwd(resolvedDir)
   }, 10_000)
 })

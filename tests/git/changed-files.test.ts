@@ -54,6 +54,17 @@ describe('ChangedFiles', () => {
     expect(result).toContain('staged.txt')
   })
 
+  it('returns [] for a non-git directory without throwing', async () => {
+    const nonGitDir = await fs.mkdtemp(path.join(os.tmpdir(), 'non-git-'))
+    try {
+      const cf = new ChangedFiles()
+      const result = await cf.changedFiles(nonGitDir)
+      expect(result).toEqual([])
+    } finally {
+      await fs.rm(nonGitDir, { recursive: true, force: true })
+    }
+  })
+
   it('deduplicates a file that is both staged and unstaged', async () => {
     // Stage a file then modify it again (so it appears in both outputs)
     await fs.writeFile(path.join(tmpDir, 'init.txt'), 'staged-version')

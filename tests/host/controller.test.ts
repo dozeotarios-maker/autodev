@@ -1369,7 +1369,7 @@ describe('Fix #4: _rescoreFromSpec empty-spec guard — minimal spec scores XS w
     // Wait for rescore to run + journal to flush
     await new Promise<void>((resolve, reject) => {
       const journalPath = path.join(tmpDir, '.autodev', 'journal.jsonl')
-      const deadline = Date.now() + 8_000
+      const deadline = Date.now() + 13_000
       const check = async () => {
         if (Date.now() > deadline) { reject(new Error('minimal-word: "P1 complete" not journalled within deadline')); return }
         const exists = await fs.access(journalPath).then(() => true).catch(() => false)

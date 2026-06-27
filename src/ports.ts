@@ -104,4 +104,6 @@ export interface BoundedExecResult {
 
 export interface BoundedExec {
   run(cmd: string, cwd: string, opts: { timeoutMs: number }): Promise<BoundedExecResult>
+  /** Re-root the confinement boundary to a new project dir (call after process.chdir). */
+  setRepoRoot?(dir: string): void
 }

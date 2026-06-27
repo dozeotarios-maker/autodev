@@ -20,10 +20,17 @@ function parseNames(output: string): string[] {
 
 export class ChangedFiles implements Pick<GitOps, 'changedFiles'> {
   async changedFiles(cwd: string): Promise<string[]> {
-    const [unstaged, staged] = await Promise.all([
-      git(['diff', '--name-only'], cwd),
-      git(['diff', '--name-only', '--staged'], cwd),
-    ])
+    let unstaged = ''
+    let staged = ''
+    try {
+      ;[unstaged, staged] = await Promise.all([
+        git(['diff', '--name-only'], cwd),
+        git(['diff', '--name-only', '--staged'], cwd),
+      ])
+    } catch {
+      // Non-git directory or git error — degrade gracefully to empty list.
+      return []
+    }
     const all = [...parseNames(unstaged), ...parseNames(staged)]
     // Deduplicate preserving order
     return [...new Set(all)]
