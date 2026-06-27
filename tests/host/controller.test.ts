@@ -314,6 +314,22 @@ describe('S2-M2: Controller — session_start → ARMED', () => {
     expect(transparency.log).not.toHaveBeenCalledWith(expect.stringContaining('RUNNING'))
   })
 
+  // Live regression: the user's `mkdir … && cd …` setup command was treated as a build
+  // idea and fired the whole pipeline on it. Shell commands must NOT start a run.
+  it('shell command stays ARMED, does not start a run', async () => {
+    const { pi, fire } = makeMockPi()
+    const transparency = makeNullTransparency()
+    const ctrl = makeController(pi, { transparency })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+    for (const cmd of ['mkdir -p /tmp/at-fresh && cd /tmp/at-fresh', 'git status', 'npm install', 'cd ~/proj', './run.sh']) {
+      await fire('input', makeInputEvent(cmd), ctx)
+    }
+    expect(transparency.log).not.toHaveBeenCalledWith(expect.stringContaining('RUNNING'))
+  })
+
   it('input with idea → ARMED→RUNNING + sets run-lock + starts P1', async () => {
     const { pi, fire } = makeMockPi()
     const transparency = makeNullTransparency()

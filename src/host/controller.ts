@@ -107,6 +107,23 @@ function isBenignCompactError(err: Error): boolean {
   return /nothing to compact|too small|already compacted/i.test(err.message)
 }
 
+// First words that mean "this is a shell command the user wants run", NOT a build
+// idea — so autodev never fires the pipeline on e.g. `mkdir … && cd …` or `git status`.
+// Deliberately excludes NL-ambiguous verbs (make/build/test/run/add/create/write).
+const SHELL_COMMAND_HEADS = new Set([
+  'cd', 'ls', 'mkdir', 'rmdir', 'rm', 'cp', 'mv', 'cat', 'echo', 'touch', 'chmod',
+  'chown', 'pwd', 'grep', 'find', 'sed', 'awk', 'tar', 'ssh', 'scp', 'git', 'npm',
+  'npx', 'pnpm', 'yarn', 'node', 'deno', 'bun', 'python', 'python3', 'pip', 'pip3',
+  'curl', 'wget', 'docker', 'kubectl', 'cargo', 'go', 'export', 'source', 'sudo',
+  'kill', 'pkill', 'ps', 'df', 'du', 'head', 'tail', 'which', 'env', 'sleep', 'clear',
+])
+
+/** True when the text reads as a raw shell command rather than a build idea. */
+function looksLikeShellCommand(trimmed: string): boolean {
+  const firstWord = (trimmed.split(/\s+/)[0] ?? '').toLowerCase()
+  return SHELL_COMMAND_HEADS.has(firstWord) || trimmed.startsWith('./') || trimmed.startsWith('~/')
+}
+
 /**
  * Promise wrapper over ctx.compact({ onComplete, onError }) with:
  *   - Conditional: skips unless shouldCompact() says the context is near-full.
@@ -566,8 +583,14 @@ export class Controller {
 
     const text = e.text ?? ''
 
-    // Detect idea vs question: ideas are statements, not questions or commands
-    const isIdea = text.trim().length > 10 && !text.trim().endsWith('?') && !text.startsWith('/')
+    // Detect idea vs question/command: a build idea is a statement — not a question,
+    // a /slash-command, or a raw shell command the user wants run.
+    const trimmed = text.trim()
+    const isIdea =
+      trimmed.length > 10 &&
+      !trimmed.endsWith('?') &&
+      !trimmed.startsWith('/') &&
+      !looksLikeShellCommand(trimmed)
     if (!isIdea) {
       await this.opts.transparency.log(`input: question/command, stays ARMED`)
       return
