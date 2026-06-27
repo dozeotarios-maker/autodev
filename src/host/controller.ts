@@ -177,6 +177,8 @@ export interface ControllerOptions {
     ensureIndexed?(): Promise<void>
     /** Re-root the indexer to the resolved dir (resets cached index). */
     setRepoRoot?(dir: string): void
+    /** Find call-sites for a symbol. Optional — degrades gracefully via ?. chaining. */
+    findCallers?(symbol: string): Promise<Array<{ file: string; symbol?: string }>>
   }
   /** Optional security lane — used to screen recalled memory before injecting into instructions. */
   securityLane?: SecurityLane
