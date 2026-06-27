@@ -9,6 +9,7 @@ import { validateD3Output } from './debug-output.js'
 import type { D3Output } from './debug-output.js'
 import type { D1Output } from './debug-output.js'
 import type { D2Output } from './debug-output.js'
+import { MINIMALISM_DIRECTIVE, CRAFTSMANSHIP_DIRECTIVE } from '../principles.js'
 
 export interface D3Result {
   ok: boolean
@@ -49,10 +50,13 @@ export class D3Fix {
       'You MUST NOT edit, modify, rename, or delete this file.',
       '',
       '## Rules',
-      '- Implement the MINIMAL fix — change as few lines as possible.',
       '- Do NOT edit the repro file (see above).',
       '- Do NOT add new test files (except if the fix requires a new production module).',
       '- List every production file you changed in filesChanged.',
+      '',
+      MINIMALISM_DIRECTIVE,
+      '',
+      CRAFTSMANSHIP_DIRECTIVE,
       '',
       '## Required output',
       `Write your result as valid JSON to: ${outputFile}`,

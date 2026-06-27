@@ -14,6 +14,7 @@ import type { PhaseResult } from './phase-executor.js'
 import { wrapUntrusted } from './safe-prompt.js'
 import { DEFAULT_SIZING } from '../engine/complexity.js'
 import { partitionFiles } from '../lanes/partitioner.js'
+import { MINIMALISM_DIRECTIVE, CRAFTSMANSHIP_DIRECTIVE } from '../principles.js'
 
 const ROLE_DIRECTIVES = `
 ## Role: Build Agent (P4)
@@ -88,6 +89,10 @@ function buildP4Instruction(ctx: P4Context, outputFile: string): string {
     '```',
     '',
     'Do NOT add extra fields. Write the file, then confirm "P4 output written."',
+    '',
+    MINIMALISM_DIRECTIVE,
+    '',
+    CRAFTSMANSHIP_DIRECTIVE,
   ].join('\n')
 }
 

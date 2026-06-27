@@ -9,6 +9,7 @@ import type { HostAgent } from '../host/host-agent.js'
 import { validateR2Output } from './refactor-output.js'
 import type { R2Output } from './refactor-output.js'
 import type { R1Output } from './refactor-output.js'
+import { MINIMALISM_DIRECTIVE, CRAFTSMANSHIP_DIRECTIVE } from '../principles.js'
 
 export interface R2Result {
   ok: boolean
@@ -64,6 +65,10 @@ export class R2Transform {
       '```',
       '',
       'After applying the refactor AND writing the JSON output file, confirm "R2 output written."',
+      '',
+      MINIMALISM_DIRECTIVE,
+      '',
+      CRAFTSMANSHIP_DIRECTIVE,
     ].join('\n')
 
     let steerResult

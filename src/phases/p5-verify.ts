@@ -14,6 +14,7 @@ import { validateP5Output } from './phase-output.js'
 import type { PhaseResult } from './phase-executor.js'
 import { wrapUntrusted } from './safe-prompt.js'
 import { DEFAULT_SIZING } from '../engine/complexity.js'
+import { MINIMALISM_REVIEW_LENS, CRAFTSMANSHIP_REVIEW_LENS } from '../principles.js'
 
 const ROLE_DIRECTIVES = `
 ## Role: Verifier Agent (P5)
@@ -62,7 +63,7 @@ function buildP5Instruction(
       tasks: [{
         index: 0,
         agent: 'reviewer',
-        task: `Review ONLY the following diff. Do NOT reference the spec or builder history.\nArtifacts:\n${wrapUntrusted(artifactsRaw)}\nFileDAG:\n${wrapUntrusted(ctx.p3.fileDAG.map((e) => e.file).join(', '))}\n\nList any CRITICAL, HIGH, MEDIUM, or LOW findings. Format each as:\n{"severity":"CRITICAL|HIGH|MEDIUM|LOW","file":"<path>","line":<n>,"description":"<text>"}`,
+        task: `Review ONLY the following diff. Do NOT reference the spec or builder history.\nArtifacts:\n${wrapUntrusted(artifactsRaw)}\nFileDAG:\n${wrapUntrusted(ctx.p3.fileDAG.map((e) => e.file).join(', '))}\n\nList any CRITICAL, HIGH, MEDIUM, or LOW findings. Format each as:\n{"severity":"CRITICAL|HIGH|MEDIUM|LOW","file":"<path>","line":<n>,"description":"<text>"}\n\n${MINIMALISM_REVIEW_LENS}\n\n${CRAFTSMANSHIP_REVIEW_LENS}`,
       }],
       concurrency: 1,
       worktree: false,

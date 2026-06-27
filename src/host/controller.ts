@@ -61,6 +61,7 @@ import type { R1Output, R2Output } from '../refactor/refactor-output.js'
 import { MAX_REFACTOR_ROUNDS } from '../refactor/refactor-output.js'
 import { scoreComplexity, tierSizing, DEFAULT_SIZING, isValidComplexityInput, tierFromOverride, gearFromForced } from '../engine/complexity.js'
 import type { Sizing, ComplexityInput, ComplexityTier, Gear } from '../engine/complexity.js'
+import { MINIMALISM_DIRECTIVE, CRAFTSMANSHIP_DIRECTIVE } from '../principles.js'
 import type { RetroWriter } from '../engine/retro.js'
 import { resolveProjectDir } from '../project/resolver.js'
 import type { ProjectRegistry } from '../project/registry.js'
@@ -1266,6 +1267,10 @@ export class Controller {
         '```',
         '',
         'Rules: No web research. No alternatives. No personas. Write ONLY this one file. Keep it minimal.',
+        '',
+        MINIMALISM_DIRECTIVE,
+        '',
+        CRAFTSMANSHIP_DIRECTIVE,
       ].join('\n')
 
       this.opts.transparency.setHudStatus('QUICK-SEED', this.currentIdea.slice(0, 60), 'running', 'opus')
