@@ -53,6 +53,32 @@ const THRESHOLDS: Array<[number, ComplexityTier]> = [
   [18, 'L'],
 ]
 
+// ── B2: Gear type + gear-from-tier mapping ────────────────────────────────────
+
+/** B2: Phase-path gear. quick=seed→P4→P5→P6; middle=P1→P3→P4→P5→P6; full=P1→P6. */
+export type Gear = 'quick' | 'middle' | 'full'
+
+const TIER_TO_GEAR: Record<ComplexityTier, Gear> = {
+  XS: 'quick',
+  S:  'middle',
+  M:  'middle',
+  L:  'full',
+  XL: 'full',
+}
+
+/** Map a complexity tier to its corresponding gear. */
+export function gearFromTier(tier: ComplexityTier): Gear {
+  return TIER_TO_GEAR[tier]
+}
+
+/**
+ * When a tier was forced via prefix (quick:/mid:/full:), return the gear for that tier.
+ * When no tier was forced (undefined), return undefined — no explicit gear, use full path.
+ */
+export function gearFromForced(forcedTier: ComplexityTier | undefined): Gear | undefined {
+  return forcedTier === undefined ? undefined : gearFromTier(forcedTier)
+}
+
 // ── B1: Override-gear → tier mapping ─────────────────────────────────────────
 
 export type OverrideGear = 'quick' | 'mid' | 'full'
