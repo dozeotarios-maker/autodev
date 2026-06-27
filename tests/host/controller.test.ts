@@ -1020,6 +1020,20 @@ describe('S2.5: XL idea → setThinkingLevel("xhigh") called at run-start', () =
 
     // setThinkingLevel must have been called at least once (run-start with 'high')
     expect(setThinkingLevelMock).toHaveBeenCalled()
+
+    // Drain P2: wait for P2 steer in-flight, fire agent_end so lifecycle.release() runs
+    // instead of leaking the 500ms steer timer into adjacent tests.
+    await new Promise<void>((resolve) => {
+      const deadline = Date.now() + 2_000
+      const check = () => {
+        const calls = (pi.sendUserMessage as ReturnType<typeof vi.fn>).mock.calls
+        if (calls.length >= 2 || Date.now() > deadline) resolve()
+        else setTimeout(check, 10)
+      }
+      check()
+    })
+    fire('agent_end', makeAgentEndEvent('P2 drain'), ctx)
+    await new Promise(r => setTimeout(r, 30))
   }, 10_000)
 })
 
@@ -1104,6 +1118,20 @@ describe('S2.5: post-P1 rescore changes tier → setThinkingLevel called again +
     })
     const journalContent = await fs.readFile(journalPath, 'utf-8')
     expect(journalContent).toMatch(/tier/)
+
+    // Drain P2: wait for P2 steer in-flight, fire agent_end so lifecycle.release() runs
+    // instead of leaking the 500ms steer timer into adjacent tests.
+    await new Promise<void>((resolve) => {
+      const deadline = Date.now() + 2_000
+      const check = () => {
+        const calls = (pi.sendUserMessage as ReturnType<typeof vi.fn>).mock.calls
+        if (calls.length >= 2 || Date.now() > deadline) resolve()
+        else setTimeout(check, 10)
+      }
+      check()
+    })
+    fire('agent_end', makeAgentEndEvent('P2 drain'), ctx)
+    await new Promise(r => setTimeout(r, 30))
   }, 10_000)
 })
 
@@ -1338,11 +1366,11 @@ describe('Fix #4: _rescoreFromSpec empty-spec guard — minimal spec scores XS w
     fire('agent_end', makeAgentEndEvent('P1 output written'), ctx)
 
     // Wait for rescore to run + journal to flush
-    await new Promise<void>((resolve) => {
+    await new Promise<void>((resolve, reject) => {
       const journalPath = path.join(tmpDir, '.autodev', 'journal.jsonl')
-      const deadline = Date.now() + 3_000
+      const deadline = Date.now() + 8_000
       const check = async () => {
-        if (Date.now() > deadline) { resolve(); return }
+        if (Date.now() > deadline) { reject(new Error('minimal-word: "P1 complete" not journalled within deadline')); return }
         const exists = await fs.access(journalPath).then(() => true).catch(() => false)
         if (exists) {
           const content = await fs.readFile(journalPath, 'utf-8')
@@ -1362,7 +1390,20 @@ describe('Fix #4: _rescoreFromSpec empty-spec guard — minimal spec scores XS w
 
     // Tier DOES change (M→XS) since spec is minimal
     expect(journalContent).toMatch(/tier:/)
-  }, 10_000)
+
+    // Drain P2: wait for P2 steer in-flight, fire agent_end so lifecycle.release() runs
+    // instead of leaking the 5s steer timer into adjacent tests.
+    await new Promise<void>((resolve) => {
+      const deadline = Date.now() + 2_000
+      const check = () => {
+        if (steerCount >= 2 || Date.now() > deadline) resolve()
+        else setTimeout(check, 10)
+      }
+      check()
+    })
+    fire('agent_end', makeAgentEndEvent('P2 drain'), ctx)
+    await new Promise(r => setTimeout(r, 30))
+  }, 15_000)
 })
 
 // ── B4: retro → memoryStore.store called on success and halt ─────────────────
@@ -2278,7 +2319,7 @@ describe('B1 Task5: forced tier skips post-P1 rescore (integration)', () => {
       gitOps: makeNullGitOps(),
       judge: makeNullJudge(),
       transparency: makeNullTransparency(),
-      steerTimeoutMs: 500,
+      steerTimeoutMs: 1, // 1ms: P2 steer times out immediately → lifecycle.release(), no leaked timers
     })
     ctrl.wire()
 
@@ -2345,7 +2386,7 @@ describe('B1 Task5: forced tier skips post-P1 rescore (integration)', () => {
       gitOps: makeNullGitOps(),
       judge: makeNullJudge(),
       transparency: makeNullTransparency(),
-      steerTimeoutMs: 500,
+      steerTimeoutMs: 1, // 1ms: P2 steer times out immediately → lifecycle.release(), no leaked timers
     })
     ctrl.wire()
 
@@ -2413,7 +2454,10 @@ describe('B1 Task4: post-P1 rescore — p1.complexity vs keyword fallback', () =
     await fs.rm(tmpDir, { recursive: true, force: true })
   })
 
-  /** Helper: run through P1, write a p1 output file, fire agent_end, poll journal for a string. */
+  /** Helper: run through P1, write a p1 output file, fire agent_end, poll journal for a string.
+   * After the journal poll resolves, waits for P2 steer to be in-flight then fires a second
+   * agent_end to drain the lifecycle (P2 has no output file → _escalate → lifecycle.release()),
+   * ensuring no timer/poller leaks into subsequent tests. */
   async function runP1AndPollJournal(
     pi: ReturnType<typeof makeMockPi>['pi'],
     fire: ReturnType<typeof makeMockPi>['fire'],
@@ -2456,7 +2500,24 @@ describe('B1 Task4: post-P1 rescore — p1.complexity vs keyword fallback', () =
       void check()
     })
 
-    return fs.readFile(journalPath, 'utf-8')
+    const journal = await fs.readFile(journalPath, 'utf-8')
+
+    // Drain P2: wait for P2 steer to be in-flight (sendUserMessage call #2), then fire agent_end
+    // so the lifecycle releases cleanly instead of leaking a 500ms steer timer.
+    await new Promise<void>((resolve) => {
+      const deadline = Date.now() + 2_000
+      const check = () => {
+        const calls = (pi.sendUserMessage as ReturnType<typeof vi.fn>).mock.calls
+        if (calls.length >= 2 || Date.now() > deadline) resolve()
+        else setTimeout(check, 10)
+      }
+      check()
+    })
+    fire('agent_end', makeAgentEndEvent('P2 drain'), ctx)
+    // Give the event loop a tick for _escalate → lifecycle.release() to process
+    await new Promise(r => setTimeout(r, 30))
+
+    return journal
   }
 
   it('trivial p1.complexity (XS) rescores to XS — journal records "via p1.complexity"', async () => {
