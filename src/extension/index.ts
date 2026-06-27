@@ -44,6 +44,33 @@ import { MutationGate } from '../verify/mutation.js'
 import { HoldoutVerifier } from '../verify/holdout.js'
 import { BoundedExecImpl } from '../verify/bounded-exec.js'
 import { ActionMonitor } from '../safety/action-monitor.js'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+
+// ── Env: load .env from the package root so keys (GEMINI_API_KEY, etc.) survive
+// across pi launches without a manual export. Minimal parser — no dotenv dep.
+// Never overrides a variable already set in the process environment.
+function loadDotEnv(): void {
+  try {
+    const envPath = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '.env')
+    for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed || trimmed.startsWith('#')) continue
+      const eq = trimmed.indexOf('=')
+      if (eq === -1) continue
+      const key = trimmed.slice(0, eq).replace(/^export\s+/, '').trim()
+      let val = trimmed.slice(eq + 1).trim()
+      if (val.length >= 2 && ((val[0] === '"' && val.endsWith('"')) || (val[0] === "'" && val.endsWith("'")))) {
+        val = val.slice(1, -1)
+      }
+      if (key && process.env[key] === undefined) process.env[key] = val
+    }
+  } catch {
+    // No or unreadable .env — leave the environment untouched.
+  }
+}
+loadDotEnv()
 
 // ── S2-M8: Real concretes wired here ─────────────────────────────────────────
 import { SubagentJudge } from '../verify/subagent-judge.js'

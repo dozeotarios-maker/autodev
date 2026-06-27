@@ -4,3 +4,7 @@ dist/
 *.log
 *.tsbuildinfo
 .omc/
+
+# local secrets
+.env
+.env.local
