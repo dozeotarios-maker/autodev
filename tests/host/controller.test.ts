@@ -2305,6 +2305,18 @@ describe('B1 Task5: forced tier skips post-P1 rescore (integration)', () => {
   })
 
   afterEach(async () => {
+    // These tests use steerTimeoutMs:1, so P1 escalates and the run terminates via
+    // _escalate (async journal write) + lifecycle.release() (unlinks the run-lock). If we
+    // rmdir while those are in-flight, a late write lands in .autodev/ → ENOTEMPTY. Settle
+    // deterministically: wait for the run-lock to be released, then a small trailing margin.
+    const lockPath = path.join(tmpDir, '.autodev', 'running.lock')
+    const deadline = Date.now() + 4_000
+    while (Date.now() < deadline) {
+      const locked = await fs.access(lockPath).then(() => true).catch(() => false)
+      if (!locked) break
+      await new Promise((r) => setTimeout(r, 15))
+    }
+    await new Promise((r) => setTimeout(r, 25))
     await fs.rm(tmpDir, { recursive: true, force: true })
   })
 
