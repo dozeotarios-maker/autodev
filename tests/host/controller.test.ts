@@ -2372,8 +2372,30 @@ describe('B1 Task5: forced tier skips post-P1 rescore (integration)', () => {
     })
 
     fire('agent_end', makeAgentEndEvent('P1 output written'), ctx)
-    await new Promise(r => setTimeout(r, 300))
 
+    // Poll journal for "forced" entry proving the forced-tier path ran
+    const journalPath = path.join(tmpDir, '.autodev', 'journal.jsonl')
+    await new Promise<void>((resolve, reject) => {
+      const deadline = Date.now() + 4_000
+      const check = async () => {
+        if (Date.now() > deadline) { reject(new Error('journal forced-tier entry not seen within 4s')); return }
+        const exists = await fs.access(journalPath).then(() => true).catch(() => false)
+        if (exists) {
+          const content = await fs.readFile(journalPath, 'utf-8')
+          if (content.includes('forced') || content.includes('XL')) { resolve(); return }
+        }
+        setTimeout(check, 20)
+      }
+      void check()
+    })
+
+    const journal = await fs.readFile(journalPath, 'utf-8')
+    // Must mention forced / XL
+    expect(journal).toMatch(/forced|XL/)
+    // Must NOT contain rescore-source entries — rescore was SKIPPED because tier was forced
+    expect(journal).not.toContain('keyword heuristic')
+    expect(journal).not.toContain('p1.complexity')
+    // setThinkingLevel must have been called with 'xhigh' (XL tier)
     expect(setThinkingLevelMock).toHaveBeenCalledWith('xhigh')
   }, 10_000)
 })
@@ -2508,4 +2530,96 @@ describe('B1 Task4: post-P1 rescore — p1.complexity vs keyword fallback', () =
 
     expect(journal).toContain('keyword heuristic')
   }, 10_000)
+})
+
+// ── B1 Review: empty-idea guard (Finding 1) ──────────────────────────────────
+
+describe('B1 Review Finding1: parseOverrides — empty idea after prefix strip', () => {
+  it('quick: mid: → idea is empty string', () => {
+    const result = parseOverrides('quick: mid:')
+    expect(result.idea).toBe('')
+  })
+
+  it('build: quick: → idea is empty string', () => {
+    const result = parseOverrides('build: quick:')
+    expect(result.idea).toBe('')
+  })
+
+  it('full: quick: → idea is empty string', () => {
+    const result = parseOverrides('full: quick:')
+    expect(result.idea).toBe('')
+  })
+
+  it('refactor: mid: → idea is empty string', () => {
+    const result = parseOverrides('refactor: mid:')
+    expect(result.idea).toBe('')
+  })
+})
+
+describe('B1 Review Finding1: _onInput — empty idea after prefix strip stays ARMED', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'b1-empty-idea-test-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('quick: mid: (empty after strip) does NOT start a run — stays ARMED, lifecycle.run not called', async () => {
+    const { pi, fire } = makeMockPi()
+    const transparency = makeNullTransparency()
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency,
+      steerTimeoutMs: 500,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    // "quick: mid:" passes isIdea (>10 chars) but idea is '' after strip
+    await fire('input', makeInputEvent('quick: mid:'), ctx)
+    await new Promise(r => setImmediate(r))
+
+    // Must NOT transition to RUNNING
+    expect(transparency.log).not.toHaveBeenCalledWith(expect.stringContaining('RUNNING'))
+    // Must log the empty-after-strip message
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('empty after prefix strip'))
+    // No sendUserMessage (P1 steer) must have fired
+    expect(pi.sendUserMessage).not.toHaveBeenCalled()
+    // Status must NOT have been set to RUNNING
+    expect(ctx.ui.setStatus).not.toHaveBeenCalledWith('autodev', 'RUNNING')
+  })
+
+  it('build: quick: (empty after strip) does NOT start a run', async () => {
+    const { pi, fire } = makeMockPi()
+    const transparency = makeNullTransparency()
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency,
+      steerTimeoutMs: 500,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    await fire('input', makeInputEvent('build: quick:'), ctx)
+    await new Promise(r => setImmediate(r))
+
+    expect(transparency.log).not.toHaveBeenCalledWith(expect.stringContaining('RUNNING'))
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('empty after prefix strip'))
+    expect(pi.sendUserMessage).not.toHaveBeenCalled()
+  })
 })

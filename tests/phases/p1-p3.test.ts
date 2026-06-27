@@ -1085,6 +1085,17 @@ describe('B1 Task3: buildP1Instruction — complexity self-assessment section', 
     expect(instr).toContain('irreversibility')
   })
 
+  it('all four complexity schema keys appear together (schema block is complete)', () => {
+    const ctx: P1Context = { phase: 'P1', idea: 'add a utility function' }
+    const instr = buildP1Instruction(ctx, '/tmp/p1-spec.json')
+    // Verify all four keys are present in the same instruction string — guards against
+    // partial schema where one key is accidentally omitted from the JSON schema block.
+    const keys = ['files', 'novelty', 'blastRadius', 'irreversibility']
+    for (const key of keys) {
+      expect(instr, `expected schema key "${key}" to appear in P1 instruction`).toContain(key)
+    }
+  })
+
   it('instruction mentions the complexity key in the output JSON', () => {
     const ctx: P1Context = { phase: 'P1', idea: 'add a utility function' }
     const instr = buildP1Instruction(ctx, '/tmp/p1-spec.json')

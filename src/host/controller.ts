@@ -194,7 +194,7 @@ export interface ParsedOverrides {
 /**
  * Strip up to two known leading prefixes from a raw idea string.
  * quick/mid/full → sets forcedTier; build/debug/refactor → sets taskType (default 'build').
- * Only KNOWN leading tokens matched by /^(quick|mid|full|build|debug|refactor)\s*:\s*‌/i are stripped.
+ * Only KNOWN leading tokens matched by the regex `^(quick|mid|full|build|debug|refactor)\s*:\s*` (case-insensitive) are stripped.
  * Mid-sentence colons are untouched.
  */
 export function parseOverrides(raw: string): ParsedOverrides {
@@ -248,7 +248,7 @@ export class Controller {
   /** B1: forced tier from override prefix (quick:/mid:/full:). Undefined = no override. */
   private currentForcedTier: ComplexityTier | undefined
   /** B1: task type from prefix (build/debug/refactor). Default 'build'. */
-  private currentTaskType = 'build'
+  private currentTaskType = 'build' // B2-consumed: Stage B2 routing reads this; do not remove as "unused".
   private currentRunId = ''
   /** Fix #1: set true after the first terminal store so _escalate cannot double-store. */
   private _terminalStored = false
@@ -518,6 +518,14 @@ export class Controller {
     // lock acquisition — strips the idea to its bare form, captures forcedTier/taskType locally.
     const parsed = parseOverrides(text.trim())
     const idea = parsed.idea
+
+    // B1 review: guard against inputs that pass isIdea (>10 chars raw) but reduce to an empty
+    // idea after prefix stripping (e.g. "quick: mid:", "build: quick:"). Running lifecycle.run('')
+    // on an empty idea wastes a P1 spec-gen turn; bail early and stay ARMED.
+    if (idea.trim().length === 0) {
+      await this.opts.transparency.log('input: empty after prefix strip, stays ARMED')
+      return
+    }
 
     // Fix 6 (TOCTOU): lifecycle.run() is the SINGLE atomic source of truth.
     // It sets internal state to RUNNING synchronously before any async I/O, so
