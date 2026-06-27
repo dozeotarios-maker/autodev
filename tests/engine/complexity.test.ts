@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { scoreComplexity, ComplexityInput, ComplexityTier, tierSizing, DEFAULT_SIZING, Sizing } from '../../src/engine/complexity.js'
+import { scoreComplexity, ComplexityInput, ComplexityTier, tierSizing, DEFAULT_SIZING, Sizing, tierFromOverride, isValidComplexityInput } from '../../src/engine/complexity.js'
 
 describe('M3: complexity scorer', () => {
   it('XS: 1 file, low novelty, blast 1, low irreversibility', () => {
@@ -88,5 +88,66 @@ describe('M3: tierSizing — §6 table', () => {
 
   it('DEFAULT_SIZING equals tierSizing("M")', () => {
     expect(DEFAULT_SIZING).toEqual(tierSizing('M'))
+  })
+})
+
+// ── B1: tierFromOverride ───────────────────────────────────────────────────────
+
+describe('B1: tierFromOverride — override prefix → tier mapping', () => {
+  it('quick → XS', () => { expect(tierFromOverride('quick')).toBe('XS') })
+  it('mid → M', () => { expect(tierFromOverride('mid')).toBe('M') })
+  it('full → XL', () => { expect(tierFromOverride('full')).toBe('XL') })
+  it('bogus → null', () => { expect(tierFromOverride('bogus')).toBeNull() })
+  it('empty string → null', () => { expect(tierFromOverride('')).toBeNull() })
+  it('case-insensitive: QUICK → XS', () => { expect(tierFromOverride('QUICK')).toBe('XS') })
+  it('case-insensitive: Mid → M', () => { expect(tierFromOverride('Mid')).toBe('M') })
+  it('build → null (task-type only, not a tier)', () => { expect(tierFromOverride('build')).toBeNull() })
+})
+
+// ── B1: isValidComplexityInput ────────────────────────────────────────────────
+
+describe('B1: isValidComplexityInput — validation', () => {
+  it('valid minimal input', () => {
+    expect(isValidComplexityInput({ files: 1, novelty: 'low', blastRadius: 1, irreversibility: 'low' })).toBe(true)
+  })
+  it('valid with all enums set to med/high', () => {
+    expect(isValidComplexityInput({ files: 10, novelty: 'high', blastRadius: 5, irreversibility: 'med' })).toBe(true)
+  })
+  it('valid with extra rationale field (ComplexityInput & { rationale })', () => {
+    expect(isValidComplexityInput({ files: 2, novelty: 'med', blastRadius: 2, irreversibility: 'low', rationale: 'small util' })).toBe(true)
+  })
+  it('files < 1 → false', () => {
+    expect(isValidComplexityInput({ files: 0, novelty: 'low', blastRadius: 1, irreversibility: 'low' })).toBe(false)
+  })
+  it('files > 50 → false', () => {
+    expect(isValidComplexityInput({ files: 51, novelty: 'low', blastRadius: 1, irreversibility: 'low' })).toBe(false)
+  })
+  it('files at boundary 50 → true', () => {
+    expect(isValidComplexityInput({ files: 50, novelty: 'low', blastRadius: 1, irreversibility: 'low' })).toBe(true)
+  })
+  it('bad novelty enum → false', () => {
+    expect(isValidComplexityInput({ files: 1, novelty: 'huge', blastRadius: 1, irreversibility: 'low' })).toBe(false)
+  })
+  it('blastRadius > 5 → false', () => {
+    expect(isValidComplexityInput({ files: 1, novelty: 'low', blastRadius: 9, irreversibility: 'low' })).toBe(false)
+  })
+  it('blastRadius < 1 → false', () => {
+    expect(isValidComplexityInput({ files: 1, novelty: 'low', blastRadius: 0, irreversibility: 'low' })).toBe(false)
+  })
+  it('bad irreversibility enum → false', () => {
+    expect(isValidComplexityInput({ files: 1, novelty: 'low', blastRadius: 1, irreversibility: 'critical' })).toBe(false)
+  })
+  it('null → false', () => { expect(isValidComplexityInput(null)).toBe(false) })
+  it('missing fields → false', () => { expect(isValidComplexityInput({ files: 1 })).toBe(false) })
+  it('string → false', () => { expect(isValidComplexityInput('low')).toBe(false) })
+})
+
+// ── B1: trivial assessment → XS ───────────────────────────────────────────────
+
+describe('B1: trivial self-assessment scores XS', () => {
+  it('files:1 novelty:low blast:1 irrev:low → XS with panelPersonas 0', () => {
+    const result = scoreComplexity({ files: 1, novelty: 'low', blastRadius: 1, irreversibility: 'low' })
+    expect(result.tier).toBe('XS')
+    expect(tierSizing(result.tier).panelPersonas).toBe(0)
   })
 })

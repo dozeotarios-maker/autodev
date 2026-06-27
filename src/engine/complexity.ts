@@ -53,6 +53,32 @@ const THRESHOLDS: Array<[number, ComplexityTier]> = [
   [18, 'L'],
 ]
 
+// ── B1: Override-gear → tier mapping ─────────────────────────────────────────
+
+export type OverrideGear = 'quick' | 'mid' | 'full'
+
+const OVERRIDE_TIER: Record<OverrideGear, ComplexityTier> = { quick: 'XS', mid: 'M', full: 'XL' }
+
+export function tierFromOverride(prefix: string): ComplexityTier | null {
+  return OVERRIDE_TIER[prefix.toLowerCase() as OverrideGear] ?? null
+}
+
+// ── B1: ComplexityInput runtime validator ─────────────────────────────────────
+
+const NOVELTY_VALUES = new Set<string>(['low', 'med', 'high'])
+const IRREV_VALUES = new Set<string>(['low', 'med', 'high'])
+
+export function isValidComplexityInput(x: unknown): x is ComplexityInput {
+  if (!x || typeof x !== 'object') return false
+  const o = x as Record<string, unknown>
+  return (
+    typeof o['files'] === 'number' && o['files'] >= 1 && o['files'] <= 50 &&
+    typeof o['novelty'] === 'string' && NOVELTY_VALUES.has(o['novelty']) &&
+    typeof o['blastRadius'] === 'number' && o['blastRadius'] >= 1 && o['blastRadius'] <= 5 &&
+    typeof o['irreversibility'] === 'string' && IRREV_VALUES.has(o['irreversibility'])
+  )
+}
+
 export function scoreComplexity(input: ComplexityInput): ComplexityResult {
   const fileScore = Math.min(input.files, 20)              // cap raw file count contribution
   const blastScore = Math.min(input.blastRadius, 5) * 1.5
