@@ -67,11 +67,18 @@ export class SubagentDriver {
 
     try {
       const instruction = buildSubagentInstruction(tasks, { worktree, concurrency })
-      const result = await this.hostAgent.steer(instruction, {
-        expectTool: 'subagent',
-      })
+      const result = await this.hostAgent.steer(instruction, { expectTool: 'subagent' })
+      const results = correlateResults(tasks, result.toolResults)
 
-      return correlateResults(tasks, result.toolResults)
+      // Host-synthesis fallback: some pi runtimes reject our agent types ("Unknown
+      // agent: <type>") — the subagent tool returns that as the task result. Handing
+      // that rejection to the judges/reviewer stalls the phase, so when any task comes
+      // back unsupported, re-do them all by steering the host to act as each agent
+      // directly — the same host-synthesis path the persona panels already use.
+      if (results.some((r) => /unknown agent|no such agent|not a valid agent/i.test(r.output))) {
+        return await this._hostSynthesizeFallback(tasks)
+      }
+      return results
     } finally {
       // Fix 4: wrap _stashPop in try/catch so a pop failure does NOT mask the
       // original error. The stash entry stays for manual recovery; we log the
@@ -85,6 +92,33 @@ export class SubagentDriver {
         }
       }
     }
+  }
+
+  /**
+   * Fallback when the subagent tool is unavailable: steer the host to act as each
+   * agent directly and capture its reply. Sequential — pi can't truly parallelise here,
+   * and the consumers (judges/reviewer) only need the per-task output text.
+   */
+  private async _hostSynthesizeFallback(tasks: SubagentTask[]): Promise<SubagentResult[]> {
+    const results: SubagentResult[] = []
+    for (let i = 0; i < tasks.length; i++) {
+      const t = tasks[i]
+      const prompt = [
+        `The subagent system is unavailable in this runtime. Act as the "${t.agent}" agent yourself and complete the task below directly.`,
+        `Reply with ONLY the result the "${t.agent}" agent should return (the JSON or text it would output) — no preamble, no explanation.`,
+        '',
+        t.task,
+      ].join('\n')
+      let output: string
+      try {
+        const res = await this.hostAgent.steer(prompt)
+        output = res.rawText ?? ''
+      } catch {
+        output = SUBAGENT_MISSING
+      }
+      results.push({ index: i, agent: t.agent, task: t.task, output })
+    }
+    return results
   }
 
   // ── Git helpers ────────────────────────────────────────────────────────────

@@ -309,6 +309,26 @@ describe('Fix 5: correlateResults marks missing tasks as failed', () => {
     expect(results[1].output).toBe(SUBAGENT_MISSING)
   })
 
+  // Live regression: pi rejected our agent types ("Unknown agent: done-judge"), so the
+  // judges/reviewer got the rejection and P5 stalled short of a commit. Now the driver
+  // host-synthesises instead.
+  it('falls back to host-synthesis when the subagent rejects the agent type', async () => {
+    const steer = vi
+      .fn()
+      .mockResolvedValueOnce(
+        mockAgentResult([{ toolName: 'subagent', content: [{ text: 'Unknown agent: done-judge' }] }])
+      )
+      .mockResolvedValueOnce({ rawText: '{"done": true}', toolResults: [], seq: 2 })
+    const agent = { steer, _onAgentEnd: vi.fn(), _onTurnEnd: vi.fn() } as unknown as HostAgent
+    const driver = new SubagentDriver(agent)
+
+    const results = await driver.invoke([{ agent: 'done-judge', task: 'is the goal met?' }])
+
+    expect(steer).toHaveBeenCalledTimes(2) // dispatch + host-synthesis fallback
+    expect(results[0].output).toBe('{"done": true}') // the synthesized result, not the rejection
+    expect(steer.mock.calls[1][0]).toContain('done-judge') // fallback steered the host as the agent
+  })
+
   it('correct count of results returns normally without SUBAGENT_MISSING', async () => {
     const agent = makeMockHostAgent(
       mockAgentResult([
