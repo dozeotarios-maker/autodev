@@ -193,6 +193,70 @@ describe('B2 Task2: debug: → escalates with stub message, starts no phase', ()
   }, 10_000)
 })
 
+describe('B2 Finding2: debug: after prior run escalates under a FRESH run-id', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'b2-router-runid-'))
+  })
+
+  afterEach(async () => {
+    await waitForLockRelease(tmpDir)
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('debug: run after prior quick run captures two distinct run-ids via retroWriter', async () => {
+    const { pi, fire } = makeMockPi()
+    const transparency = makeNullTransparency()
+
+    // Capture run-ids via retroWriter mock (the only place currentRunId flows into an observable)
+    const retroRunIds: string[] = []
+    const retroWriter = {
+      write: vi.fn(async ({ runId }: { runId: string }) => {
+        retroRunIds.push(runId)
+      }),
+    } as unknown as import('../../src/engine/retro.js').RetroWriter
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency,
+      steerTimeoutMs: 50, // short: quick run times out immediately
+      retroWriter,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+
+    // ── First run: quick gear, times out → escalates (retroWriter.write called with run-id 1) ──
+    void fire('input', makeInputEvent('quick: add a slugify function'), ctx)
+    await waitForLockRelease(tmpDir)
+
+    expect(retroRunIds.length).toBeGreaterThanOrEqual(1)
+    const firstRunId = retroRunIds[0]
+    expect(firstRunId).toMatch(/^run-/)
+
+    // ── Second run: debug: router path (retroWriter.write called with run-id 2) ──
+    void fire('input', makeInputEvent('debug: tests fail in the auth module'), ctx)
+    await waitForLockRelease(tmpDir)
+
+    expect(retroRunIds.length).toBeGreaterThanOrEqual(2)
+    const secondRunId = retroRunIds[retroRunIds.length - 1]
+    expect(secondRunId).toMatch(/^run-/)
+    // The two runs must have DIFFERENT run-ids (fresh reset on second run)
+    expect(secondRunId).not.toBe(firstRunId)
+
+    // Lock must be released after the debug escalation
+    const lockPath = path.join(tmpDir, '.autodev', 'running.lock')
+    const locked = await fs.access(lockPath).then(() => true).catch(() => false)
+    expect(locked).toBe(false)
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('debug track not yet implemented'))
+  }, 15_000)
+})
+
 describe('B2 Task2: refactor: → escalates with stub message, starts no phase', () => {
   let tmpDir: string
 
@@ -344,9 +408,102 @@ describe('B2 Task3: quick: → _runPhasesQuick invoked (seed steer, no P1Discove
     const { pi, fire } = makeMockPi()
     const transparency = makeNullTransparency()
     const steerContents: string[] = []
-    ;(pi as unknown as Record<string, unknown>).sendUserMessage = vi.fn((content: string) => {
+    let steerCallCount = 0
+
+    const outputDir = path.join(tmpDir, '.autodev', 'phase-output')
+
+    // Finding 4: drive ALL 4 steers (seed + P4 + P5 + P6) so end-to-end chain runs.
+    // Each sendUserMessage call writes the appropriate phase file so the next steer can fire.
+    ;(pi as unknown as Record<string, unknown>).sendUserMessage = vi.fn(async (content: string) => {
       steerContents.push(content)
+      steerCallCount++
+      await fs.mkdir(outputDir, { recursive: true })
+      if (steerCallCount === 1) {
+        // Seed steer: write single combined quick-seed.json (Finding 1 fix)
+        await fs.writeFile(path.join(outputDir, 'quick-seed.json'), JSON.stringify({
+          spec: 'Add a slugify function that converts strings to URL-safe slugs',
+          plan: {
+            goal: 'Add slugify function',
+            successCriteria: ['slugify("Hello World") === "hello-world"'],
+            fileDAG: [{ file: 'src/slugify.ts', lane: 0, deps: [] }],
+            examplesTable: [{ scenario: 'basic', input: 'slugify("Hello World")', expectedOutput: '"hello-world"' }],
+          },
+        }))
+      } else if (steerCallCount === 2) {
+        // P4 steer
+        await fs.writeFile(path.join(outputDir, 'p4-build.json'), JSON.stringify({
+          phase: 'P4',
+          laneResults: [{ laneId: 0, status: 'success', output: 'ok' }],
+          artifacts: ['src/slugify.ts'],
+        }))
+      } else if (steerCallCount === 3) {
+        // P5 steer
+        await fs.writeFile(path.join(outputDir, 'p5-verify.json'), JSON.stringify({
+          phase: 'P5',
+          verifyReport: { deterministicPassed: true, holdoutPassed: true, securityClean: true },
+          reviewFindings: [],
+        }))
+      } else if (steerCallCount === 4) {
+        // P6 steer
+        await fs.writeFile(path.join(outputDir, 'p6-release.json'), JSON.stringify({
+          phase: 'P6',
+          commitSha: 'quickabc123',
+          pushResult: 'pushed',
+        }))
+      }
     })
+
+    const ctrl = new Controller(pi, {
+      repoRoot: tmpDir,
+      verifier: makeNullVerifier(),
+      gitOps: makeNullGitOps(),
+      judge: makeNullJudge(),
+      transparency,
+      steerTimeoutMs: 5_000,
+    })
+    ctrl.wire()
+
+    const ctx = makeExtCtx()
+    await fire('session_start', makeSessionStartEvent(), ctx)
+    void fire('input', makeInputEvent('quick: add a slugify function'), ctx)
+
+    // Drive all 4 steers: poll for new sendUserMessage, fire agent_end to advance each phase.
+    const drivePhases = async () => {
+      let driven = 0
+      const deadline = Date.now() + 20_000
+      while (driven < 4 && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 30))
+        if (steerCallCount > driven) {
+          await new Promise(r => setTimeout(r, 50))
+          driven = steerCallCount
+          fire('agent_end', makeAgentEndEvent('output written'), ctx)
+          await new Promise(r => setTimeout(r, 50))
+        }
+      }
+    }
+    await drivePhases()
+    await waitForLockRelease(tmpDir)
+
+    // Steer 1 must be the quick seed (not P1 DISCOVER)
+    expect(steerContents.length).toBeGreaterThanOrEqual(1)
+    expect(steerContents[0]).not.toContain('P1 DISCOVER phase')
+    expect(steerContents[0]).toContain('quick')
+
+    // Finding 4: assert seed→P4→P5→P6→release end-to-end
+    const lockPath = path.join(tmpDir, '.autodev', 'running.lock')
+    const locked = await fs.access(lockPath).then(() => true).catch(() => false)
+    expect(locked).toBe(false)
+    const journalPath = path.join(tmpDir, '.autodev', 'journal.jsonl')
+    const journalExists = await fs.access(journalPath).then(() => true).catch(() => false)
+    expect(journalExists).toBe(true)
+    const journalText = await fs.readFile(journalPath, 'utf-8')
+    expect(journalText).toContain('P6 release (quick gear)')
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('ALL DONE (quick gear)'))
+  }, 30_000)
+
+  it('quick: seed file present but plan missing → clean escalate + lock released', async () => {
+    const { pi, fire } = makeMockPi()
+    const transparency = makeNullTransparency()
 
     const ctrl = new Controller(pi, {
       repoRoot: tmpDir,
@@ -366,35 +523,37 @@ describe('B2 Task3: quick: → _runPhasesQuick invoked (seed steer, no P1Discove
     await new Promise<void>((resolve) => {
       const deadline = Date.now() + 3_000
       const check = () => {
-        if (steerContents.length >= 1 || Date.now() > deadline) resolve()
+        const calls = (pi.sendUserMessage as ReturnType<typeof vi.fn>).mock.calls
+        if (calls.length >= 1 || Date.now() > deadline) resolve()
         else setTimeout(check, 10)
       }
       check()
     })
 
-    expect(steerContents.length).toBeGreaterThanOrEqual(1)
-    // Seed steer must NOT contain the P1 DISCOVER role directive
-    expect(steerContents[0]).not.toContain('P1 DISCOVER phase')
-    // Seed steer must contain a build-plan/minimal-plan request
-    expect(steerContents[0]).toContain('quick')
-
-    // Drain: write seed output files and fire agent_end
+    // Write a seed file with spec but NO plan field — should trigger clean escalate
     const outputDir = path.join(tmpDir, '.autodev', 'phase-output')
     await fs.mkdir(outputDir, { recursive: true })
-    // Write both seed files (p1-spec.json and p3-plan.json) before agent_end
-    await fs.writeFile(path.join(outputDir, 'p1-spec.json'), JSON.stringify({
-      phase: 'P1', spec: 'Add a slugify function that converts strings to URL-safe slugs', stackAdr: '(quick gear — no ADR)', webResearch: [],
+    await fs.writeFile(path.join(outputDir, 'quick-seed.json'), JSON.stringify({
+      spec: 'Add a slugify function',
+      // plan field intentionally absent
     }))
-    await fs.writeFile(path.join(outputDir, 'p3-plan.json'), JSON.stringify({
-      phase: 'P3',
-      fileDAG: [{ file: 'src/slugify.ts', lane: 0, deps: [] }],
-      panelObjCount: 0,
-      sprintContract: { goal: 'Add slugify function', successCriteria: ['slugify("Hello World") === "hello-world"'], outOfScope: [] },
-      examplesTable: [{ scenario: 'basic', input: 'slugify("Hello World")', expectedOutput: '"hello-world"' }],
-    }))
-    fire('agent_end', makeAgentEndEvent('seed output written'), ctx)
+    fire('agent_end', makeAgentEndEvent('seed written (no plan)'), ctx)
 
+    // Wait for escalation + lock release
     await waitForLockRelease(tmpDir)
+
+    // Must escalate cleanly (no crash), lock must be released
+    const lockPath = path.join(tmpDir, '.autodev', 'running.lock')
+    const locked = await fs.access(lockPath).then(() => true).catch(() => false)
+    expect(locked).toBe(false)
+    expect(transparency.log).toHaveBeenCalledWith(expect.stringContaining('ESCALATE'))
+    // Escalate message must mention "plan" (Finding 5: includes raw excerpt context)
+    const escalateCalls = (transparency.log as ReturnType<typeof vi.fn>).mock.calls
+    const escalateMsg = escalateCalls.find((args: unknown[]) =>
+      typeof args[0] === 'string' && (args[0] as string).includes('ESCALATE')
+    )?.[0] as string | undefined
+    expect(escalateMsg).toBeDefined()
+    expect(escalateMsg).toContain('plan')
   }, 10_000)
 
   it('quick: run releases the lock on escalation (seed fails)', async () => {
@@ -491,11 +650,12 @@ describe('B2 Task3: mid: → _runPhasesMiddle invoked (P1 steer fires, NO P2 per
       check()
     })
 
+    // Finding 3 fix: hard assert that the 2nd steer fired — a conditional guard
+    // silently passed with zero assertions if the steer never arrived.
+    expect(steerContents.length).toBeGreaterThanOrEqual(2)
     // The 2nd steer must be P3 (not P2 persona debate)
-    if (steerContents.length >= 2) {
-      expect(steerContents[1]).toContain('P3 PLAN')
-      expect(steerContents[1]).not.toContain('P2 ELABORATE')
-    }
+    expect(steerContents[1]).toContain('P3 PLAN')
+    expect(steerContents[1]).not.toContain('P2 ELABORATE')
 
     // Write P3 file and drain
     await fs.writeFile(path.join(outputDir, 'p3-plan.json'), JSON.stringify({

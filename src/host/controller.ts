@@ -573,11 +573,17 @@ export class Controller {
     await this._resolveRepoRoot(idea)
 
     // B2: Task-type router — debug/refactor escalate with stub, no phase started.
+    // Finding 2 fix: reset currentRunId + _terminalStored here, mirroring the phase-method
+    // preamble, so _escalate tags this escalation under a fresh run id (not the previous run's).
     if (this.currentTaskType === 'debug') {
+      this.currentRunId = `run-${crypto.randomUUID()}`
+      this._terminalStored = false
       void this._escalate('ROUTER', 'debug track not yet implemented — coming in Stage C (D1–D5). Re-run without debug: to use the build pipeline.')
       return
     }
     if (this.currentTaskType === 'refactor') {
+      this.currentRunId = `run-${crypto.randomUUID()}`
+      this._terminalStored = false
       void this._escalate('ROUTER', 'refactor track not yet implemented. Re-run without refactor: to use the build pipeline.')
       return
     }
@@ -1094,7 +1100,14 @@ export class Controller {
 
   /**
    * Quick gear phase path: skips P1/P2/P3 ceremony.
-   * Issues one seed steer to produce minimal P1Output + P3Output, then runs P4→P5→P6.
+   * Issues ONE seed steer to produce a combined quick-seed.json (containing both
+   * spec and plan fields), then runs P4→P5→P6.
+   *
+   * Single-file seed design: writing two separate files (p1-spec.json + p3-plan.json)
+   * introduced a race — the steer's expectFile gated on p1 only, so the steer could
+   * resolve with p1 written and p3 not yet flushed, making fs.readFile(p3File) throw
+   * spuriously. Collapsing to ONE file eliminates the race entirely.
+   *
    * Full lifecycle bookends: pause-check at entry, compactAsync between steps,
    * _escalate on failure, retro + lifecycle.release() + _restoreCwd on success.
    * Lock is released on BOTH success and failure paths.
@@ -1116,39 +1129,44 @@ export class Controller {
       // ── Pause check at entry ──────────────────────────────────────────────
       if (await this._isPaused()) { await this._waitResume() }
 
-      // ── Seed steer: produce minimal P1Output + P3Output ───────────────────
+      // ── Seed steer: produce a SINGLE combined seed file ───────────────────
+      // Writing two files (p1-spec.json + p3-plan.json) introduced a race where
+      // the steer resolved (expectFile=p1File) with p3 not yet flushed. A single
+      // combined file eliminates the race structurally.
       const outputDir = this.outputDir
       await fs.mkdir(outputDir, { recursive: true })
-      const p1File = path.join(outputDir, 'p1-spec.json')
-      const p3File = path.join(outputDir, 'p3-plan.json')
+      const seedFile = path.join(outputDir, 'quick-seed.json')
 
       const seedInstruction = [
         '## Role: Quick-Gear Seed Agent',
         `You are the **quick gear** seed phase for pi-autodev. The idea is: "${this.currentIdea}"`,
         '',
-        'Produce a MINIMAL build plan for this small task. Write TWO JSON files:',
+        'Produce a MINIMAL build plan for this small task. Write ONE JSON file:',
         '',
-        `**File 1 — \`${p1File}\`** (P1Output):`,
+        `**\`${seedFile}\`** (combined seed):`,
         '```json',
-        '{"phase":"P1","spec":"<one paragraph spec>","stackAdr":"(quick gear — no ADR)","webResearch":[]}',
+        '{',
+        '  "spec": "<one paragraph spec>",',
+        '  "plan": {',
+        '    "goal": "<goal>",',
+        '    "successCriteria": ["<criterion>"],',
+        '    "fileDAG": [{"file": "<path>", "lane": 0, "deps": []}],',
+        '    "examplesTable": [{"scenario": "<name>", "input": "<input>", "expectedOutput": "<output>"}]',
+        '  }',
+        '}',
         '```',
         '',
-        `**File 2 — \`${p3File}\`** (P3Output):`,
-        '```json',
-        '{"phase":"P3","fileDAG":[{"file":"<path>","lane":0,"deps":[]}],"panelObjCount":0,"sprintContract":{"goal":"<goal>","successCriteria":["<criterion>"],"outOfScope":[]},"examplesTable":[{"scenario":"<name>","input":"<input>","expectedOutput":"<output>"}]}',
-        '```',
-        '',
-        'Rules: No web research. No alternatives. No personas. Write ONLY these two files. Keep it minimal.',
+        'Rules: No web research. No alternatives. No personas. Write ONLY this one file. Keep it minimal.',
       ].join('\n')
 
       this.opts.transparency.setHudStatus('QUICK-SEED', this.currentIdea.slice(0, 60), 'running', 'opus')
 
-      // Steer the host to write both files
+      // Steer the host to write the combined seed file
       const hostAgent = this.hostAgent
       let seedSteerResult
       try {
         seedSteerResult = await hostAgent.steer(seedInstruction, {
-          expectFile: p1File,
+          expectFile: seedFile,
           ...(this.opts.steerTimeoutMs !== undefined ? { timeoutMs: this.opts.steerTimeoutMs } : {}),
         })
       } catch (err) {
@@ -1157,33 +1175,63 @@ export class Controller {
       }
       void seedSteerResult
 
-      // Read + validate P1Output
-      let p1Raw: unknown
+      // Read + parse combined seed file
+      let raw: unknown
       try {
-        p1Raw = JSON.parse(await fs.readFile(p1File, 'utf-8'))
+        raw = JSON.parse(await fs.readFile(seedFile, 'utf-8'))
       } catch (err) {
-        await this._escalate('QUICK-SEED', `Seed P1 file read failed: ${String(err)}`)
+        await this._escalate('QUICK-SEED', `Seed file read/parse failed: ${String(err)}`)
         return
       }
-      if (!validateP1Output(p1Raw)) {
-        await this._escalate('QUICK-SEED', 'Seed P1Output failed schema validation')
-        return
-      }
-      this.phaseStore.p1 = p1Raw
 
-      // Read + validate P3Output
-      let p3Raw: unknown
-      try {
-        p3Raw = JSON.parse(await fs.readFile(p3File, 'utf-8'))
-      } catch (err) {
-        await this._escalate('QUICK-SEED', `Seed P3 file read failed: ${String(err)}`)
+      // Extract and validate fields; include a raw excerpt for debuggability (Finding 5)
+      const rawExcerpt = JSON.stringify(raw).slice(0, 200)
+      if (!raw || typeof raw !== 'object') {
+        await this._escalate('QUICK-SEED', `Seed file is not a JSON object. Raw: ${rawExcerpt}`)
         return
       }
-      if (!validateP3Output(p3Raw)) {
-        await this._escalate('QUICK-SEED', 'Seed P3Output failed schema validation')
+      const seedObj = raw as Record<string, unknown>
+
+      if (typeof seedObj['spec'] !== 'string' || !seedObj['spec']) {
+        await this._escalate('QUICK-SEED', `Seed missing valid "spec" string. Raw: ${rawExcerpt}`)
         return
       }
-      this.phaseStore.p3 = p3Raw
+      if (!seedObj['plan'] || typeof seedObj['plan'] !== 'object') {
+        await this._escalate('QUICK-SEED', `Seed missing valid "plan" object. Raw: ${rawExcerpt}`)
+        return
+      }
+      const plan = seedObj['plan'] as Record<string, unknown>
+
+      // Construct minimal P1Output from seed
+      const p1Candidate: unknown = {
+        phase: 'P1',
+        spec: seedObj['spec'],
+        stackAdr: typeof seedObj['stackAdr'] === 'string' ? seedObj['stackAdr'] : '(quick gear — no ADR)',
+        webResearch: [],
+      }
+      if (!validateP1Output(p1Candidate)) {
+        await this._escalate('QUICK-SEED', `Constructed P1Output failed schema validation. Raw: ${rawExcerpt}`)
+        return
+      }
+      this.phaseStore.p1 = p1Candidate
+
+      // Construct minimal P3Output from plan
+      const p3Candidate: unknown = {
+        phase: 'P3',
+        fileDAG: Array.isArray(plan['fileDAG']) ? plan['fileDAG'] : [],
+        panelObjCount: 0,
+        sprintContract: {
+          goal: typeof plan['goal'] === 'string' ? plan['goal'] : '',
+          successCriteria: Array.isArray(plan['successCriteria']) ? plan['successCriteria'] : [],
+          outOfScope: [],
+        },
+        examplesTable: Array.isArray(plan['examplesTable']) ? plan['examplesTable'] : [],
+      }
+      if (!validateP3Output(p3Candidate)) {
+        await this._escalate('QUICK-SEED', `Constructed P3Output failed schema validation. Raw: ${rawExcerpt}`)
+        return
+      }
+      this.phaseStore.p3 = p3Candidate
 
       await this.journal.write({ type: 'completion', phase: 'QUICK-SEED', action: 'seed complete' })
 
