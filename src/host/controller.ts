@@ -165,6 +165,8 @@ export interface ControllerOptions {
   steerTimeoutMs?: number
   /** Pause-file path; default .autodev/PAUSE */
   pauseFilePath?: string
+  /** B3a: timeout ms for ctx.ui.select / ctx.ui.input dialogues. Default: 300000 (5 min). */
+  dialogueTimeoutMs?: number
   /** Optional RetroWriter for post-run retro (injected for test isolation) */
   retroWriter?: RetroWriter
   /** Optional memory backends — wired at entry; consumed by P1 and retro. */
@@ -190,34 +192,43 @@ export interface ParsedOverrides {
   idea: string
   forcedTier?: ComplexityTier
   taskType: string
+  /** B3a: true when a `step:` prefix was present — enables phase-by-phase gate. */
+  phaseByPhase: boolean
 }
 
 /**
- * Strip up to two known leading prefixes from a raw idea string.
+ * Strip up to three known leading prefixes from a raw idea string.
  * quick/mid/full → sets forcedTier; build/debug/refactor → sets taskType (default 'build').
- * Only KNOWN leading tokens matched by the regex `^(quick|mid|full|build|debug|refactor)\s*:\s*` (case-insensitive) are stripped.
+ * step: → sets phaseByPhase=true (does NOT set taskType or forcedTier).
+ * Only KNOWN leading tokens matched by the regex
+ * `^(quick|mid|full|build|debug|refactor|step)\s*:\s*` (case-insensitive) are stripped.
  * Mid-sentence colons are untouched.
  */
 export function parseOverrides(raw: string): ParsedOverrides {
   let idea = raw
   let forcedTier: ComplexityTier | undefined
   let taskType = 'build'
-  const PREFIX_RE = /^(quick|mid|full|build|debug|refactor)\s*:\s*/i
+  let phaseByPhase = false
+  const PREFIX_RE = /^(quick|mid|full|build|debug|refactor|step)\s*:\s*/i
 
-  for (let i = 0; i < 2; i++) {
+  for (let i = 0; i < 3; i++) {
     const m = PREFIX_RE.exec(idea)
     if (!m) break
     const token = m[1].toLowerCase()
     idea = idea.slice(m[0].length)
-    const tier = tierFromOverride(token)
-    if (tier !== null) {
-      forcedTier = tier
-    } else if (TASK_TYPE_PREFIXES.has(token)) {
-      taskType = token
+    if (token === 'step') {
+      phaseByPhase = true
+    } else {
+      const tier = tierFromOverride(token)
+      if (tier !== null) {
+        forcedTier = tier
+      } else if (TASK_TYPE_PREFIXES.has(token)) {
+        taskType = token
+      }
     }
   }
 
-  return { idea, forcedTier, taskType }
+  return { idea, forcedTier, taskType, phaseByPhase }
 }
 
 // ── Controller ────────────────────────────────────────────────────────────────
@@ -255,6 +266,8 @@ export class Controller {
   private currentRunId = ''
   /** Fix #1: set true after the first terminal store so _escalate cannot double-store. */
   private _terminalStored = false
+  /** B3a: true when a `step:` prefix was seen — enables phase-by-phase gate in _runPhases. */
+  private phaseByPhase = false
 
   constructor(
     private readonly pi: ExtensionAPI,
@@ -345,6 +358,7 @@ export class Controller {
           repoRoot: this.repoRoot,
           activeProject: activeProject ?? '(none)',
           gear: this.currentGear ?? 'full',
+          phaseByPhase: this.phaseByPhase,
         }
         ctx.ui.notify(JSON.stringify(status, null, 2), 'info')
       },
@@ -560,6 +574,8 @@ export class Controller {
     this.currentIdea = idea
     this.currentForcedTier = parsed.forcedTier
     this.currentTaskType = parsed.taskType
+    // B3a: phase-by-phase mode from step: prefix
+    this.phaseByPhase = parsed.phaseByPhase
     // B2: derive gear from forced tier (undefined when no prefix → full path auto)
     this.currentGear = gearFromForced(parsed.forcedTier)
     void this.journal.write({
@@ -726,6 +742,8 @@ export class Controller {
       // ── Run-start: default tier M (or forced tier from prefix override) ──────
       this.currentRunId = `run-${crypto.randomUUID()}`
       this._terminalStored = false // Fix #1: reset per-run so consecutive runs don't share state
+      // B3a: phaseByPhase already set from _onInput (parsed.phaseByPhase); reset adjust counters
+      // per-phase adjust counters are local vars in the phase blocks, no instance field needed
       const pi = this.pi as unknown as { setThinkingLevel?: (level: string) => void }
       if (this.currentForcedTier) {
         // B1: forced tier from quick:/mid:/full: prefix — use directly, skip rescore later
@@ -799,6 +817,25 @@ export class Controller {
         void this.journal.write({ type: 'decision', phase: this.fsm.getPhase(), action: 'compaction skipped: 45s timeout' })
       })
       await this.fsm.advance()
+
+      // B3a: phase-by-phase gate after P1 (forward edge; no-op when phaseByPhase=false)
+      if (this.phaseByPhase) {
+        const g = await this._runPhaseGate('P1', ctx, async (note) => {
+          const r = new P1Discover(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
+          const res = await r.execute({
+            phase: 'P1', idea: this.currentIdea, sizing: this.currentSizing,
+            memoryStore: this.opts.memoryStore, embedder: this.opts.embedder,
+            screenContent: this.opts.securityLane ? (t, s) => this.opts.securityLane!.screenContent(t, s) : undefined,
+          })
+          if (!res.ok || !res.output) { await this._escalate('P1', res.reason ?? 'P1 re-run failed'); return false }
+          this.phaseStore.p1 = res.output
+          if (note) await this.journal.write({ type: 'decision', phase: 'P1', action: `adjust note: ${note.slice(0, 200)}` })
+          return true
+        })
+        if (g === 'stop') { await this._operatorBrief('P1', 'phase-by-phase: human chose stop'); return }
+        if (g === 'escalated') return
+      }
+
       this.opts.transparency.setHudStatus('P2', this.currentIdea.slice(0, 60), 'running', 'opus')
 
       // ── P2 ELABORATE ─────────────────────────────────────────────────────
@@ -818,6 +855,21 @@ export class Controller {
         void this.journal.write({ type: 'decision', phase: this.fsm.getPhase(), action: 'compaction skipped: 45s timeout' })
       })
       await this.fsm.advance()
+
+      // B3a: phase-by-phase gate after P2
+      if (this.phaseByPhase) {
+        const g = await this._runPhaseGate('P2', ctx, async (note) => {
+          const r = new P2Elaborate(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
+          const res = await r.execute({ phase: 'P2', p1: this.phaseStore.p1!, sizing: this.currentSizing })
+          if (!res.ok || !res.output) { await this._escalate('P2', res.reason ?? 'P2 re-run failed'); return false }
+          this.phaseStore.p2 = res.output
+          if (note) await this.journal.write({ type: 'decision', phase: 'P2', action: `adjust note: ${note.slice(0, 200)}` })
+          return true
+        })
+        if (g === 'stop') { await this._operatorBrief('P2', 'phase-by-phase: human chose stop'); return }
+        if (g === 'escalated') return
+      }
+
       this.opts.transparency.setHudStatus('P3', this.currentIdea.slice(0, 60), 'running', 'opus')
 
       // ── P3 PLAN ──────────────────────────────────────────────────────────
@@ -849,6 +901,26 @@ export class Controller {
         void this.journal.write({ type: 'decision', phase: this.fsm.getPhase(), action: 'compaction skipped: 45s timeout' })
       })
       await this.fsm.advance()
+
+      // B3a: phase-by-phase gate after P3
+      if (this.phaseByPhase) {
+        const g = await this._runPhaseGate('P3', ctx, async (note) => {
+          const r = new P3Plan(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
+          const res = await r.execute({ phase: 'P3', p1: this.phaseStore.p1!, p2: this.phaseStore.p2!, sizing: this.currentSizing })
+          if (!res.ok || !res.output) {
+            const f = res as { ok: false; reason?: string; operatorBrief?: unknown }
+            const brief = f.operatorBrief ? JSON.stringify(f.operatorBrief, null, 2) : undefined
+            if (brief) { await this._operatorBrief('P3', brief) } else { await this._escalate('P3', f.reason ?? 'P3 re-run failed') }
+            return false
+          }
+          this.phaseStore.p3 = res.output
+          if (note) await this.journal.write({ type: 'decision', phase: 'P3', action: `adjust note: ${note.slice(0, 200)}` })
+          return true
+        })
+        if (g === 'stop') { await this._operatorBrief('P3', 'phase-by-phase: human chose stop'); return }
+        if (g === 'escalated') return
+      }
+
       this.opts.transparency.setHudStatus('P4', this.currentIdea.slice(0, 60), 'running', 'opus')
 
       // ── P4 BUILD ─────────────────────────────────────────────────────────
@@ -868,6 +940,21 @@ export class Controller {
         void this.journal.write({ type: 'decision', phase: this.fsm.getPhase(), action: 'compaction skipped: 45s timeout' })
       })
       await this.fsm.advance()
+
+      // B3a: phase-by-phase gate after P4
+      if (this.phaseByPhase) {
+        const g = await this._runPhaseGate('P4', ctx, async (note) => {
+          const r = new P4Build(this.hostAgent, this.outputDir, this.subagentDriver, this.opts.steerTimeoutMs)
+          const res = await r.execute({ phase: 'P4', p3: this.phaseStore.p3!, sizing: this.currentSizing, repoRoot: this.repoRoot })
+          if (!res.ok || !res.output) { await this._escalate('P4', res.reason ?? 'P4 re-run failed'); return false }
+          this.phaseStore.p4 = res.output
+          if (note) await this.journal.write({ type: 'decision', phase: 'P4', action: `adjust note: ${note.slice(0, 200)}` })
+          return true
+        })
+        if (g === 'stop') { await this._operatorBrief('P4', 'phase-by-phase: human chose stop'); return }
+        if (g === 'escalated') return
+      }
+
       this.opts.transparency.setHudStatus('P5', this.currentIdea.slice(0, 60), 'running', 'opus')
 
       // ── P5 VERIFY ────────────────────────────────────────────────────────
@@ -929,6 +1016,21 @@ export class Controller {
         void this.journal.write({ type: 'decision', phase: this.fsm.getPhase(), action: 'compaction skipped: 45s timeout' })
       })
       await this.fsm.advance()
+
+      // B3a: phase-by-phase gate after P5 (forward path only; H9 backedge branch above has no gate)
+      if (this.phaseByPhase) {
+        const g = await this._runPhaseGate('P5', ctx, async (note) => {
+          const r = new P5Verify(this.hostAgent, this.outputDir, this.opts.verifier, this.opts.judge, this.repoRoot, this.opts.steerTimeoutMs)
+          const res = await r.execute({ phase: 'P5', p3: this.phaseStore.p3!, p4: this.phaseStore.p4!, sizing: this.currentSizing, repoRoot: this.repoRoot })
+          if (!res.ok || !res.output) { await this._escalate('P5', res.reason ?? 'P5 re-run failed'); return false }
+          this.phaseStore.p5 = res.output
+          if (note) await this.journal.write({ type: 'decision', phase: 'P5', action: `adjust note: ${note.slice(0, 200)}` })
+          return true
+        })
+        if (g === 'stop') { await this._operatorBrief('P5', 'phase-by-phase: human chose stop'); return }
+        if (g === 'escalated') return
+      }
+
       this.opts.transparency.setHudStatus('P6', this.currentIdea.slice(0, 60), 'running', 'opus')
 
       // ── P6 RELEASE ───────────────────────────────────────────────────────
@@ -1637,6 +1739,84 @@ export class Controller {
     const irreversibility = irrevHigh.test(spec) ? 'high' : irrevMed.test(spec) ? 'med' : 'low'
 
     return { files, novelty, blastRadius, irreversibility }
+  }
+
+  // ── B3a: phase gate ───────────────────────────────────────────────────────────
+
+  /**
+   * Ask the human what to do after a phase completes (B3a phase-by-phase mode).
+   *
+   * Guard: only called when this.phaseByPhase === true.
+   * If !ctx.hasUI → return 'continue' immediately (autonomous fallback; no UI to ask on).
+   * Otherwise calls ctx.ui.select with a bounded timeout.
+   * timeout/cancel (undefined) → degrade to 'continue'.
+   * Unknown values → degrade to 'continue'.
+   */
+  private async _phaseGate(
+    phaseName: string,
+    ctx: ExtensionContext
+  ): Promise<'continue' | 'adjust' | 'stop'> {
+    const ctxAny = ctx as unknown as { hasUI?: boolean }
+    if (!ctxAny.hasUI) return 'continue'
+
+    const uiAny = ctx.ui as unknown as {
+      select?(title: string, options: string[], opts: { timeout: number }): Promise<string | undefined>
+    }
+    if (typeof uiAny.select !== 'function') return 'continue'
+
+    const choice = await uiAny.select(
+      `autodev — ${phaseName} complete. Proceed?`,
+      ['continue', 'adjust', 'stop'],
+      { timeout: this.opts.dialogueTimeoutMs ?? 300_000 }
+    )
+    if (choice === undefined) return 'continue'
+    if (choice === 'continue' || choice === 'adjust' || choice === 'stop') return choice
+    return 'continue' // unknown → safe default
+  }
+
+  /**
+   * B3a: phase-by-phase gate with adjust re-run loop, capped at MAX_ADJUST_PER_PHASE=3.
+   * Called on each FORWARD phase boundary when this.phaseByPhase===true.
+   * rerunPhase: async fn that re-executes the phase; receives optional human note.
+   *   Returns true on success, false if it already called _escalate/_operatorBrief internally.
+   * Returns 'continue' | 'stop' | 'escalated'.
+   * 'escalated' means rerunPhase returned false — caller must `return` immediately.
+   */
+  private async _runPhaseGate(
+    phaseName: string,
+    ctx: ExtensionContext,
+    rerunPhase: (note: string | undefined) => Promise<boolean>
+  ): Promise<'continue' | 'stop' | 'escalated'> {
+    const MAX_ADJUST = 3
+    let adjustCount = 0
+    let decision = await this._phaseGate(phaseName, ctx)
+
+    while (decision === 'adjust') {
+      if (adjustCount >= MAX_ADJUST) {
+        await this.journal.write({ type: 'decision', phase: phaseName, action: 'adjust limit reached, continuing' })
+        break
+      }
+      adjustCount++
+
+      // Optionally collect a note via ctx.ui.input (if available)
+      const uiAny = ctx.ui as unknown as {
+        input?(title: string, placeholder: string): Promise<string | undefined>
+      }
+      const note = typeof uiAny.input === 'function'
+        ? await uiAny.input('What to adjust?', '')
+        : undefined
+
+      // Backedge FSM to phase, re-run it, then advance back
+      await this.fsm.backedge(phaseName as Parameters<FSM['backedge']>[0])
+      const ok = await rerunPhase(note)
+      if (!ok) return 'escalated'
+      await this.fsm.advance()
+
+      decision = await this._phaseGate(phaseName, ctx)
+    }
+
+    if (decision === 'stop') return 'stop'
+    return 'continue'
   }
 
   /**

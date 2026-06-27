@@ -2288,10 +2288,13 @@ describe('B1 Task5: _parseOverrides — prefix parsing (unit via exported helper
     expect(result.forcedTier).toBe('XS')
   })
 
-  it('only two prefix strips maximum', () => {
-    // Third prefix is not stripped — becomes part of the idea
-    const result = parseOverrides('quick: build: debug: something')
+  it('only three prefix strips maximum (cap=3; 4th prefix stays in idea)', () => {
+    // Cap raised from 2→3 for B3a (step: + two tier/task-type prefixes).
+    // With quick: build: debug:, all three are stripped (new cap).
+    // A 4th token is not stripped and remains part of the idea.
+    const result = parseOverrides('step: quick: build: debug: something')
     expect(result.idea).toBe('debug: something')
+    expect(result.phaseByPhase).toBe(true)
     expect(result.forcedTier).toBe('XS')
     expect(result.taskType).toBe('build')
   })
