@@ -3,7 +3,8 @@
 // The controller reads + schema-validates these files; the next phase's PhaseContext
 // is derived from the prior phase's PhaseOutput.
 
-import type { Sizing } from '../engine/complexity.js'
+import type { Sizing, ComplexityInput } from '../engine/complexity.js'
+import { isValidComplexityInput } from '../engine/complexity.js'
 import type { MemoryStore, Embedder } from '../ports.js'
 
 // ── P1 DISCOVER ───────────────────────────────────────────────────────────────
@@ -19,6 +20,8 @@ export interface P1Output {
   spec: string
   stackAdr: string
   webResearch: WebResearchEntry[]
+  /** Host-LLM self-assessment of complexity (B1). Optional — absent ⇒ controller falls back to keyword heuristic. */
+  complexity?: ComplexityInput & { rationale?: string }
 }
 
 export interface P1Context {
@@ -175,12 +178,24 @@ export type PhaseContext = P1Context | P2Context | P3Context | P4Context | P5Con
 export function validateP1Output(raw: unknown): raw is P1Output {
   if (!raw || typeof raw !== 'object') return false
   const o = raw as Record<string, unknown>
-  return (
-    o['phase'] === 'P1' &&
-    typeof o['spec'] === 'string' &&
-    typeof o['stackAdr'] === 'string' &&
-    Array.isArray(o['webResearch'])
-  )
+  if (
+    o['phase'] !== 'P1' ||
+    typeof o['spec'] !== 'string' ||
+    typeof o['stackAdr'] !== 'string' ||
+    !Array.isArray(o['webResearch'])
+  ) return false
+  // B1: complexity is optional. If present and valid, keep it (plus rationale if a string).
+  // If malformed or absent, drop it — NEVER hard-fail the whole P1 output.
+  if ('complexity' in o) {
+    const c = o['complexity']
+    if (isValidComplexityInput(c)) {
+      // Keep complexity as-is; rationale passthrough is automatic (it's just a property on the object)
+    } else {
+      // Silently drop malformed complexity
+      delete o['complexity']
+    }
+  }
+  return true
 }
 
 export function validateP2Output(raw: unknown): raw is P2Output {

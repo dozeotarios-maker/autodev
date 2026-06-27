@@ -14,6 +14,7 @@ import { P3Plan } from '../../src/phases/p3-plan.js'
 import { wrapUntrusted } from '../../src/phases/safe-prompt.js'
 import type { HostAgent } from '../../src/host/host-agent.js'
 import type { P1Context, P2Context, P3Context } from '../../src/phases/phase-output.js'
+import { validateP1Output } from '../../src/phases/phase-output.js'
 import { tierSizing } from '../../src/engine/complexity.js'
 
 // ── Mock HostAgent factory ────────────────────────────────────────────────────
@@ -993,5 +994,71 @@ describe('Fix #5: line-boundary cap — truncated block has no partial trailing 
       const value = line.slice(2) // remove "- "
       expect(value).toMatch(new RegExp(`^${longValue}-\\d$`))
     }
+  })
+})
+
+// ── B1 Task 2: P1Output optional complexity field + validator back-compat ─────
+
+describe('B1 Task2: validateP1Output — optional complexity field', () => {
+  it('P1 output without complexity validates (back-compat)', () => {
+    const raw = {
+      phase: 'P1',
+      spec: 'A comprehensive spec for a REST API with full CRUD operations',
+      stackAdr: 'Node.js + Express chosen for performance and ecosystem',
+      webResearch: [],
+    }
+    expect(validateP1Output(raw)).toBe(true)
+  })
+
+  it('P1 output with valid complexity validates and retains the field', () => {
+    const raw = {
+      phase: 'P1',
+      spec: 'A comprehensive spec for a REST API with full CRUD operations',
+      stackAdr: 'Node.js + Express chosen for performance and ecosystem',
+      webResearch: [],
+      complexity: { files: 1, novelty: 'low', blastRadius: 1, irreversibility: 'low', rationale: 'single utility function' },
+    }
+    expect(validateP1Output(raw)).toBe(true)
+    // complexity must be retained on the validated object
+    const out = raw as Record<string, unknown>
+    expect(out['complexity']).toBeDefined()
+  })
+
+  it('P1 output with valid complexity (no rationale) validates', () => {
+    const raw = {
+      phase: 'P1',
+      spec: 'A comprehensive spec for a REST API with full CRUD operations',
+      stackAdr: 'Node.js + Express chosen for performance and ecosystem',
+      webResearch: [],
+      complexity: { files: 3, novelty: 'med', blastRadius: 2, irreversibility: 'low' },
+    }
+    expect(validateP1Output(raw)).toBe(true)
+  })
+
+  it('P1 output with malformed complexity still validates — complexity silently dropped, never hard-fails', () => {
+    const raw = {
+      phase: 'P1',
+      spec: 'A comprehensive spec for a REST API with full CRUD operations',
+      stackAdr: 'Node.js + Express chosen for performance and ecosystem',
+      webResearch: [],
+      complexity: { files: 0, novelty: 'huge', blastRadius: 99, irreversibility: 'unknown' },
+    }
+    expect(validateP1Output(raw)).toBe(true)
+  })
+
+  it('P1 output with null complexity still validates', () => {
+    const raw = {
+      phase: 'P1',
+      spec: 'A comprehensive spec for a REST API with full CRUD operations',
+      stackAdr: 'Node.js + Express chosen for performance and ecosystem',
+      webResearch: [],
+      complexity: null,
+    }
+    expect(validateP1Output(raw)).toBe(true)
+  })
+
+  it('P1 output missing spec still fails (existing gate unchanged)', () => {
+    const raw = { phase: 'P1', stackAdr: 'Node.js + Express', webResearch: [] }
+    expect(validateP1Output(raw)).toBe(false)
   })
 })
