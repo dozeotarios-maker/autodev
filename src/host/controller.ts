@@ -50,23 +50,78 @@ import type { ProjectRegistry } from '../project/registry.js'
 
 // ── compactAsync ─────────────────────────────────────────────────────────────
 
+/** Default compaction timeout (ms). Overridable for tests. */
+export const COMPACT_TIMEOUT_MS = 45_000
+
+/** Context-usage threshold above which compaction is triggered (0–1). */
+const COMPACT_USAGE_THRESHOLD = 0.7
+
 /**
- * Promise wrapper over ctx.compact({ onComplete, onError }).
+ * Decide whether the context actually needs compaction.
+ *
+ * Strategy: use ctx.getContextUsage() (available on ExtensionContext since pi
+ * updated its API). If usage.percent is available, skip unless >= threshold.
+ * If usage is unknown (returns undefined / null percent), allow compaction —
+ * i.e. fail-open so we don't skip when we can't tell.
+ */
+export function shouldCompact(ctx: ExtensionContext): boolean {
+  const usage = (ctx as unknown as { getContextUsage?: () => { percent: number | null } | undefined }).getContextUsage?.()
+  if (!usage) return true // unknown — allow
+  if (usage.percent === null || usage.percent === undefined) return true // unknown — allow
+  return usage.percent >= COMPACT_USAGE_THRESHOLD
+}
+
+/**
+ * Promise wrapper over ctx.compact({ onComplete, onError }) with:
+ *   - Conditional: skips unless shouldCompact() says the context is near-full.
+ *   - Timeout: races compact against timeoutMs (default COMPACT_TIMEOUT_MS).
+ *     On timeout → resolves (skip, log), never hangs.
+ *   - Double-settle guard: late onComplete/onError after timeout are no-ops.
+ *
  * The controller MUST await this before the next steer — otherwise the next
  * message lands in a pre-compaction context.
  */
-export function compactAsync(ctx: ExtensionContext): Promise<void> {
+export function compactAsync(
+  ctx: ExtensionContext,
+  timeoutMs: number = COMPACT_TIMEOUT_MS
+): Promise<void> {
+  // Conditional: skip when context is not near the limit
+  if (!shouldCompact(ctx)) {
+    return Promise.resolve()
+  }
+
   return new Promise<void>((resolve, reject) => {
+    let settled = false
+    const settle = (fn: () => void) => {
+      if (settled) return // double-settle guard
+      settled = true
+      fn()
+    }
+
+    // Timeout race: resolve (skip) after timeoutMs — never escalate, never hang
+    const timer = setTimeout(() => {
+      settle(() => {
+        // Log via console since we have no journal reference here; callers can
+        // observe this via the resolve path (no error thrown).
+        console.warn('[pi-autodev] compaction skipped: timeout')
+        resolve()
+      })
+    }, timeoutMs)
+
     ctx.compact({
-      onComplete: () => resolve(),
+      onComplete: () => {
+        clearTimeout(timer)
+        settle(() => resolve())
+      },
       onError: (err: Error) => {
+        clearTimeout(timer)
         // "Nothing to compact" on a small session at a phase boundary is benign — skip it.
         // "Already compacted" fires on back-to-back zero-work compaction at phase boundaries
         // (the session hasn't grown since the last compaction). Also benign — skip it.
         if (/nothing to compact|too small|already compacted/i.test(err.message)) {
-          resolve()
+          settle(() => resolve())
         } else {
-          reject(err)
+          settle(() => reject(err))
         }
       },
     })

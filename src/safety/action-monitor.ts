@@ -46,6 +46,68 @@ const EGRESS_SUFFIX = new Set([
 
 const DEFAULT_PROTECTED_PATHS = ['/root/.openclaw']
 
+// ── Safe write zones ──────────────────────────────────────────────────────────
+//
+// Paths that are ALWAYS allowed as write targets, even outside repoRoot.
+// These are either virtual devices (/dev/null, /dev/stdout …) or the OS temp
+// dir (/tmp on Linux, TMPDIR elsewhere). Blocking them breaks normal builds
+// (e.g. `cmd 2>/dev/null`, `npm install 2>/tmp/npm.log`).
+//
+// Checked BEFORE the allowedPaths confinement gate in both checkFileWrite and
+// checkBashCommand. They do NOT bypass the protectedPaths denylist — a write
+// to /root/.openclaw is still blocked even if someone names it /dev/null.
+
+const SAFE_WRITE_ZONES: Array<string | { prefix: string }> = [
+  '/dev/null',
+  '/dev/stdout',
+  '/dev/stderr',
+  '/dev/zero',
+  '/dev/tty',
+  { prefix: '/dev/fd/' },
+  // On Linux, /dev/stdout → /proc/self/fd/1, /dev/stderr → /proc/self/fd/2, etc.
+  // realpathSafe resolves symlinks, so we need to cover the real targets too.
+  { prefix: '/proc/self/fd/' },
+  // '/tmp' is the canonical Unix temp dir — always a safe write destination.
+  // Listed explicitly so `> /tmp/x.log` is allowed even when os.tmpdir() differs
+  // (e.g. in containers or restricted environments where TMPDIR is remapped).
+  '/tmp',
+  // os.tmpdir() at module load — covers the runtime TMPDIR (may differ from /tmp).
+  os.tmpdir(),
+]
+
+/**
+ * Returns true when the given path is inside a safe write zone.
+ *
+ * Strategy: check BOTH the raw path and the realpath'd value, but with different
+ * semantics for /dev/* vs directory-based zones:
+ *   - /dev/* zones: checked against the RAW path (before symlink resolution) because
+ *     /dev/stdout may resolve to a process-specific path (e.g. a temp file) in some
+ *     environments, but it is always semantically safe.
+ *   - Directory-based zones (os.tmpdir()): checked against the REAL path only, so
+ *     symlinks that happen to live under /tmp but point outside allowed dirs are
+ *     correctly handled by the realpath.
+ *   - /proc/self/fd/* prefix: checked against realPath (covers Linux fd resolution).
+ */
+function isInSafeWriteZone(rawPath: string, realPath: string): boolean {
+  for (const zone of SAFE_WRITE_ZONES) {
+    if (typeof zone === 'string') {
+      // String zone: /dev/null, /dev/stdout, /dev/stderr, /dev/zero, /dev/tty, os.tmpdir().
+      // For /dev/* entries: check raw path (device paths are semantically safe regardless of resolution).
+      // For others (tmpdir): check realPath (symlink-dereferenced, correct confinement).
+      const checkRaw = zone.startsWith('/dev/')
+      const candidate = checkRaw ? rawPath : realPath
+      if (candidate === zone || candidate.startsWith(zone + path.sep)) return true
+    } else {
+      // Prefix zone: /dev/fd/, /proc/self/fd/.
+      // /dev/fd/* — check raw path. /proc/self/fd/* — check real path.
+      const checkRaw = zone.prefix.startsWith('/dev/')
+      const candidate = checkRaw ? rawPath : realPath
+      if (candidate.startsWith(zone.prefix)) return true
+    }
+  }
+  return false
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
@@ -278,9 +340,13 @@ export class ActionMonitor {
     if (this.allowedPaths.length > 0) {
       const absTarget = _extractBashWriteTarget(cmd)
       if (absTarget !== undefined) {
-        const check = this.checkFileWrite(absTarget)
-        if (!check.allowed) {
-          return { allowed: false, reason: `Bash absolute-path write escape blocked: ${absTarget}` }
+        // Safe write zones bypass the allowedPaths confinement check (same logic as checkFileWrite).
+        const r = realpathSafe(absTarget)
+        if (!isInSafeWriteZone(absTarget, r)) {
+          const check = this.checkFileWrite(absTarget)
+          if (!check.allowed) {
+            return { allowed: false, reason: `Bash absolute-path write escape blocked: ${absTarget}` }
+          }
         }
       }
     }
@@ -297,6 +363,9 @@ export class ActionMonitor {
         return { allowed: false, reason: `Write to protected path (main pipeline) blocked: ${filePath}` }
       }
     }
+    // Safe write zones: always allowed even outside repoRoot (e.g. /dev/null, /tmp).
+    // Checked AFTER protectedPaths denylist so a renamed protected path can't slip through.
+    if (isInSafeWriteZone(filePath, r)) return { allowed: true }
     if (this.allowedPaths.length === 0) return { allowed: true }
     // Resolve allowedPaths to absolute before comparing so repoRoot-relative confinement works
     const ok = this.allowedPaths.some(p => {

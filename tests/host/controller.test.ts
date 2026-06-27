@@ -8,7 +8,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
-import { Controller, compactAsync } from '../../src/host/controller.js'
+import { Controller, compactAsync, shouldCompact, COMPACT_TIMEOUT_MS } from '../../src/host/controller.js'
 import type { ControllerOptions } from '../../src/host/controller.js'
 import type {
   ExtensionAPI,
@@ -1990,5 +1990,124 @@ describe('CONTRACT: pi SDK InputSource union includes "extension" (self-steer fi
     const legalSources: InputSource[] = ['interactive', 'rpc', 'extension']
     expect(legalSources).not.toContain('user')
     expect(legalSources).toHaveLength(3)
+  })
+})
+
+// ── A1: compactAsync timeout + shouldCompact ──────────────────────────────────
+
+describe('A1: compactAsync — timeout never hangs + double-settle guard', () => {
+  it('compact that never settles resolves after timeout (fake timers)', async () => {
+    vi.useFakeTimers()
+    try {
+      const ctx = {
+        getContextUsage: () => ({ tokens: 90000, contextWindow: 100000, percent: 0.9 }),
+        compact: vi.fn(), // never calls onComplete or onError
+      } as unknown as ExtensionContext
+
+      const p = compactAsync(ctx, 100)
+      // Advance past the timeout
+      await vi.advanceTimersByTimeAsync(200)
+      await p // must resolve, not hang
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('compact that never settles → resolves (not rejects) on timeout', async () => {
+    vi.useFakeTimers()
+    try {
+      const ctx = {
+        getContextUsage: () => ({ tokens: 90000, contextWindow: 100000, percent: 0.9 }),
+        compact: vi.fn(),
+      } as unknown as ExtensionContext
+
+      let resolved = false
+      let rejected = false
+      const p = compactAsync(ctx, 50).then(() => { resolved = true }).catch(() => { rejected = true })
+      await vi.advanceTimersByTimeAsync(100)
+      await p
+      expect(resolved).toBe(true)
+      expect(rejected).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('late onComplete after timeout is a no-op (double-settle guard)', async () => {
+    vi.useFakeTimers()
+    try {
+      let capturedOnComplete: (() => void) | undefined
+      const ctx = {
+        getContextUsage: () => ({ percent: 0.9 }),
+        compact: vi.fn(({ onComplete }: { onComplete: () => void }) => {
+          capturedOnComplete = onComplete
+          // Don't call onComplete immediately — simulate a late fire
+        }),
+      } as unknown as ExtensionContext
+
+      let settleCount = 0
+      const p = compactAsync(ctx, 50).then(() => settleCount++)
+      await vi.advanceTimersByTimeAsync(100) // timeout fires → resolve #1
+      await p
+      expect(settleCount).toBe(1)
+
+      // Now fire the late onComplete — must be a no-op (no second resolve/throw)
+      capturedOnComplete?.()
+      await Promise.resolve()
+      expect(settleCount).toBe(1) // still 1, not 2
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('A1: shouldCompact — skips low-usage, runs high-usage', () => {
+  it('low usage (percent=0.3) → shouldCompact returns false', () => {
+    const ctx = {
+      getContextUsage: () => ({ tokens: 30000, contextWindow: 100000, percent: 0.3 }),
+    } as unknown as ExtensionContext
+    expect(shouldCompact(ctx)).toBe(false)
+  })
+
+  it('high usage (percent=0.8) → shouldCompact returns true', () => {
+    const ctx = {
+      getContextUsage: () => ({ tokens: 80000, contextWindow: 100000, percent: 0.8 }),
+    } as unknown as ExtensionContext
+    expect(shouldCompact(ctx)).toBe(true)
+  })
+
+  it('exact threshold (percent=0.7) → shouldCompact returns true', () => {
+    const ctx = {
+      getContextUsage: () => ({ percent: 0.7 }),
+    } as unknown as ExtensionContext
+    expect(shouldCompact(ctx)).toBe(true)
+  })
+
+  it('unknown usage (getContextUsage returns undefined) → shouldCompact returns true (fail-open)', () => {
+    const ctx = {
+      getContextUsage: () => undefined,
+    } as unknown as ExtensionContext
+    expect(shouldCompact(ctx)).toBe(true)
+  })
+
+  it('null percent → shouldCompact returns true (fail-open)', () => {
+    const ctx = {
+      getContextUsage: () => ({ tokens: null, contextWindow: 100000, percent: null }),
+    } as unknown as ExtensionContext
+    expect(shouldCompact(ctx)).toBe(true)
+  })
+
+  it('low usage → compactAsync skips (compact not called)', async () => {
+    const compactFn = vi.fn()
+    const ctx = {
+      getContextUsage: () => ({ percent: 0.3 }),
+      compact: compactFn,
+    } as unknown as ExtensionContext
+    await compactAsync(ctx)
+    expect(compactFn).not.toHaveBeenCalled()
+  })
+
+  it('COMPACT_TIMEOUT_MS is exported and positive', () => {
+    expect(COMPACT_TIMEOUT_MS).toBeGreaterThan(0)
   })
 })

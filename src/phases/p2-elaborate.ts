@@ -18,12 +18,16 @@ const ROLE_DIRECTIVES = `
 ## Role: Elaboration Agent (P2)
 You are the P2 ELABORATE phase. Your job:
 1. Build a domain model from the spec (entities, relationships, invariants).
-2. Run a persona debate: use the subagent tool to spawn persona agents.
-   Each persona critiques the domain model from their perspective.
-3. Collect all objections; synthesise them into the personaDebate array.
+2. Run a persona debate: synthesise objections from each persona's viewpoint.
+3. Collect all objections; populate the personaDebate array.
 `.trim()
 
 const ALL_PERSONAS = ['user', 'developer', 'security', 'ops', 'product-manager']
+
+// Note: persona names (user/developer/security/ops/product-manager) are NOT valid
+// pi-subagent agent types. Host-self-synthesis is the designed path: the host LLM
+// acts as each persona in turn and collects their objections internally.
+// This avoids "Unknown agent" errors while producing equivalent debate quality.
 
 export function buildP2Instruction(ctx: P2Context, outputFile: string): string {
   const sizing = ctx.sizing ?? DEFAULT_SIZING
@@ -37,19 +41,12 @@ export function buildP2Instruction(ctx: P2Context, outputFile: string): string {
         'Panel skipped (XS tier — panelPersonas=0). Set personaDebate to [].',
       ]
     : [
-        `## Persona panel (run as parallel subagents, ${Math.min(panelPersonas, ALL_PERSONAS.length)} personas)`,
-        'Call the `subagent` tool with:',
-        '```json',
-        JSON.stringify({
-          tasks: personas.map((p, i) => ({
-            index: i,
-            agent: p,
-            task: `Review this domain model as a ${p} and list your top 3 objections or concerns.\n${wrapUntrusted(ctx.p1.spec)}`,
-          })),
-          concurrency: panelPersonas,
-          worktree: false,
-        }, null, 2),
-        '```',
+        `## Persona debate (host-synthesised, ${Math.min(panelPersonas, ALL_PERSONAS.length)} personas)`,
+        `For each of the following personas, adopt that perspective and list their top 3 objections or concerns about the domain model:`,
+        personas.map(p => `- **${p}**: Act as a ${p}. From that lens, what are your top 3 objections?`).join('\n'),
+        '',
+        'Synthesise all objections into the personaDebate array in the output JSON.',
+        '(Do NOT use the subagent tool for this — persona names are not valid subagent types.)',
       ]
 
   return [

@@ -203,21 +203,25 @@ describe('S2-M3a: P2Elaborate', () => {
     expect(result.ok).toBe(true)
     const { prompt, expectFile } = steerCalls[0]
     expect(prompt).toContain('P2 ELABORATE')
-    expect(prompt).toContain('subagent')
+    // A3 fix: host-synthesis path — no invalid subagent agent types
+    expect(prompt).toContain('persona')
     expect(prompt).toContain('p2-domain.json')
     expect(expectFile).toContain('p2-domain.json')
   })
 
-  it('buildP2Instruction contains persona panel instruction', () => {
+  it('buildP2Instruction contains persona panel instruction (host-synthesised, no invalid subagent types)', () => {
     const ctx = makeP2Context()
     const instruction = buildP2Instruction(ctx, '/tmp/p2-domain.json')
-    expect(instruction).toContain('subagent')
+    // A3 fix: personas are listed for host-synthesis, not dispatched as invalid subagent types
     expect(instruction).toContain('user')
     expect(instruction).toContain('security')
     expect(instruction).toContain('/tmp/p2-domain.json')
+    // Must NOT tell host to spawn persona names as subagent agent types (causes "Unknown agent" error)
+    expect(instruction).not.toMatch(/"agent":\s*"user"/)
+    expect(instruction).not.toMatch(/"agent":\s*"developer"/)
   })
 
-  it('P2 panel runs as parallel subagents (instruction contains subagent tool call)', async () => {
+  it('P2 panel instruction uses host-synthesis (no invalid subagent agent type dispatch)', async () => {
     const { agent, steerCalls } = makeMockHostAgent(async (expectFile) => {
       await fs.mkdir(path.dirname(expectFile), { recursive: true })
       await fs.writeFile(expectFile, JSON.stringify({
@@ -233,9 +237,13 @@ describe('S2-M3a: P2Elaborate', () => {
     const p2 = new P2Elaborate(agent, tmpDir)
     await p2.execute(makeP2Context())
 
-    // The instruction should instruct the host to use the subagent tool
-    expect(steerCalls[0].prompt).toContain('subagent')
-    expect(steerCalls[0].prompt).toContain('concurrency')
+    // A3 fix: host-synthesis — prompt must NOT contain subagent JSON with persona agent types
+    const prompt = steerCalls[0].prompt
+    expect(prompt).not.toMatch(/"agent":\s*"user"/)
+    expect(prompt).not.toMatch(/"agent":\s*"security"/)
+    // Personas ARE listed for the host to adopt each perspective
+    expect(prompt).toContain('developer')
+    expect(prompt).toContain('security')
   })
 
   it('gate fails when domainModel is empty', async () => {
@@ -336,8 +344,12 @@ describe('S2-M3a: P3Plan', () => {
     expect(result.ok).toBe(true)
     const { prompt } = steerCalls[0]
     expect(prompt).toContain('P3 PLAN')
-    expect(prompt).toContain('subagent')
+    // A3 fix: host-synthesis path — persona names listed but NOT dispatched as invalid subagent types
+    expect(prompt).toContain('persona')
     expect(prompt).toContain('p3-plan.json')
+    // Must NOT dispatch persona names as invalid subagent agent types
+    expect(prompt).not.toMatch(/"agent":\s*"user"/)
+    expect(prompt).not.toMatch(/"agent":\s*"architect"/)
   })
 
   it('accepts plan when panel has zero objections (first round)', async () => {
@@ -570,13 +582,17 @@ describe('S2.5: P2 panel sizing — XS skips panel + gate passes; XL uses 8 pers
     expect(instruction).not.toContain('"concurrency"')
   })
 
-  it('XL sizing → instruction contains 5 personas (capped at ALL_PERSONAS.length)', async () => {
+  it('XL sizing → instruction contains 5 personas (capped at ALL_PERSONAS.length, host-synthesised)', async () => {
     const ctx = makeP2ContextWithSizing('XL')
     const instruction = buildP2Instruction(ctx, '/tmp/p2-domain.json')
-    // XL has panelPersonas=8 but we only have 5 personas defined — sliced to 5
-    expect(instruction).toContain('"concurrency"')
+    // XL has panelPersonas=8 but we only have 5 personas defined — sliced to 5.
+    // A3 fix: host-synthesis path — personas are listed for host adoption, NOT dispatched
+    // as invalid subagent agent types (which caused "Unknown agent" errors).
     expect(instruction).toContain('user')
     expect(instruction).toContain('security')
+    // Must NOT contain subagent JSON with persona agent types
+    expect(instruction).not.toMatch(/"agent":\s*"user"/)
+    expect(instruction).not.toMatch(/"concurrency"/)
   })
 
   it('XS sizing → gate passes even with empty personaDebate (panel was skipped)', async () => {
@@ -677,7 +693,7 @@ describe('S2.5: P3 panel sizing — XS skips panel; XL uses Math.min(8*2,10)=10 
     expect(steerPrompts[0]).toContain('Panel skipped')
   })
 
-  it('XL sizing → P3 instruction contains concurrency=10', async () => {
+  it('XL sizing → P3 instruction lists 10 personas for host-synthesis (no invalid subagent dispatch)', async () => {
     const ctx = makeP3ContextWithSizing('XL')
     const steerPrompts: string[] = []
     const agent = {
@@ -702,8 +718,13 @@ describe('S2.5: P3 panel sizing — XS skips panel; XL uses Math.min(8*2,10)=10 
     } as unknown as HostAgent
 
     await new P3Plan(agent, tmpDir).execute(ctx)
-    // XL: Math.min(8*2, 10) = 10 personas
-    expect(steerPrompts[0]).toContain('"concurrency": 10')
+    // XL: Math.min(8*2, 10) = 10 personas — listed for host-synthesis, not subagent dispatch.
+    // A3 fix: no invalid subagent agent types dispatched; personas listed for host adoption.
+    expect(steerPrompts[0]).toContain('architect')
+    expect(steerPrompts[0]).toContain('performance')
+    // Must NOT dispatch persona names as invalid subagent agent types
+    expect(steerPrompts[0]).not.toMatch(/"agent":\s*"architect"/)
+    expect(steerPrompts[0]).not.toMatch(/"concurrency"/)
   })
 })
 

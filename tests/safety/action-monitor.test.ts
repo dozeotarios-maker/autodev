@@ -338,6 +338,77 @@ describe('Item 3: cp/mv in any segment + target-directory flag', () => {
   })
 })
 
+// ── A2: safe write zones — /dev/null, /tmp, /dev/fd/* always allowed ─────────
+
+describe('A2: safe write zones — /dev/null, /tmp, /dev/fd/* always allowed even outside allowedPaths', () => {
+  it('checkBashCommand: echo x 2>/dev/null allowed (even with allowedPaths set)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x 2>/dev/null').allowed).toBe(true)
+  })
+
+  it('checkBashCommand: redirect to /dev/stdout allowed', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x > /dev/stdout').allowed).toBe(true)
+  })
+
+  it('checkBashCommand: redirect to /dev/stderr allowed', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x > /dev/stderr').allowed).toBe(true)
+  })
+
+  it('checkBashCommand: redirect to /tmp/npm.log allowed', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('npm install > /tmp/npm.log').allowed).toBe(true)
+  })
+
+  it('checkBashCommand: redirect to os.tmpdir() path allowed', () => {
+    const tmpFile = path.join(os.tmpdir(), 'test-output.log')
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand(`npm install > ${tmpFile}`).allowed).toBe(true)
+  })
+
+  it('checkBashCommand: redirect to /dev/fd/1 allowed (fd prefix)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x > /dev/fd/1').allowed).toBe(true)
+  })
+
+  it('checkBashCommand: redirect to /root/pollute.js still blocked', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x > /root/pollute.js').allowed).toBe(false)
+  })
+
+  it('checkFileWrite(/dev/null) allowed even with allowedPaths=[/tmp/proj]', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkFileWrite('/dev/null').allowed).toBe(true)
+  })
+
+  it('checkFileWrite(/dev/stdout) allowed', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkFileWrite('/dev/stdout').allowed).toBe(true)
+  })
+
+  it('checkFileWrite(/dev/stderr) allowed', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkFileWrite('/dev/stderr').allowed).toBe(true)
+  })
+
+  it('checkFileWrite(os.tmpdir()/x) allowed', () => {
+    const m = new ActionMonitor(['/some/proj'])
+    expect(m.checkFileWrite(path.join(os.tmpdir(), 'some-file.txt')).allowed).toBe(true)
+  })
+
+  it('checkFileWrite(/root/x) blocked when allowedPaths=[/tmp/proj]', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkFileWrite('/root/bad.js').allowed).toBe(false)
+  })
+
+  it('protectedPaths denylist still wins over safe zones (hypothetical)', () => {
+    // If a protected path happened to be in /tmp, it must still be blocked.
+    const m = new ActionMonitor([], [os.tmpdir()])
+    expect(m.checkFileWrite(path.join(os.tmpdir(), 'secret')).allowed).toBe(false)
+  })
+})
+
 // ── Item 4: realpathSafe walks up to nearest existing ancestor on ENOENT ─────────
 
 describe('Item 4: realpathSafe dereferences a symlinked parent for a missing leaf', () => {
@@ -358,12 +429,12 @@ describe('Item 4: realpathSafe dereferences a symlinked parent for a missing lea
       const viaLink = path.join(linkParent, 'subdir', 'newfile.ts') // leaf missing
       expect(m.checkFileWrite(viaLink).allowed).toBe(true)
 
-      // Conversely, a symlink whose real parent is OUTSIDE allowedPaths must be
-      // blocked even for a missing leaf (deref reveals the true location).
-      const outsideReal = path.join(base, 'outside-real')
+      // Conversely, a symlink whose real parent is OUTSIDE allowedPaths AND outside
+      // safe write zones must be blocked even for a missing leaf.
+      // Use /root as the outside target — it is neither in allowedPaths nor in /tmp.
       const outsideLink = path.join(base, 'outside-link')
-      fs.mkdirSync(outsideReal, { recursive: true })
-      fs.symlinkSync(outsideReal, outsideLink)
+      try { fs.unlinkSync(outsideLink) } catch { /* not present */ }
+      fs.symlinkSync('/root', outsideLink)
       const viaOutside = path.join(outsideLink, 'x', 'missing.ts')
       expect(m.checkFileWrite(viaOutside).allowed).toBe(false)
     } finally {

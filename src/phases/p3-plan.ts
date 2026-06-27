@@ -24,13 +24,16 @@ const ALL_PLAN_PERSONAS = [
   'architect', 'qa', 'legal', 'accessibility', 'performance',
 ]
 
+// Note: persona names are NOT valid pi-subagent agent types. Host-self-synthesis
+// is the designed path — avoids "Unknown agent" errors with equivalent quality.
+
 const ROLE_DIRECTIVES = `
 ## Role: Planning Agent (P3)
 You are the P3 PLAN phase. Your job:
 1. Scope: define what is IN and OUT of scope for this sprint.
 2. Slice: break the work into a file-DAG (which files, in which lane, with which dependencies).
 3. Plan: produce a sprint contract (goal, success criteria, out-of-scope) and examples table.
-4. Run a persona panel via the subagent tool to review the plan.
+4. Run a persona debate (host-synthesised) to review the plan.
 5. If objections remain, revise and re-plan (this will be indicated in your context).
 `.trim()
 
@@ -50,19 +53,14 @@ function buildP3Instruction(ctx: P3Context, outputFile: string, objections?: str
         'Panel skipped (XS tier — panelPersonas=0). Set panelObjCount to 0.',
       ]
     : [
-        `## Persona panel (run as parallel subagents, ${panelCount} personas)`,
-        'Call the `subagent` tool with:',
-        '```json',
-        JSON.stringify({
-          tasks: personas.map((p, i) => ({
-            index: i,
-            agent: p,
-            task: `Review this sprint plan as a ${p} and list your top objections (or say "no objections").\n${wrapUntrusted(`Spec: ${ctx.p1.spec}\nDomain: ${ctx.p2.domainModel}`)}`,
-          })),
-          concurrency: panelCount,
-          worktree: false,
-        }, null, 2),
-        '```',
+        `## Persona debate (host-synthesised, ${panelCount} personas)`,
+        `For each of the following personas, adopt that perspective and list their top objections about the sprint plan (or say "no objections"):`,
+        personas.map(p => `- **${p}**: As a ${p}, what are your top objections to this plan?`).join('\n'),
+        '',
+        `Context for personas:\n${wrapUntrusted(`Spec: ${ctx.p1.spec}\nDomain: ${ctx.p2.domainModel}`)}`,
+        '',
+        'Count the total number of distinct objections raised across all personas and set panelObjCount to that number.',
+        '(Do NOT use the subagent tool for this — persona names are not valid subagent types.)',
       ]
 
   return [
