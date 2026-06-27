@@ -151,6 +151,38 @@ describe('S2-M2: compactAsync', () => {
     } as unknown as ExtensionContext
     await expect(compactAsync(ctx)).rejects.toThrow('compact failed')
   })
+
+  it('resolves (skip) on a benign "session too small" via onError', async () => {
+    const ctx = {
+      getContextUsage: () => ({ percent: 80 }),
+      compact: vi.fn(({ onError }: { onError: (e: Error) => void }) => {
+        setImmediate(() => onError(new Error('Nothing to compact (session too small)')))
+      }),
+    } as unknown as ExtensionContext
+    await expect(compactAsync(ctx)).resolves.toBeUndefined()
+  })
+
+  // Live-run regression: pi's ctx.compact() THREW synchronously instead of calling
+  // onError, so "Nothing to compact (session too small)" hard-blocked every run at P1→P2.
+  it('resolves (skip) when ctx.compact THROWS synchronously with a benign message', async () => {
+    const ctx = {
+      getContextUsage: () => ({ percent: 80 }),
+      compact: vi.fn(() => {
+        throw new Error('Nothing to compact (session too small)')
+      }),
+    } as unknown as ExtensionContext
+    await expect(compactAsync(ctx)).resolves.toBeUndefined()
+  })
+
+  it('rejects when ctx.compact THROWS synchronously with a non-benign error', async () => {
+    const ctx = {
+      getContextUsage: () => ({ percent: 80 }),
+      compact: vi.fn(() => {
+        throw new Error('real compaction OOM')
+      }),
+    } as unknown as ExtensionContext
+    await expect(compactAsync(ctx)).rejects.toThrow('real compaction OOM')
+  })
 })
 
 // ── HIGH: shouldCompact — percent is 0–100, not 0–1 ─────────────────────────

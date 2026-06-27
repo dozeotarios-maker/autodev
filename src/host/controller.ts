@@ -100,6 +100,14 @@ export function shouldCompact(ctx: ExtensionContext): boolean {
 }
 
 /**
+ * "Nothing to compact"/"too small" (small session) and "already compacted"
+ * (zero-work back-to-back compaction) are benign at phase boundaries — skip them.
+ */
+function isBenignCompactError(err: Error): boolean {
+  return /nothing to compact|too small|already compacted/i.test(err.message)
+}
+
+/**
  * Promise wrapper over ctx.compact({ onComplete, onError }) with:
  *   - Conditional: skips unless shouldCompact() says the context is near-full.
  *   - Timeout: races compact against timeoutMs (default COMPACT_TIMEOUT_MS).
@@ -140,23 +148,24 @@ export function compactAsync(
       })
     }, timeoutMs)
 
-    ctx.compact({
-      onComplete: () => {
-        clearTimeout(timer)
-        settle(() => resolve())
-      },
-      onError: (err: Error) => {
-        clearTimeout(timer)
-        // "Nothing to compact" on a small session at a phase boundary is benign — skip it.
-        // "Already compacted" fires on back-to-back zero-work compaction at phase boundaries
-        // (the session hasn't grown since the last compaction). Also benign — skip it.
-        if (/nothing to compact|too small|already compacted/i.test(err.message)) {
+    const handleCompactError = (err: Error) => {
+      clearTimeout(timer)
+      settle(() => (isBenignCompactError(err) ? resolve() : reject(err)))
+    }
+    try {
+      ctx.compact({
+        onComplete: () => {
+          clearTimeout(timer)
           settle(() => resolve())
-        } else {
-          settle(() => reject(err))
-        }
-      },
-    })
+        },
+        onError: handleCompactError,
+      })
+    } catch (err) {
+      // pi's ctx.compact() can THROW SYNCHRONOUSLY instead of calling onError —
+      // observed live: "Nothing to compact (session too small)" hard-blocked every
+      // run at the first phase boundary (P1→P2). Same benign-skip handling here.
+      handleCompactError(err instanceof Error ? err : new Error(String(err)))
+    }
   })
 }
 
