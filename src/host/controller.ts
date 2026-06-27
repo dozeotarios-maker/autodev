@@ -1178,16 +1178,17 @@ export class Controller {
     this.journal = new Journal(path.join(r.dir, '.autodev', 'journal.jsonl'))
     this.actionMonitor = new ActionMonitor([r.dir])
 
-    // A fresh scratch project (~/autodev/<slug>) is just an empty directory — make it a
-    // git repo so P6's scoped commit has somewhere to land. Existing repos are untouched.
-    if (r.isNew) {
-      try {
-        if (await ensureGitRepo(r.dir)) {
-          void this.journal.write({ type: 'decision', phase: 'P1', action: 'git init: fresh project repo created' })
-        }
-      } catch (e) {
-        void this.journal.write({ type: 'decision', phase: 'P1', action: `git init failed: ${String(e)}` })
+    // Make sure the project is a git repo so P6's scoped commit has somewhere to land.
+    // Fires for fresh ~/autodev/<slug> scratch dirs AND reused ones whose path already
+    // exists but was never initialized (the per-idea dir is deterministic, so a rerun
+    // resolves to the same path). ensureGitRepo no-ops on dirs that are already repos,
+    // so real user projects are left untouched.
+    try {
+      if (await ensureGitRepo(r.dir)) {
+        void this.journal.write({ type: 'decision', phase: 'P1', action: 'git init: project repo created' })
       }
+    } catch (e) {
+      void this.journal.write({ type: 'decision', phase: 'P1', action: `git init failed: ${String(e)}` })
     }
 
     // Re-root construction-captured backends (chdir does NOT fix frozen paths):
