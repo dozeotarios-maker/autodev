@@ -268,6 +268,10 @@ export class Controller {
   private _terminalStored = false
   /** B3a: true when a `step:` prefix was seen — enables phase-by-phase gate in _runPhases. */
   private phaseByPhase = false
+  /** B3b: true when the most-recent _resolveRepoRoot resolved a brand-new project. */
+  private resolvedIsNew = false
+  /** B3b: intent gathered from the intent gate; undefined when gate skipped or no input given. */
+  private currentIntent: { useCase?: string; scale?: string; audience?: string } | undefined
 
   constructor(
     private readonly pi: ExtensionAPI,
@@ -359,6 +363,7 @@ export class Controller {
           activeProject: activeProject ?? '(none)',
           gear: this.currentGear ?? 'full',
           phaseByPhase: this.phaseByPhase,
+          intentCaptured: this.currentIntent !== undefined,
         }
         ctx.ui.notify(JSON.stringify(status, null, 2), 'info')
       },
@@ -742,6 +747,8 @@ export class Controller {
       // ── Run-start: default tier M (or forced tier from prefix override) ──────
       this.currentRunId = `run-${crypto.randomUUID()}`
       this._terminalStored = false // Fix #1: reset per-run so consecutive runs don't share state
+      // B3b: reset intent per-run; resolvedIsNew was already reset at top of _resolveRepoRoot
+      this.currentIntent = undefined
       // B3a: phaseByPhase is NOT reset here — it is unconditionally reassigned from
       // parsed.phaseByPhase in _onInput's lock-won block (line ~578) on every new input
       // event, which is sufficient: each run always reflects the most-recent input's
@@ -765,6 +772,12 @@ export class Controller {
 
       await this.journal.write({ type: 'pre-action', phase: 'P1', action: 'starting P1 DISCOVER' })
 
+      // B3b: intent gate — ask 1-3 questions before P1 if this is a new project with UI
+      const gatedIntent = await this._intentGate(ctx)
+      if (gatedIntent !== undefined) {
+        this.currentIntent = gatedIntent
+      }
+
       // ── P1 DISCOVER ──────────────────────────────────────────────────────
       if (await this._isPaused()) { await this._waitResume() }
 
@@ -778,6 +791,7 @@ export class Controller {
         screenContent: this.opts.securityLane
           ? (t, s) => this.opts.securityLane!.screenContent(t, s)
           : undefined,
+        intent: this.currentIntent,
       })
       if (!p1Result.ok || !p1Result.output) {
         await this._escalate('P1', p1Result.reason ?? 'P1 failed')
@@ -1047,6 +1061,8 @@ export class Controller {
    * stays process.cwd(), NO chdir).
    */
   private async _resolveRepoRoot(idea: string): Promise<void> {
+    // B3b: reset per-run; stays false on the no-registry early-return path
+    this.resolvedIsNew = false
     if (!this.opts.registry) return
 
     let r
@@ -1087,6 +1103,8 @@ export class Controller {
       return
     }
     this.originalCwd = originalCwd
+    // B3b: record whether this resolved project is brand-new
+    this.resolvedIsNew = r.isNew
 
     // chdir succeeded — now safe to mutate instance state to the new dir.
     this.repoRoot = r.dir
@@ -1838,6 +1856,89 @@ export class Controller {
 
     if (decision === 'stop') return 'stop'
     return 'continue'
+  }
+
+  // ── B3b: intent gate ─────────────────────────────────────────────────────────
+
+  /**
+   * Ask up to 3 questions via ctx.ui.input when starting a brand-new project with UI.
+   *
+   * Gate conditions (ALL must hold — any false → skip, return undefined):
+   *   1. ctx.hasUI  — UI is available (tui/rpc mode)
+   *   2. this.resolvedIsNew — the resolved project is new (not an existing repo)
+   *   3. !this.currentForcedTier — no explicit tier/depth override (quick:/mid:/full:)
+   *
+   * A `build:` prefix leaves forcedTier undefined → gate is eligible (the user gave
+   * no depth signal, so we ask). debug:/refactor: early-return before _runPhases (moot).
+   *
+   * On any answer returning undefined (cancel/timeout) → stop asking, return whatever
+   * was gathered so far (partial intent) or undefined if nothing was captured yet.
+   * Never hangs: ctx.ui.input is a bounded Promise (dialogueTimeoutMs or 5 min).
+   */
+  private async _intentGate(
+    ctx: ExtensionContext
+  ): Promise<{ useCase?: string; scale?: string; audience?: string } | undefined> {
+    const ctxAny = ctx as unknown as { hasUI?: boolean }
+    if (!ctxAny.hasUI) {
+      void this.journal.write({ type: 'decision', phase: 'P1', action: 'intent gate skipped: no UI' })
+      return undefined
+    }
+    if (!this.resolvedIsNew) {
+      void this.journal.write({ type: 'decision', phase: 'P1', action: 'intent gate skipped: existing project' })
+      return undefined
+    }
+    if (this.currentForcedTier) {
+      void this.journal.write({ type: 'decision', phase: 'P1', action: `intent gate skipped: forcedTier=${this.currentForcedTier}` })
+      return undefined
+    }
+
+    const uiAny = ctx.ui as unknown as {
+      input?(title: string, placeholder?: string, opts?: { timeout: number }): Promise<string | undefined>
+    }
+    if (typeof uiAny.input !== 'function') {
+      void this.journal.write({ type: 'decision', phase: 'P1', action: 'intent gate skipped: ctx.ui.input not available' })
+      return undefined
+    }
+
+    void this.journal.write({ type: 'decision', phase: 'P1', action: 'intent gate fired: asking 3 questions' })
+    const timeout = this.opts.dialogueTimeoutMs ?? 300_000
+    const intent: { useCase?: string; scale?: string; audience?: string } = {}
+
+    const useCase = await uiAny.input(
+      'What are you building? (use case)',
+      'e.g. a todo app, a REST API, a CLI tool',
+      { timeout }
+    )
+    if (useCase === undefined) {
+      void this.journal.write({ type: 'decision', phase: 'P1', action: 'intent gate: use-case cancelled/timed out — degrading' })
+      return undefined
+    }
+    intent.useCase = useCase
+
+    const scale = await uiAny.input(
+      'What scale? (team size / user count)',
+      'e.g. solo, small team, 1k users',
+      { timeout }
+    )
+    if (scale === undefined) {
+      void this.journal.write({ type: 'decision', phase: 'P1', action: 'intent gate: scale cancelled/timed out — proceeding with partial intent' })
+      return intent
+    }
+    intent.scale = scale
+
+    const audience = await uiAny.input(
+      'Who is the audience?',
+      'e.g. just me, internal team, public users',
+      { timeout }
+    )
+    if (audience === undefined) {
+      void this.journal.write({ type: 'decision', phase: 'P1', action: 'intent gate: audience cancelled/timed out — proceeding with partial intent' })
+      return intent
+    }
+    intent.audience = audience
+
+    void this.journal.write({ type: 'decision', phase: 'P1', action: `intent gate complete: useCase="${useCase}" scale="${scale}" audience="${audience}"` })
+    return intent
   }
 
   /**

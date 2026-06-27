@@ -137,17 +137,27 @@ export function buildP1Instruction(ctx: P1Context, outputFile: string): string |
     complexitySection,
   ].join('\n')
 
+  // B3b: append intent section when user provided clarifying answers via the intent gate.
+  const intentSection = ctx.intent
+    ? [
+        '',
+        '## User intent (from intent gate)',
+        `The user clarified their intent — use case: ${ctx.intent.useCase ?? '(not provided)'}, scale: ${ctx.intent.scale ?? '(not provided)'}, audience: ${ctx.intent.audience ?? '(not provided)'}. Factor these into the spec and the complexity self-assessment.`,
+      ].join('\n')
+    : ''
+
   // If no memory backend, return synchronously (preserves byte-identical baseline).
-  if (!ctx.memoryStore) return base
+  if (!ctx.memoryStore) return base + intentSection
 
   // Memory present: async path — recall, screen, cap, inject.
   return recallMemoryBlock(ctx).then((block) => {
-    if (!block) return base
+    if (!block) return base + intentSection
     return [
       base,
       '',
       '## Prior memory (screened)',
       block,
+      ...(intentSection ? [intentSection] : []),
     ].join('\n')
   })
 }

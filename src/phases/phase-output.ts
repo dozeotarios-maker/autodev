@@ -35,6 +35,8 @@ export interface P1Context {
   embedder?: Embedder
   /** Injection-screening hook — screen recalled text before injecting into instructions. */
   screenContent?: (text: string, source: 'repo') => Promise<{ safe: boolean; threats: string[] }>
+  /** B3b: user-provided intent from the intent gate; absent leaves P1 instruction unchanged. */
+  intent?: { useCase?: string; scale?: string; audience?: string }
 }
 
 // ── P2 ELABORATE ─────────────────────────────────────────────────────────────
