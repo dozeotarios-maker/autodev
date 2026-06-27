@@ -1,12 +1,12 @@
-// S2-M3a: P2 ELABORATE — domain model + persona debate panel (parallel subagents)
+// S2-M3a: P2 ELABORATE — domain model + persona debate panel (host-self-synthesis)
 //
 // Steer-then-verify: host writes .autodev/phase-output/p2-domain.json
 // containing { phase:'P2', domainModel, personaDebate[] }.
-// The persona panel runs as parallel subagents via SubagentDriver.
+// The persona panel is synthesised by the host LLM adopting each persona in turn
+// (not via parallel subagents — persona names are not valid subagent agent types).
 
 import * as path from 'path'
 import type { HostAgent } from '../host/host-agent.js'
-import type { SubagentDriver } from '../host/subagent-driver.js'
 import { PhaseExecutor } from './phase-executor.js'
 import type { P2Context, P2Output } from './phase-output.js'
 import { validateP2Output } from './phase-output.js'
@@ -84,10 +84,6 @@ export class P2Elaborate {
   constructor(
     private readonly hostAgent: HostAgent,
     private readonly outputDir: string,
-    // SubagentDriver injected but the actual subagent call is embedded in the steer instruction.
-    // The host LLM uses the subagent tool to run the panel — SubagentDriver is kept here
-    // for potential direct invocation (e.g. in alternative flow or direct-invoke path).
-    _subagentDriver?: SubagentDriver,
     private readonly timeoutMs?: number
   ) {}
 

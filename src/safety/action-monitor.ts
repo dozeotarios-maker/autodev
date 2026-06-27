@@ -78,31 +78,40 @@ const SAFE_WRITE_ZONES: Array<string | { prefix: string }> = [
 /**
  * Returns true when the given path is inside a safe write zone.
  *
- * Strategy: check BOTH the raw path and the realpath'd value, but with different
- * semantics for /dev/* vs directory-based zones:
- *   - /dev/* zones: checked against the RAW path (before symlink resolution) because
- *     /dev/stdout may resolve to a process-specific path (e.g. a temp file) in some
- *     environments, but it is always semantically safe.
- *   - Directory-based zones (os.tmpdir()): checked against the REAL path only, so
- *     symlinks that happen to live under /tmp but point outside allowed dirs are
- *     correctly handled by the realpath.
- *   - /proc/self/fd/* prefix: checked against realPath (covers Linux fd resolution).
+ * Strategy: NORMALIZE the candidate with path.resolve() first (collapses `..`).
+ * After normalization a traversal like `/dev/fd/../../root/.ssh` becomes `/root/.ssh`
+ * which matches no /dev zone and falls through to the normal confinement check.
+ *
+ * Also reject any candidate still containing `..` after normalization (shouldn't
+ * happen after path.resolve, but defense-in-depth).
+ *
+ * Zone semantics after normalization:
+ *   - Literal device files (/dev/null, /dev/stdout, /dev/stderr, /dev/zero, /dev/tty):
+ *     require EXACT equality on the normalized path.
+ *   - /dev/fd/ and /proc/self/fd/ prefixes: startsWith on the normalized path.
+ *   - Directory-based zones (os.tmpdir()): checked against the REAL path (symlink-dereferenced).
  */
 function isInSafeWriteZone(rawPath: string, realPath: string): boolean {
+  // Normalize the raw path to collapse any `..` traversal components.
+  const normPath = path.resolve(rawPath)
+
+  // Defense-in-depth: if somehow `..` survives resolve (it shouldn't), reject.
+  if (normPath.includes('..')) return false
+
   for (const zone of SAFE_WRITE_ZONES) {
     if (typeof zone === 'string') {
-      // String zone: /dev/null, /dev/stdout, /dev/stderr, /dev/zero, /dev/tty, os.tmpdir().
-      // For /dev/* entries: check raw path (device paths are semantically safe regardless of resolution).
-      // For others (tmpdir): check realPath (symlink-dereferenced, correct confinement).
-      const checkRaw = zone.startsWith('/dev/')
-      const candidate = checkRaw ? rawPath : realPath
-      if (candidate === zone || candidate.startsWith(zone + path.sep)) return true
+      if (zone.startsWith('/dev/')) {
+        // Literal device file: require exact equality on the NORMALIZED path.
+        // A traversal like /dev/null/../../root/x normalizes to /root/x, which
+        // does NOT equal /dev/null → correctly rejected.
+        if (normPath === zone) return true
+      } else {
+        // Directory-based zone (os.tmpdir()): check realPath (symlink-dereferenced).
+        if (realPath === zone || realPath.startsWith(zone + path.sep)) return true
+      }
     } else {
-      // Prefix zone: /dev/fd/, /proc/self/fd/.
-      // /dev/fd/* — check raw path. /proc/self/fd/* — check real path.
-      const checkRaw = zone.prefix.startsWith('/dev/')
-      const candidate = checkRaw ? rawPath : realPath
-      if (candidate.startsWith(zone.prefix)) return true
+      // Prefix zone: /dev/fd/ or /proc/self/fd/ — check normalized path.
+      if (normPath.startsWith(zone.prefix)) return true
     }
   }
   return false

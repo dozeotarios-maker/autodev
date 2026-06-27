@@ -152,6 +152,64 @@ describe('S2-M2: compactAsync', () => {
   })
 })
 
+// ── HIGH: shouldCompact — percent is 0–100, not 0–1 ─────────────────────────
+
+describe('HIGH: shouldCompact uses 0–100 percent scale', () => {
+  it('returns true when percent is 70 (at threshold)', () => {
+    const ctx = {
+      getContextUsage: () => ({ percent: 70 }),
+    } as unknown as ExtensionContext
+    expect(shouldCompact(ctx)).toBe(true)
+  })
+
+  it('returns true when percent is 80 (above threshold)', () => {
+    const ctx = {
+      getContextUsage: () => ({ percent: 80 }),
+    } as unknown as ExtensionContext
+    expect(shouldCompact(ctx)).toBe(true)
+  })
+
+  it('returns false when percent is 50 (below threshold — locks 0–100 unit)', () => {
+    // This test LOCKS the 0–100 contract: if COMPACT_USAGE_THRESHOLD regresses to 0.7
+    // (treating percent as a fraction), then percent:50 >= 0.7 → true → this fails.
+    const ctx = {
+      getContextUsage: () => ({ percent: 50 }),
+    } as unknown as ExtensionContext
+    expect(shouldCompact(ctx)).toBe(false)
+  })
+
+  it('returns false when percent is 30 (well below threshold)', () => {
+    const ctx = {
+      getContextUsage: () => ({ percent: 30 }),
+    } as unknown as ExtensionContext
+    expect(shouldCompact(ctx)).toBe(false)
+  })
+
+  it('returns true when getContextUsage returns null percent (fail-open)', () => {
+    const ctx = {
+      getContextUsage: () => ({ percent: null }),
+    } as unknown as ExtensionContext
+    expect(shouldCompact(ctx)).toBe(true)
+  })
+
+  it('returns true when getContextUsage is absent (fail-open)', () => {
+    const ctx = {} as unknown as ExtensionContext
+    expect(shouldCompact(ctx)).toBe(true)
+  })
+})
+
+// ── MEDIUM: shouldCompact — getContextUsage() throw is caught, returns true ──
+
+describe('MEDIUM: shouldCompact catches getContextUsage() throw → returns true', () => {
+  it('getContextUsage throws → shouldCompact returns true, no exception escapes', () => {
+    const ctx = {
+      getContextUsage: () => { throw new Error('assertActive: stale instance') },
+    } as unknown as ExtensionContext
+    expect(() => shouldCompact(ctx)).not.toThrow()
+    expect(shouldCompact(ctx)).toBe(true)
+  })
+})
+
 // ── Controller lifecycle ──────────────────────────────────────────────────────
 
 describe('S2-M2: Controller — session_start → ARMED', () => {
@@ -2000,7 +2058,7 @@ describe('A1: compactAsync — timeout never hangs + double-settle guard', () =>
     vi.useFakeTimers()
     try {
       const ctx = {
-        getContextUsage: () => ({ tokens: 90000, contextWindow: 100000, percent: 0.9 }),
+        getContextUsage: () => ({ tokens: 90000, contextWindow: 100000, percent: 90 }),
         compact: vi.fn(), // never calls onComplete or onError
       } as unknown as ExtensionContext
 
@@ -2017,7 +2075,7 @@ describe('A1: compactAsync — timeout never hangs + double-settle guard', () =>
     vi.useFakeTimers()
     try {
       const ctx = {
-        getContextUsage: () => ({ tokens: 90000, contextWindow: 100000, percent: 0.9 }),
+        getContextUsage: () => ({ tokens: 90000, contextWindow: 100000, percent: 90 }),
         compact: vi.fn(),
       } as unknown as ExtensionContext
 
@@ -2038,7 +2096,7 @@ describe('A1: compactAsync — timeout never hangs + double-settle guard', () =>
     try {
       let capturedOnComplete: (() => void) | undefined
       const ctx = {
-        getContextUsage: () => ({ percent: 0.9 }),
+        getContextUsage: () => ({ percent: 90 }),
         compact: vi.fn(({ onComplete }: { onComplete: () => void }) => {
           capturedOnComplete = onComplete
           // Don't call onComplete immediately — simulate a late fire
@@ -2062,23 +2120,23 @@ describe('A1: compactAsync — timeout never hangs + double-settle guard', () =>
 })
 
 describe('A1: shouldCompact — skips low-usage, runs high-usage', () => {
-  it('low usage (percent=0.3) → shouldCompact returns false', () => {
+  it('low usage (percent=30) → shouldCompact returns false', () => {
     const ctx = {
-      getContextUsage: () => ({ tokens: 30000, contextWindow: 100000, percent: 0.3 }),
+      getContextUsage: () => ({ tokens: 30000, contextWindow: 100000, percent: 30 }),
     } as unknown as ExtensionContext
     expect(shouldCompact(ctx)).toBe(false)
   })
 
-  it('high usage (percent=0.8) → shouldCompact returns true', () => {
+  it('high usage (percent=80) → shouldCompact returns true', () => {
     const ctx = {
-      getContextUsage: () => ({ tokens: 80000, contextWindow: 100000, percent: 0.8 }),
+      getContextUsage: () => ({ tokens: 80000, contextWindow: 100000, percent: 80 }),
     } as unknown as ExtensionContext
     expect(shouldCompact(ctx)).toBe(true)
   })
 
-  it('exact threshold (percent=0.7) → shouldCompact returns true', () => {
+  it('exact threshold (percent=70) → shouldCompact returns true', () => {
     const ctx = {
-      getContextUsage: () => ({ percent: 0.7 }),
+      getContextUsage: () => ({ percent: 70 }),
     } as unknown as ExtensionContext
     expect(shouldCompact(ctx)).toBe(true)
   })
@@ -2100,7 +2158,7 @@ describe('A1: shouldCompact — skips low-usage, runs high-usage', () => {
   it('low usage → compactAsync skips (compact not called)', async () => {
     const compactFn = vi.fn()
     const ctx = {
-      getContextUsage: () => ({ percent: 0.3 }),
+      getContextUsage: () => ({ percent: 30 }),
       compact: compactFn,
     } as unknown as ExtensionContext
     await compactAsync(ctx)

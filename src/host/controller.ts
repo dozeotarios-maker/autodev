@@ -53,8 +53,8 @@ import type { ProjectRegistry } from '../project/registry.js'
 /** Default compaction timeout (ms). Overridable for tests. */
 export const COMPACT_TIMEOUT_MS = 45_000
 
-/** Context-usage threshold above which compaction is triggered (0–1). */
-const COMPACT_USAGE_THRESHOLD = 0.7
+/** Context-usage threshold above which compaction is triggered (0–100 scale, matching ContextUsage.percent). */
+const COMPACT_USAGE_THRESHOLD = 70
 
 /**
  * Decide whether the context actually needs compaction.
@@ -63,27 +63,42 @@ const COMPACT_USAGE_THRESHOLD = 0.7
  * updated its API). If usage.percent is available, skip unless >= threshold.
  * If usage is unknown (returns undefined / null percent), allow compaction —
  * i.e. fail-open so we don't skip when we can't tell.
+ *
+ * ContextUsage.percent is 0–100 (NOT 0–1). COMPACT_USAGE_THRESHOLD=70 means
+ * "compact when context is 70% or more full".
+ *
+ * getContextUsage() can throw (e.g. assertActive on a stale instance). Wrap in
+ * try/catch and fail-open (return true) so a throw never silently skips compaction.
  */
 export function shouldCompact(ctx: ExtensionContext): boolean {
-  const usage = (ctx as unknown as { getContextUsage?: () => { percent: number | null } | undefined }).getContextUsage?.()
-  if (!usage) return true // unknown — allow
-  if (usage.percent === null || usage.percent === undefined) return true // unknown — allow
-  return usage.percent >= COMPACT_USAGE_THRESHOLD
+  try {
+    const usage = (ctx as unknown as { getContextUsage?: () => { percent: number | null } | undefined }).getContextUsage?.()
+    if (!usage) return true // unknown — allow
+    if (usage.percent === null || usage.percent === undefined) return true // unknown — allow
+    return usage.percent >= COMPACT_USAGE_THRESHOLD
+  } catch {
+    return true // getContextUsage threw (stale instance etc.) — fail-open
+  }
 }
 
 /**
  * Promise wrapper over ctx.compact({ onComplete, onError }) with:
  *   - Conditional: skips unless shouldCompact() says the context is near-full.
  *   - Timeout: races compact against timeoutMs (default COMPACT_TIMEOUT_MS).
- *     On timeout → resolves (skip, log), never hangs.
+ *     On timeout → resolves (skip, log via onTimeout callback), never hangs.
  *   - Double-settle guard: late onComplete/onError after timeout are no-ops.
  *
  * The controller MUST await this before the next steer — otherwise the next
  * message lands in a pre-compaction context.
+ *
+ * @param onTimeout - optional callback invoked when the timeout path fires,
+ *   so callers (the controller) can journal the skip without needing a
+ *   journal reference here.
  */
 export function compactAsync(
   ctx: ExtensionContext,
-  timeoutMs: number = COMPACT_TIMEOUT_MS
+  timeoutMs: number = COMPACT_TIMEOUT_MS,
+  onTimeout?: () => void
 ): Promise<void> {
   // Conditional: skip when context is not near the limit
   if (!shouldCompact(ctx)) {
@@ -101,9 +116,8 @@ export function compactAsync(
     // Timeout race: resolve (skip) after timeoutMs — never escalate, never hang
     const timer = setTimeout(() => {
       settle(() => {
-        // Log via console since we have no journal reference here; callers can
-        // observe this via the resolve path (no error thrown).
         console.warn('[pi-autodev] compaction skipped: timeout')
+        onTimeout?.()
         resolve()
       })
     }, timeoutMs)
@@ -670,14 +684,16 @@ export class Controller {
       await this.journal.write({ type: 'completion', phase: 'P1', action: 'P1 complete' })
       this.opts.transparency.setHudStatus('P1→P2', this.currentIdea.slice(0, 60), 'compacting', 'opus')
 
-      await compactAsync(ctx)
+      await compactAsync(ctx, COMPACT_TIMEOUT_MS, () => {
+        void this.journal.write({ type: 'decision', phase: this.fsm.getPhase(), action: 'compaction skipped: 45s timeout' })
+      })
       await this.fsm.advance()
       this.opts.transparency.setHudStatus('P2', this.currentIdea.slice(0, 60), 'running', 'opus')
 
       // ── P2 ELABORATE ─────────────────────────────────────────────────────
       if (await this._isPaused()) { await this._waitResume() }
 
-      const p2 = new P2Elaborate(this.hostAgent, this.outputDir, this.subagentDriver, this.opts.steerTimeoutMs)
+      const p2 = new P2Elaborate(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
       const p2Result = await p2.execute({ phase: 'P2', p1: this.phaseStore.p1, sizing: this.currentSizing })
       if (!p2Result.ok || !p2Result.output) {
         await this._escalate('P2', p2Result.reason ?? 'P2 failed')
@@ -687,7 +703,9 @@ export class Controller {
       await this.journal.write({ type: 'completion', phase: 'P2', action: 'P2 complete' })
       this.opts.transparency.setHudStatus('P2→P3', this.currentIdea.slice(0, 60), 'compacting', 'opus')
 
-      await compactAsync(ctx)
+      await compactAsync(ctx, COMPACT_TIMEOUT_MS, () => {
+        void this.journal.write({ type: 'decision', phase: this.fsm.getPhase(), action: 'compaction skipped: 45s timeout' })
+      })
       await this.fsm.advance()
       this.opts.transparency.setHudStatus('P3', this.currentIdea.slice(0, 60), 'running', 'opus')
 
@@ -716,7 +734,9 @@ export class Controller {
       await this.journal.write({ type: 'completion', phase: 'P3', action: 'P3 complete' })
       this.opts.transparency.setHudStatus('P3→P4', this.currentIdea.slice(0, 60), 'compacting', 'opus')
 
-      await compactAsync(ctx)
+      await compactAsync(ctx, COMPACT_TIMEOUT_MS, () => {
+        void this.journal.write({ type: 'decision', phase: this.fsm.getPhase(), action: 'compaction skipped: 45s timeout' })
+      })
       await this.fsm.advance()
       this.opts.transparency.setHudStatus('P4', this.currentIdea.slice(0, 60), 'running', 'opus')
 
@@ -733,7 +753,9 @@ export class Controller {
       await this.journal.write({ type: 'completion', phase: 'P4', action: 'P4 complete' })
       this.opts.transparency.setHudStatus('P4→P5', this.currentIdea.slice(0, 60), 'compacting', 'opus')
 
-      await compactAsync(ctx)
+      await compactAsync(ctx, COMPACT_TIMEOUT_MS, () => {
+        void this.journal.write({ type: 'decision', phase: this.fsm.getPhase(), action: 'compaction skipped: 45s timeout' })
+      })
       await this.fsm.advance()
       this.opts.transparency.setHudStatus('P5', this.currentIdea.slice(0, 60), 'running', 'opus')
 
@@ -792,7 +814,9 @@ export class Controller {
       await this.journal.write({ type: 'completion', phase: 'P5', action: 'P5 complete' })
       this.opts.transparency.setHudStatus('P5→P6', this.currentIdea.slice(0, 60), 'compacting', 'opus')
 
-      await compactAsync(ctx)
+      await compactAsync(ctx, COMPACT_TIMEOUT_MS, () => {
+        void this.journal.write({ type: 'decision', phase: this.fsm.getPhase(), action: 'compaction skipped: 45s timeout' })
+      })
       await this.fsm.advance()
       this.opts.transparency.setHudStatus('P6', this.currentIdea.slice(0, 60), 'running', 'opus')
 

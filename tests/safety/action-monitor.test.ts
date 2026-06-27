@@ -409,6 +409,58 @@ describe('A2: safe write zones — /dev/null, /tmp, /dev/fd/* always allowed eve
   })
 })
 
+// ── CRITICAL: /dev traversal escape via .. must be blocked ───────────────────
+
+describe('CRITICAL: /dev path traversal escape blocked after normalize', () => {
+  it('blocks echo x > /dev/fd/../../root/.ssh/authorized_keys (traversal escapes /dev/fd/)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    const result = m.checkBashCommand('echo x > /dev/fd/../../root/.ssh/authorized_keys')
+    expect(result.allowed).toBe(false)
+  })
+
+  it('blocks echo x > /dev/null/../../root/x (null with traversal)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    const result = m.checkBashCommand('echo x > /dev/null/../../root/x')
+    expect(result.allowed).toBe(false)
+  })
+
+  it('allows echo x > /dev/null (literal device, exact match)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x > /dev/null').allowed).toBe(true)
+  })
+
+  it('allows echo x > /dev/fd/2 (legitimate fd)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x > /dev/fd/2').allowed).toBe(true)
+  })
+
+  it('allows echo x > /dev/stderr (exact device name)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x > /dev/stderr').allowed).toBe(true)
+  })
+
+  it('allows echo x > /tmp/x (tmp zone always allowed)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x > /tmp/x').allowed).toBe(true)
+  })
+
+  it('blocks echo x > /root/x (outside allowedPaths, not a device)', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkBashCommand('echo x > /root/x').allowed).toBe(false)
+  })
+
+  it('blocks checkFileWrite for /dev/fd/../../root/.ssh/authorized_keys', () => {
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkFileWrite('/dev/fd/../../root/.ssh/authorized_keys').allowed).toBe(false)
+  })
+
+  it('blocks checkFileWrite for path still containing .. after attempted normalize', () => {
+    // A path that cannot be trivially collapsed must be rejected
+    const m = new ActionMonitor(['/tmp/proj'])
+    expect(m.checkFileWrite('/dev/fd/../../root/secret').allowed).toBe(false)
+  })
+})
+
 // ── Item 4: realpathSafe walks up to nearest existing ancestor on ENOENT ─────────
 
 describe('Item 4: realpathSafe dereferences a symlinked parent for a missing leaf', () => {
