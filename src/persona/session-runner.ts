@@ -39,45 +39,52 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return Promise.race([p, timeout]).finally(() => clearTimeout(timer))
 }
 
-export interface GeminiRunnerOptions {
-  model: string
-  apiKey: string
+export interface PiRunnerOptions {
+  /** Explicit model id; empty/undefined → the session's SELECTED/default model. */
+  model?: string
+  /** Provider for an explicit model ('google' | 'openai' | 'anthropic' …). */
+  provider?: string
+  /** API key for the explicit provider (e.g. a Gemini key for 'google'). Omit for default auth. */
+  apiKey?: string
   thinkingLevel?: 'low' | 'medium' | 'high'
   timeoutMs?: number
 }
 
 /**
- * PersonaSessionRunner backed by an isolated pi `createAgentSession` running a Gemini model.
- * Each run() is a fresh in-memory session, disposed after — no state held between calls.
+ * PersonaSessionRunner backed by an isolated pi `createAgentSession`. By DEFAULT it runs the
+ * SELECTED model — the one the host pi session uses (Claude when you run Claude) — by omitting
+ * the model so createAgentSession resolves it from settings. Set model+provider to override
+ * (e.g. a Gemini model). Each run() is a fresh in-memory session, disposed after.
  */
-export class GeminiSessionRunner implements PersonaSessionRunner {
+export class PiSessionRunner implements PersonaSessionRunner {
   private readonly auth: AuthStorage
   private readonly registry: ModelRegistry
   private model: ReturnType<ModelRegistry['find']> | undefined
   private resolved = false
 
-  constructor(private readonly opts: GeminiRunnerOptions) {
+  constructor(private readonly opts: PiRunnerOptions = {}) {
     this.auth = AuthStorage.create()
-    this.auth.setRuntimeApiKey('google', opts.apiKey)
+    if (opts.provider && opts.apiKey) this.auth.setRuntimeApiKey(opts.provider, opts.apiKey)
     this.registry = ModelRegistry.create(this.auth)
   }
 
   private resolveModel(): void {
     if (this.resolved) return
-    this.model = this.registry.find('google', this.opts.model)
+    // Explicit override only; otherwise leave undefined so createAgentSession picks the
+    // session's selected/default model.
+    if (this.opts.model && this.opts.provider) {
+      this.model = this.registry.find(this.opts.provider, this.opts.model)
+    }
     this.resolved = true
   }
 
   async run(systemPrompt: string, task: string): Promise<PersonaRunResult> {
     this.resolveModel()
-    if (!this.model) {
-      return { ok: false, text: '', failure: 'unavailable', errorMessage: `model ${this.opts.model} not in registry` }
-    }
 
     let created
     try {
       created = await createAgentSession({
-        model: this.model,
+        ...(this.model ? { model: this.model } : {}),
         modelRegistry: this.registry,
         authStorage: this.auth,
         sessionManager: SessionManager.inMemory(),

@@ -92,7 +92,7 @@ import { SubagentRunner } from '../lanes/subagent-runner.js'
 import { Controller } from '../host/controller.js'
 import { ProjectRegistry } from '../project/registry.js'
 import { loadPersonaConfig } from '../persona/persona-config.js'
-import { GeminiSessionRunner } from '../persona/session-runner.js'
+import { PiSessionRunner } from '../persona/session-runner.js'
 
 // ── Extension options (all external boundaries injectable for test isolation) ──
 export interface AutodevExtensionOptions {
@@ -448,13 +448,15 @@ export default function autodevExtension(pi: ExtensionAPI): void {
 
   // ── Persona panel (real Gemini subagents) — enabled when a Gemini key is present ──
   const personaConfig = loadPersonaConfig()
-  const geminiKey = process.env['GEMINI_API_KEY']
-  let personaRunner: GeminiSessionRunner | undefined
-  if (personaConfig.enabled && geminiKey) {
+  let personaRunner: PiSessionRunner | undefined
+  if (personaConfig.enabled) {
     try {
-      personaRunner = new GeminiSessionRunner({
-        model: personaConfig.model,
-        apiKey: geminiKey,
+      personaRunner = new PiSessionRunner({
+        // Empty model → personas run the SELECTED/session model (Claude when you run Claude).
+        model: personaConfig.model || undefined,
+        provider: personaConfig.provider || undefined,
+        // Pass the Gemini key only when explicitly targeting the google provider.
+        apiKey: personaConfig.provider === 'google' ? process.env['GEMINI_API_KEY'] : undefined,
         thinkingLevel: 'low',
         timeoutMs: personaConfig.timeoutMs,
       })

@@ -1,6 +1,8 @@
 export interface PersonaConfig {
-  /** Gemini model id under the 'google' provider. */
+  /** Explicit model id; '' = the session's SELECTED/default model (Claude when you run Claude). */
   model: string
+  /** Provider for an explicit model ('google'|'openai'|'anthropic'); '' = inferred / selected. */
+  provider: string
   /** Max concurrent isolated sessions (rate-limit guard). */
   concurrency: number
   /** Include P1's web-research digest in persona prompts (R1 — not live search). */
@@ -18,14 +20,23 @@ export interface PersonaConfig {
 }
 
 export const DEFAULT_PERSONA_CONFIG: PersonaConfig = {
-  model: 'gemini-2.5-flash',
-  concurrency: 1, // R6: free-tier 10 RPM safe
+  model: '', // selected/session model
+  provider: '',
+  concurrency: 1, // safe for rate-limited providers
   webResearch: true,
   fallbackToHost: true,
   maxRetries: 2,
   timeoutMs: 30_000,
   budgetMs: 120_000,
   enabled: true,
+}
+
+/** Infer the provider from a model id when not explicitly set. */
+function inferProvider(model: string): string {
+  if (/gemini/i.test(model)) return 'google'
+  if (/^(gpt|o\d)/i.test(model)) return 'openai'
+  if (/claude/i.test(model)) return 'anthropic'
+  return ''
 }
 
 /** Build config from env, falling back to defaults. All keys optional. */
@@ -36,15 +47,18 @@ export function loadPersonaConfig(env: NodeJS.ProcessEnv = process.env): Persona
   }
   const bool = (v: string | undefined, d: boolean): boolean =>
     v === undefined ? d : /^(1|true|yes|on)$/i.test(v)
+  const model = env['AUTODEV_PERSONA_MODEL'] || ''
   return {
-    model: env['AUTODEV_PERSONA_MODEL'] || DEFAULT_PERSONA_CONFIG.model,
+    model,
+    provider: env['AUTODEV_PERSONA_PROVIDER'] || inferProvider(model),
     concurrency: Math.max(1, num(env['AUTODEV_PERSONA_CONCURRENCY'], DEFAULT_PERSONA_CONFIG.concurrency)),
     webResearch: bool(env['AUTODEV_PERSONA_WEB_RESEARCH'], DEFAULT_PERSONA_CONFIG.webResearch),
     fallbackToHost: bool(env['AUTODEV_PERSONA_FALLBACK'], DEFAULT_PERSONA_CONFIG.fallbackToHost),
     maxRetries: Math.max(0, num(env['AUTODEV_PERSONA_MAX_RETRIES'], DEFAULT_PERSONA_CONFIG.maxRetries)),
     timeoutMs: Math.max(1000, num(env['AUTODEV_PERSONA_TIMEOUT_MS'], DEFAULT_PERSONA_CONFIG.timeoutMs)),
     budgetMs: Math.max(1000, num(env['AUTODEV_PERSONA_BUDGET_MS'], DEFAULT_PERSONA_CONFIG.budgetMs)),
-    // enabled defaults true ONLY if a Gemini key exists; else host-synthesis.
-    enabled: bool(env['AUTODEV_PERSONA_SUBAGENTS'], !!env['GEMINI_API_KEY']),
+    // Default ON: personas use the selected/session model, which is always available.
+    // Disable with AUTODEV_PERSONA_SUBAGENTS=0.
+    enabled: bool(env['AUTODEV_PERSONA_SUBAGENTS'], true),
   }
 }

@@ -2,23 +2,27 @@ import { describe, it, expect } from 'vitest'
 import { loadPersonaConfig, DEFAULT_PERSONA_CONFIG } from '../../src/persona/persona-config.js'
 
 describe('loadPersonaConfig', () => {
-  it('returns defaults for an empty env (no Gemini key => disabled)', () => {
+  it('defaults to the selected/session model, enabled, no key needed', () => {
     const c = loadPersonaConfig({})
-    expect(c.model).toBe(DEFAULT_PERSONA_CONFIG.model)
+    expect(c.model).toBe('') // '' = selected/session model
+    expect(c.provider).toBe('')
     expect(c.concurrency).toBe(1)
-    expect(c.enabled).toBe(false) // no GEMINI_API_KEY
+    expect(c.enabled).toBe(true) // default ON — selected model is always available
   })
 
-  it('enables by default when a Gemini key is present', () => {
-    expect(loadPersonaConfig({ GEMINI_API_KEY: 'x' }).enabled).toBe(true)
+  it('AUTODEV_PERSONA_SUBAGENTS=0 disables (forces host-synthesis)', () => {
+    expect(loadPersonaConfig({ AUTODEV_PERSONA_SUBAGENTS: '0' }).enabled).toBe(false)
+    expect(loadPersonaConfig({ AUTODEV_PERSONA_SUBAGENTS: 'false' }).enabled).toBe(false)
   })
 
-  it('AUTODEV_PERSONA_SUBAGENTS=1 forces enabled even without a key', () => {
-    expect(loadPersonaConfig({ AUTODEV_PERSONA_SUBAGENTS: '1' }).enabled).toBe(true)
+  it('infers the provider from an explicit model id', () => {
+    expect(loadPersonaConfig({ AUTODEV_PERSONA_MODEL: 'gemini-2.5-flash' }).provider).toBe('google')
+    expect(loadPersonaConfig({ AUTODEV_PERSONA_MODEL: 'gpt-5.4' }).provider).toBe('openai')
+    expect(loadPersonaConfig({ AUTODEV_PERSONA_MODEL: 'claude-opus-4-8' }).provider).toBe('anthropic')
   })
 
-  it('AUTODEV_PERSONA_SUBAGENTS=false disables even with a key', () => {
-    expect(loadPersonaConfig({ GEMINI_API_KEY: 'x', AUTODEV_PERSONA_SUBAGENTS: 'false' }).enabled).toBe(false)
+  it('an explicit AUTODEV_PERSONA_PROVIDER overrides inference', () => {
+    expect(loadPersonaConfig({ AUTODEV_PERSONA_MODEL: 'custom', AUTODEV_PERSONA_PROVIDER: 'openai' }).provider).toBe('openai')
   })
 
   it('parses overrides', () => {

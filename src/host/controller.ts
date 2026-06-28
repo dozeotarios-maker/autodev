@@ -588,8 +588,8 @@ export class Controller {
         const pc = this.opts.personaConfig
         checks.push(
           this.personaPanel
-            ? `persona-subagents: enabled (model ${pc?.model ?? '?'}, concurrency ${pc?.concurrency ?? '?'})`
-            : 'persona-subagents: disabled (host-synthesis) — set GEMINI_API_KEY (+ AUTODEV_PERSONA_SUBAGENTS=1) to enable'
+            ? `persona-subagents: enabled (model ${pc?.model || 'selected/session'}, concurrency ${pc?.concurrency ?? '?'})`
+            : 'persona-subagents: disabled (host-synthesis) — set AUTODEV_PERSONA_SUBAGENTS=1 to enable'
         )
         const probe = async (name: string, hc?: { healthCheck(): Promise<{ ok: boolean; details?: string }> }) => {
           if (!hc) { checks.push(`${name}: not wired`); return }
