@@ -49,6 +49,10 @@ export interface ResolveOpts {
   idea: string
   registry: ProjectRegistry
   homeDir?: string
+  /** Autodev's own source root — never used as a build target (prevents building into self). */
+  selfRoot?: string
+  /** Base dir for NEW projects. Default: AUTODEV_BUILD_ROOT env, else <os.tmpdir()>/autodev. */
+  buildRoot?: string
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -119,6 +123,23 @@ function isHomeOrAncestor(dir: string, homeDir: string): boolean {
   return false
 }
 
+/** True if `dir` is `root` or lives inside it. */
+function isUnderOrEqual(dir: string, root: string): boolean {
+  const d = realpathSafe(dir)
+  const r = realpathSafe(root)
+  return d === r || d.startsWith(r + path.sep)
+}
+
+/**
+ * A dir must never be returned as the build target if it is $HOME (or an ancestor) OR
+ * autodev's own source tree — building into either is destructive/surprising.
+ */
+function isForbidden(dir: string, homeDir: string, selfRoot?: string): boolean {
+  if (isHomeOrAncestor(dir, homeDir)) return true
+  if (selfRoot && isUnderOrEqual(dir, selfRoot)) return true
+  return false
+}
+
 // ── Resolver ──────────────────────────────────────────────────────────────────
 
 export async function resolveProjectDir(opts: ResolveOpts): Promise<ResolveResult> {
@@ -131,14 +152,14 @@ export async function resolveProjectDir(opts: ResolveOpts): Promise<ResolveResul
     const meta = await registry.get(registeredName)
     const dir = meta?.dir ?? path.resolve(cwd)
     // Guardrail: if the registered dir is homeDir or an ancestor, fall through
-    if (!isHomeOrAncestor(dir, homeDir)) {
+    if (!isForbidden(dir, homeDir, opts.selfRoot)) {
       return { dir, name: registeredName, isNew: false, isExisting: true }
     }
   }
 
   // Step 2: cwd is a real repo (git root OR has package.json) AND cwd !== homeDir
   const cwdResolved = path.resolve(cwd)
-  if (!isHomeOrAncestor(cwdResolved, homeDir) && (isGitRepo(cwd) || hasPackageJson(cwd))) {
+  if (!isForbidden(cwdResolved, homeDir, opts.selfRoot) && (isGitRepo(cwd) || hasPackageJson(cwd))) {
     const name = readPackageName(cwd) ?? path.basename(cwdResolved)
     await registry.register(name, cwdResolved)
     return { dir: cwdResolved, name, isNew: false, isExisting: true }
@@ -151,20 +172,22 @@ export async function resolveProjectDir(opts: ResolveOpts): Promise<ResolveResul
     if (meta !== undefined) {
       const dir = meta.dir
       // Guardrail: if the active dir IS homeDir or ancestor, fall through to step 4
-      if (!isHomeOrAncestor(dir, homeDir)) {
+      if (!isForbidden(dir, homeDir, opts.selfRoot)) {
         return { dir, name: activeName, isNew: false, isExisting: true }
       }
     }
   }
 
-  // Step 4: new project — slug + 12-char hash, scoped under ~/autodev/<slug>
-  // Fix 6: fall back to 'project' when slug is empty (all-symbol idea) to avoid
-  // leading-hyphen dir names like `-abc`.
+  // Step 4: new project — slug + 12-char hash, scoped under a TEMPORAL off-root base
+  // (default <os.tmpdir()>/autodev, overridable via AUTODEV_BUILD_ROOT) so autodev never
+  // builds under $HOME/root or into its own repo. Fix 6: fall back to 'project' when the
+  // slug is empty (all-symbol idea) to avoid leading-hyphen dir names like `-abc`.
   const rawSlug = slugify(idea)
   const slug = rawSlug.length > 0 ? rawSlug : 'project'
   const hash = hexHash(idea)
   const name = `${slug}-${hash}`
-  const dir = path.join(homeDir, 'autodev', name)
+  const base = opts.buildRoot ?? process.env['AUTODEV_BUILD_ROOT'] ?? path.join(os.tmpdir(), 'autodev')
+  const dir = path.join(base, name)
   await registry.register(name, dir)
   return { dir, name, isNew: true, isExisting: false }
 }

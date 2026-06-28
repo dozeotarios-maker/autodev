@@ -218,21 +218,24 @@ describe('resolveProjectDir — step 4: new project', () => {
   beforeEach(async () => { tmpDir = await makeTmpDir() })
   afterEach(async () => { await fs.rm(tmpDir, { recursive: true, force: true }) })
 
-  it('junk cwd + no active → isNew=true, dir under homeDir/autodev/<slug>', async () => {
+  it('junk cwd + no active → isNew=true, dir under the temporal build root (not home)', async () => {
     const registry = new ProjectRegistry(tmpDir)
     const fakeHome = '/tmp/fake-home-xyz'
+    const buildRoot = '/tmp/fake-build-root'
 
     const result = await resolveProjectDir({
       cwd: '/tmp/no-such-dir-abc',
       idea: 'build a weather app',
       registry,
       homeDir: fakeHome,
+      buildRoot,
     })
 
     expect(result.isNew).toBe(true)
     expect(result.isExisting).toBe(false)
     expect(result.dir).not.toBe(fakeHome)
-    expect(result.dir.startsWith(path.join(fakeHome, 'autodev') + path.sep)).toBe(true)
+    expect(result.dir.startsWith(buildRoot + path.sep)).toBe(true)
+    expect(result.dir.startsWith(path.join(fakeHome, 'autodev'))).toBe(false)
   })
 
   it('same idea twice → same slug+hash (deterministic)', async () => {
@@ -270,21 +273,45 @@ describe('resolveProjectDir — guardrail: never return homeDir', () => {
   beforeEach(async () => { tmpDir = await makeTmpDir() })
   afterEach(async () => { await fs.rm(tmpDir, { recursive: true, force: true }) })
 
-  it('cwd === homeDir → falls through to step 4 (scoped subdir)', async () => {
+  it('cwd === homeDir → falls through to step 4 (temporal build root, not home)', async () => {
     const fakeHome = await makeTmpDir()
     const registry = new ProjectRegistry(tmpDir)
+    const buildRoot = '/tmp/fake-build-root-2'
 
     const result = await resolveProjectDir({
       cwd: fakeHome,
       idea: 'some cool project',
       registry,
       homeDir: fakeHome,
+      buildRoot,
     })
 
     expect(result.isNew).toBe(true)
     expect(result.dir).not.toBe(fakeHome)
-    expect(result.dir.startsWith(path.join(fakeHome, 'autodev') + path.sep)).toBe(true)
+    expect(result.dir.startsWith(buildRoot + path.sep)).toBe(true)
     await fs.rm(fakeHome, { recursive: true, force: true })
+  })
+
+  it('cwd inside autodev selfRoot → never builds into self (step 4 temporal)', async () => {
+    const selfRoot = await makeTmpDir()
+    // Make selfRoot look like a real project so step 2 WOULD fire without the guard.
+    await fs.writeFile(path.join(selfRoot, 'package.json'), '{"name":"pi-autodev"}')
+    const registry = new ProjectRegistry(tmpDir)
+    const buildRoot = '/tmp/fake-build-root-3'
+
+    const result = await resolveProjectDir({
+      cwd: selfRoot,
+      idea: 'a brand new idea',
+      registry,
+      homeDir: '/tmp/fake-home-self',
+      selfRoot,
+      buildRoot,
+    })
+
+    expect(result.isNew).toBe(true)
+    expect(result.dir.startsWith(buildRoot + path.sep)).toBe(true)
+    expect(result.dir.startsWith(selfRoot + path.sep)).toBe(false) // not built into autodev's tree
+    await fs.rm(selfRoot, { recursive: true, force: true })
   })
 
   it('registered project whose dir IS homeDir is NOT returned (guardrail)', async () => {
@@ -348,13 +375,14 @@ describe('resolveProjectDir — guardrail: never return homeDir', () => {
       idea: 'symlinked home guardrail',
       registry,
       homeDir,
+      buildRoot: '/tmp/fake-build-root-sym',
     })
 
-    // Guardrail dereferenced the symlink → registered dir === home → step 4.
+    // Guardrail dereferenced the symlink → registered dir === home → step 4 (temporal base).
     // On the OLD realpathSafe this would return isNew=false (the registered dir).
     expect(result.isNew).toBe(true)
     expect(result.dir).not.toBe(registeredViaLink)
-    expect(result.dir.startsWith(path.join(homeDir, 'autodev') + path.sep)).toBe(true)
+    expect(result.dir.startsWith('/tmp/fake-build-root-sym' + path.sep)).toBe(true)
   })
 })
 

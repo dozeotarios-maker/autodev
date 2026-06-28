@@ -238,6 +238,8 @@ export interface ControllerOptions {
   personaRunner?: PersonaSessionRunner
   /** Persona panel config (model, concurrency, fallback). Built from env in the extension. */
   personaConfig?: PersonaConfig
+  /** Autodev's own source root — never used as a build target (prevents building into self). */
+  selfRoot?: string
 }
 
 // ── B1: Override-prefix parser ────────────────────────────────────────────────
@@ -1178,6 +1180,7 @@ export class Controller {
         idea,
         registry: this.opts.registry,
         homeDir: os.homedir(),
+        selfRoot: this.opts.selfRoot,
       })
     } catch (e) {
       void this.journal.write({

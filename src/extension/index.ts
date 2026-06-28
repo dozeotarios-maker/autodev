@@ -480,6 +480,8 @@ export default function autodevExtension(pi: ExtensionAPI): void {
     boundedExec,
     personaRunner,
     personaConfig,
+    // Autodev's own repo root — the resolver refuses to build into it (no building into self).
+    selfRoot: join(dirname(fileURLToPath(import.meta.url)), '..', '..'),
   })
 
   controller.wire()
