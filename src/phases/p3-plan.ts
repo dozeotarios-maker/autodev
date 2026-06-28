@@ -11,7 +11,7 @@
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import type { HostAgent } from '../host/host-agent.js'
-import type { P3Context, P3Output } from './phase-output.js'
+import type { P3Context, P3Output, PersonaDebateEntry } from './phase-output.js'
 import { validateP3Output } from './phase-output.js'
 import type { PhaseResult } from './phase-executor.js'
 import { wrapUntrusted } from './safe-prompt.js'
@@ -232,21 +232,28 @@ export class P3Plan {
     round: number,
     panelCount: number
   ): Promise<{ done: boolean; objections?: string }> {
-    const personas = await this.panel!.select(ctx.p1.spec, ALL_PERSONA_NAMES, panelCount)
-    const planSummary = [
-      `Goal: ${output.sprintContract.goal}`,
-      `Files: ${output.fileDAG.map((e) => e.file).join(', ')}`,
-      `Success: ${output.sprintContract.successCriteria.join('; ')}`,
-    ].join('\n')
-    const debate = await this.panel!.dispatch(personas, {
-      phase: 'P3',
-      idea: ctx.p1.spec,
-      spec: ctx.p1.spec,
-      stackAdr: ctx.p1.stackAdr,
-      domainModel: ctx.p2.domainModel,
-      planSummary,
-      research: digestResearch(ctx.p1.webResearch),
-    })
+    // The panel degrades internally; a throw here (selector/dispatch error) degrades to
+    // "no objections" (accept the plan) rather than crashing the phase.
+    let debate: PersonaDebateEntry[]
+    try {
+      const personas = await this.panel!.select(ctx.p1.spec, ALL_PERSONA_NAMES, panelCount)
+      const planSummary = [
+        `Goal: ${output.sprintContract.goal}`,
+        `Files: ${output.fileDAG.map((e) => e.file).join(', ')}`,
+        `Success: ${output.sprintContract.successCriteria.join('; ')}`,
+      ].join('\n')
+      debate = await this.panel!.dispatch(personas, {
+        phase: 'P3',
+        idea: ctx.p1.spec,
+        spec: ctx.p1.spec,
+        stackAdr: ctx.p1.stackAdr,
+        domainModel: ctx.p2.domainModel,
+        planSummary,
+        research: digestResearch(ctx.p1.webResearch),
+      })
+    } catch {
+      debate = []
+    }
     const objCount = debate.reduce((n, d) => n + d.objections.length, 0)
     output.panelObjCount = objCount // R4: authoritative count
     await fs.writeFile(outputFile, JSON.stringify(output, null, 2))

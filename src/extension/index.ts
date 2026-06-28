@@ -449,15 +449,20 @@ export default function autodevExtension(pi: ExtensionAPI): void {
   // ── Persona panel (real Gemini subagents) — enabled when a Gemini key is present ──
   const personaConfig = loadPersonaConfig()
   const geminiKey = process.env['GEMINI_API_KEY']
-  const personaRunner =
-    personaConfig.enabled && geminiKey
-      ? new GeminiSessionRunner({
-          model: personaConfig.model,
-          apiKey: geminiKey,
-          thinkingLevel: 'low',
-          timeoutMs: personaConfig.timeoutMs,
-        })
-      : undefined
+  let personaRunner: GeminiSessionRunner | undefined
+  if (personaConfig.enabled && geminiKey) {
+    try {
+      personaRunner = new GeminiSessionRunner({
+        model: personaConfig.model,
+        apiKey: geminiKey,
+        thinkingLevel: 'low',
+        timeoutMs: personaConfig.timeoutMs,
+      })
+    } catch (e) {
+      // Runner init failed (e.g. auth/registry construction) — degrade to host-synthesis.
+      console.warn('[pi-autodev] persona runner init failed; using host-synthesis:', e instanceof Error ? e.message : e)
+    }
+  }
 
   const controller = new Controller(pi, {
     repoRoot,

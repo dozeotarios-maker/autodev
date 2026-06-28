@@ -111,6 +111,18 @@ describe('PersonaPanel.dispatch', () => {
     expect(runner.calls).toBe(0)
     expect(out.every((o) => o.stance === 'host')).toBe(true)
   })
+
+  it('never throws even when the host-synthesis fallback itself throws (never-block contract)', async () => {
+    const runner = mockRunner(async () => ({ ok: false, text: '', failure: 'error' }))
+    const panel = new PersonaPanel({
+      runner,
+      config: cfg({ maxRetries: 0 }),
+      hostSynthesize: async () => { throw new Error('host down') },
+    })
+    const out = await panel.dispatch(['user', 'developer'], CTX)
+    expect(out).toHaveLength(2)
+    expect(out.every((o) => o.objections.length === 0)).toBe(true)
+  })
 })
 
 describe('parseObjectionJson', () => {

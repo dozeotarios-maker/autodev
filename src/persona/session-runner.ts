@@ -30,10 +30,13 @@ export function classifyFailure(stopReason?: string, errorMessage?: string): Per
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    p,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error('persona prompt timeout')), ms)),
-  ])
+  let timer: ReturnType<typeof setTimeout>
+  const timeout = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('persona prompt timeout')), ms)
+  })
+  // Clear the timer on BOTH paths so a fast happy-path response leaves no dangling timer
+  // (dozens would otherwise accumulate across personas × retries × rounds).
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer))
 }
 
 export interface GeminiRunnerOptions {
@@ -87,7 +90,10 @@ export class GeminiSessionRunner implements PersonaSessionRunner {
 
     const { session } = created
     try {
-      await withTimeout(session.prompt(`${systemPrompt}\n\n---\n\n${task}`), this.opts.timeoutMs ?? 30_000)
+      // dispose() in the finally is best-effort: pi exposes no AbortSignal on prompt(), so a
+      // timed-out call may still run to completion in the background (bounded by the model).
+      // A distinctive separator avoids colliding with `---` rules inside the task text.
+      await withTimeout(session.prompt(`${systemPrompt}\n\n=== TASK ===\n\n${task}`), this.opts.timeoutMs ?? 30_000)
       const { text, stopReason, errorMessage } = extractAssistantText(session.messages as unknown[])
       const failure = classifyFailure(stopReason, errorMessage)
       if (failure) return { ok: false, text, failure, errorMessage }

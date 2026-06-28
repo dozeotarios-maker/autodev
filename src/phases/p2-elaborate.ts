@@ -163,20 +163,23 @@ export class P2Elaborate {
       return { ok: false, reason: 'P2 domainModel is too short (< 20 chars)' }
     }
 
-    // 3. Persona panel reviews the domain model as isolated subagents.
-    const personas = await this.panel!.select(ctx.p1.spec, ALL_PERSONA_NAMES, panelPersonas)
-    const panelDebate = await this.panel!.dispatch(personas, {
-      phase: 'P2',
-      idea: ctx.p1.spec,
-      spec: ctx.p1.spec,
-      stackAdr: ctx.p1.stackAdr,
-      domainModel: output.domainModel,
-      research: digestResearch(ctx.p1.webResearch),
-    })
-
-    // 4. R4: panel objections are authoritative — overwrite whatever the host left.
-    output.personaDebate = panelDebate
-    await fs.writeFile(outputFile, JSON.stringify(output, null, 2))
+    // 3. Persona panel reviews the domain model as isolated subagents. The panel degrades
+    //    internally; a throw here (e.g. selector error) degrades to the host's empty debate
+    //    rather than crashing the phase. 4. R4: panel objections are authoritative.
+    try {
+      const personas = await this.panel!.select(ctx.p1.spec, ALL_PERSONA_NAMES, panelPersonas)
+      output.personaDebate = await this.panel!.dispatch(personas, {
+        phase: 'P2',
+        idea: ctx.p1.spec,
+        spec: ctx.p1.spec,
+        stackAdr: ctx.p1.stackAdr,
+        domainModel: output.domainModel,
+        research: digestResearch(ctx.p1.webResearch),
+      })
+      await fs.writeFile(outputFile, JSON.stringify(output, null, 2))
+    } catch {
+      // Panel unavailable — keep the host's output (empty debate). The run still proceeds.
+    }
     return { ok: true, output }
   }
 }

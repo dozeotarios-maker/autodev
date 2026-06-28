@@ -73,9 +73,9 @@ export class PersonaPanel {
 
   /** Dispatch the chosen personas; one debate entry per persona, order preserved. */
   async dispatch(personas: string[], ctx: PersonaContext): Promise<PersonaDebateEntry[]> {
-    const { config, hostSynthesize, log } = this.deps
+    const { config, log } = this.deps
     if (!config.enabled || personas.length === 0) {
-      return personas.length ? hostSynthesize(personas, ctx) : []
+      return personas.length ? this._safeHostSynthesize(personas, ctx) : []
     }
 
     this.consecutiveFailures = 0
@@ -86,12 +86,15 @@ export class PersonaPanel {
     let queue = 0
 
     const worker = async (): Promise<void> => {
-      while (queue < personas.length) {
-        const i = queue++
+      // `i = queue++` claims an index atomically (no await between read and increment), so
+      // concurrent workers never double-claim — including on the synchronous `continue` paths.
+      let i: number
+      while ((i = queue++) < personas.length) {
         const name = personas[i]
         const spec = getPersona(name)
         if (!spec) { results[i] = { persona: name, stance: '', objections: [] }; continue }
-        // Circuit breaker + soft time budget → short-circuit straight to fallback.
+        // Circuit breaker + soft time budget → short-circuit straight to fallback. The
+        // breaker is exact at concurrency=1 (the default) and best-effort above it.
         if (this.consecutiveFailures >= CIRCUIT_BREAK_THRESHOLD || now() - start > config.budgetMs) {
           fellBack.push(i)
           continue
@@ -106,12 +109,22 @@ export class PersonaPanel {
     if (fellBack.length && config.fallbackToHost) {
       log?.(`persona-panel: ${fellBack.length}/${personas.length} fell back to host-synthesis`)
       const names = fellBack.map((i) => personas[i])
-      const synth = await hostSynthesize(names, ctx)
+      const synth = await this._safeHostSynthesize(names, ctx)
       fellBack.forEach((i, k) => { results[i] = synth[k] ?? { persona: personas[i], stance: '', objections: [] } })
     } else if (fellBack.length) {
       fellBack.forEach((i) => { results[i] = { persona: personas[i], stance: '', objections: [] } })
     }
     return results.map((r, i) => r ?? { persona: personas[i], stance: '', objections: [] })
+  }
+
+  /** hostSynthesize must NEVER throw out of the panel — that is the "never block" contract. */
+  private async _safeHostSynthesize(personas: string[], ctx: PersonaContext): Promise<PersonaDebateEntry[]> {
+    try {
+      return await this.deps.hostSynthesize(personas, ctx)
+    } catch {
+      this.deps.log?.('persona-panel: host-synthesis fallback threw; degrading to empty objections')
+      return personas.map((p) => ({ persona: p, stance: '', objections: [] }))
+    }
   }
 
   /** One persona with bounded 429 backoff. Returns null if it should fall back. */
