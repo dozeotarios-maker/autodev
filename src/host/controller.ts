@@ -614,12 +614,16 @@ export class Controller {
 
   private async _onSessionStart(ctx: ExtensionContext): Promise<void> {
     this.startedAt = Date.now()
+    this.opts.personaRunner?.setHostModel?.(ctx.model)
     await this.lifecycle.arm()
     await this.opts.transparency.log('session_start: ARMED')
     ctx.ui.setStatus('autodev', 'ARMED')
   }
 
   private async _onInput(e: InputEvent, ctx: ExtensionContext): Promise<void> {
+    // Capture the host's current model so persona subagents run the operator's chosen
+    // session model (ctx.model) — the exact model selected for this run, not the settings default.
+    this.opts.personaRunner?.setHostModel?.(ctx.model)
     // Filter self-originated steers: pi echoes sendUserMessage back through the `input`
     // event with source='extension'. These are autodev's own steer messages — the host LLM
     // acts on them; the controller observes the result via agent_end, NOT via the input event.

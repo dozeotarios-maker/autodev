@@ -26,11 +26,16 @@ export interface PersonaRunResult {
   errorMessage?: string
 }
 
-/** One isolated reasoning run. Implemented by Gemini (real) or a mock (tests). */
+/** One isolated reasoning run. Implemented by the pi session runner (real) or a mock (tests). */
 export interface PersonaSessionRunner {
   run(systemPrompt: string, task: string): Promise<PersonaRunResult>
   /** Optional cheap one-shot used by the relevance selector (defaults to run). */
   ask?(systemPrompt: string, task: string): Promise<PersonaRunResult>
+  /**
+   * Inject the host session's CURRENT model (ctx.model) so persona subagents run the
+   * exact model the operator chose for this session — not the settings default.
+   */
+  setHostModel?(model: unknown): void
 }
 
 /** Host-synthesis fallback signature (the existing steer path), injected into the panel. */

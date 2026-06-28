@@ -60,6 +60,7 @@ export class PiSessionRunner implements PersonaSessionRunner {
   private readonly auth: AuthStorage
   private readonly registry: ModelRegistry
   private model: ReturnType<ModelRegistry['find']> | undefined
+  private hostModel: ReturnType<ModelRegistry['find']> | undefined
   private resolved = false
 
   constructor(private readonly opts: PiRunnerOptions = {}) {
@@ -78,13 +79,21 @@ export class PiSessionRunner implements PersonaSessionRunner {
     this.resolved = true
   }
 
+  /** Set by the controller from ctx.model so personas run the operator's chosen session model. */
+  setHostModel(model: unknown): void {
+    this.hostModel = (model ?? undefined) as ReturnType<ModelRegistry['find']>
+  }
+
   async run(systemPrompt: string, task: string): Promise<PersonaRunResult> {
     this.resolveModel()
+    // Priority: explicit AUTODEV_PERSONA_MODEL override > the host session's exact model
+    // (ctx.model) > omit (createAgentSession falls back to the settings default).
+    const chosen = this.model ?? this.hostModel
 
     let created
     try {
       created = await createAgentSession({
-        ...(this.model ? { model: this.model } : {}),
+        ...(chosen ? { model: chosen } : {}),
         modelRegistry: this.registry,
         authStorage: this.auth,
         sessionManager: SessionManager.inMemory(),
