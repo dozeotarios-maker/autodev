@@ -91,6 +91,8 @@ import { SubagentRunner } from '../lanes/subagent-runner.js'
 // ── S2-M2: Controller ────────────────────────────────────────────────────────
 import { Controller } from '../host/controller.js'
 import { ProjectRegistry } from '../project/registry.js'
+import { loadPersonaConfig } from '../persona/persona-config.js'
+import { GeminiSessionRunner } from '../persona/session-runner.js'
 
 // ── Extension options (all external boundaries injectable for test isolation) ──
 export interface AutodevExtensionOptions {
@@ -444,6 +446,19 @@ export default function autodevExtension(pi: ExtensionAPI): void {
 
   const boundedExec = new BoundedExecImpl(new ActionMonitor([repoRoot]))
 
+  // ── Persona panel (real Gemini subagents) — enabled when a Gemini key is present ──
+  const personaConfig = loadPersonaConfig()
+  const geminiKey = process.env['GEMINI_API_KEY']
+  const personaRunner =
+    personaConfig.enabled && geminiKey
+      ? new GeminiSessionRunner({
+          model: personaConfig.model,
+          apiKey: geminiKey,
+          thinkingLevel: 'low',
+          timeoutMs: personaConfig.timeoutMs,
+        })
+      : undefined
+
   const controller = new Controller(pi, {
     repoRoot,
     verifier,
@@ -456,6 +471,8 @@ export default function autodevExtension(pi: ExtensionAPI): void {
     securityLane,
     registry,
     boundedExec,
+    personaRunner,
+    personaConfig,
   })
 
   controller.wire()

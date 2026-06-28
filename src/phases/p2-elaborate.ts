@@ -5,6 +5,7 @@
 // The persona panel is synthesised by the host LLM adopting each persona in turn
 // (not via parallel subagents — persona names are not valid subagent agent types).
 
+import * as fs from 'fs/promises'
 import * as path from 'path'
 import type { HostAgent } from '../host/host-agent.js'
 import { PhaseExecutor } from './phase-executor.js'
@@ -13,6 +14,9 @@ import { validateP2Output } from './phase-output.js'
 import type { PhaseResult } from './phase-executor.js'
 import { wrapUntrusted } from './safe-prompt.js'
 import { DEFAULT_SIZING } from '../engine/complexity.js'
+import type { PersonaPanel } from '../persona/persona-panel.js'
+import { digestResearch } from '../persona/host-synthesis-fallback.js'
+import { ALL_PERSONA_NAMES } from '../persona/persona-registry.js'
 
 const ROLE_DIRECTIVES = `
 ## Role: Elaboration Agent (P2)
@@ -29,13 +33,22 @@ const ALL_PERSONAS = ['user', 'developer', 'security', 'ops', 'product-manager']
 // acts as each persona in turn and collects their objections internally.
 // This avoids "Unknown agent" errors while producing equivalent debate quality.
 
-export function buildP2Instruction(ctx: P2Context, outputFile: string): string {
+export function buildP2Instruction(
+  ctx: P2Context,
+  outputFile: string,
+  opts: { panelMode?: boolean } = {}
+): string {
   const sizing = ctx.sizing ?? DEFAULT_SIZING
   const panelPersonas = sizing.panelPersonas
   const personas = ALL_PERSONAS.slice(0, panelPersonas)
   const skipPanel = panelPersonas === 0
 
-  const panelSection = skipPanel
+  const panelSection = opts.panelMode
+    ? [
+        `## Persona panel`,
+        'An independent persona panel (real subagents) reviews your domain model separately. Set personaDebate to [] — it is populated from the panel, not by you.',
+      ]
+    : skipPanel
     ? [
         `## Persona panel`,
         'Panel skipped (XS tier — panelPersonas=0). Set personaDebate to [].',
@@ -84,12 +97,20 @@ export class P2Elaborate {
   constructor(
     private readonly hostAgent: HostAgent,
     private readonly outputDir: string,
-    private readonly timeoutMs?: number
+    private readonly timeoutMs?: number,
+    private readonly panel?: PersonaPanel
   ) {}
 
   async execute(ctx: P2Context): Promise<PhaseResult<P2Output>> {
     const outputFile = path.join(this.outputDir, 'p2-domain.json')
     const panelPersonas = ctx.sizing?.panelPersonas ?? DEFAULT_SIZING.panelPersonas
+
+    // Real-subagent panel path: the host produces the domain model, the persona panel
+    // reviews it as isolated subagents, and its objections are written authoritatively (R4).
+    if (this.panel && panelPersonas > 0) {
+      await fs.mkdir(path.dirname(outputFile), { recursive: true })
+      return this._executeWithPanel(ctx, outputFile, panelPersonas)
+    }
 
     const executor = new PhaseExecutor<P2Context, P2Output>(this.hostAgent, {
       phase: 'P2',
@@ -110,5 +131,52 @@ export class P2Elaborate {
     })
 
     return executor.execute(ctx)
+  }
+
+  private async _executeWithPanel(
+    ctx: P2Context,
+    outputFile: string,
+    panelPersonas: number
+  ): Promise<PhaseResult<P2Output>> {
+    // 1. Host produces the domain model only (panel mode: no host persona synthesis).
+    try {
+      await this.hostAgent.steer(buildP2Instruction(ctx, outputFile, { panelMode: true }), {
+        expectFile: outputFile,
+        ...(this.timeoutMs !== undefined ? { timeoutMs: this.timeoutMs } : {}),
+      })
+    } catch (err) {
+      return { ok: false, reason: `P2 steer failed: ${String(err)}` }
+    }
+
+    // 2. Read + validate the host output.
+    let raw: unknown
+    try {
+      raw = JSON.parse(await fs.readFile(outputFile, 'utf-8'))
+    } catch (err) {
+      return { ok: false, reason: `P2 file read failed: ${String(err)}` }
+    }
+    if (!validateP2Output(raw)) {
+      return { ok: false, reason: 'P2 output failed schema validation' }
+    }
+    const output: P2Output = raw
+    if (!output.domainModel || output.domainModel.trim().length < 20) {
+      return { ok: false, reason: 'P2 domainModel is too short (< 20 chars)' }
+    }
+
+    // 3. Persona panel reviews the domain model as isolated subagents.
+    const personas = await this.panel!.select(ctx.p1.spec, ALL_PERSONA_NAMES, panelPersonas)
+    const panelDebate = await this.panel!.dispatch(personas, {
+      phase: 'P2',
+      idea: ctx.p1.spec,
+      spec: ctx.p1.spec,
+      stackAdr: ctx.p1.stackAdr,
+      domainModel: output.domainModel,
+      research: digestResearch(ctx.p1.webResearch),
+    })
+
+    // 4. R4: panel objections are authoritative — overwrite whatever the host left.
+    output.personaDebate = panelDebate
+    await fs.writeFile(outputFile, JSON.stringify(output, null, 2))
+    return { ok: true, output }
   }
 }

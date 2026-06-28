@@ -65,6 +65,10 @@ import { MINIMALISM_DIRECTIVE, CRAFTSMANSHIP_DIRECTIVE } from '../principles.js'
 import type { RetroWriter } from '../engine/retro.js'
 import { resolveProjectDir } from '../project/resolver.js'
 import { ensureGitRepo } from '../git/ensure-repo.js'
+import { PersonaPanel } from '../persona/persona-panel.js'
+import type { PersonaContext, PersonaDebateEntry, PersonaSessionRunner } from '../persona/types.js'
+import type { PersonaConfig } from '../persona/persona-config.js'
+import { buildHostSynthesisPrompt, coercePersonaDebate } from '../persona/host-synthesis-fallback.js'
 import type { ProjectRegistry } from '../project/registry.js'
 
 // ── compactAsync ─────────────────────────────────────────────────────────────
@@ -230,6 +234,10 @@ export interface ControllerOptions {
   registry?: ProjectRegistry
   /** Optional bounded executor — runs untrusted repro commands with timeout + action-monitor gate. */
   boundedExec?: BoundedExec
+  /** Optional persona-subagent runner (Gemini). When present + enabled, P2/P3 run a real panel. */
+  personaRunner?: PersonaSessionRunner
+  /** Persona panel config (model, concurrency, fallback). Built from env in the extension. */
+  personaConfig?: PersonaConfig
 }
 
 // ── B1: Override-prefix parser ────────────────────────────────────────────────
@@ -284,6 +292,7 @@ export function parseOverrides(raw: string): ParsedOverrides {
 export class Controller {
   private readonly hostAgent: HostAgent
   private readonly subagentDriver: SubagentDriver
+  private readonly personaPanel?: PersonaPanel
   private readonly fsm: FSM
   private readonly lifecycle: Lifecycle
   private journal: Journal
@@ -332,6 +341,16 @@ export class Controller {
     this.repoRoot = opts.repoRoot
     this.hostAgent = new HostAgent(pi)
     this.subagentDriver = new SubagentDriver(this.hostAgent)
+    // Persona panel (real Gemini subagents) — only when a runner + enabled config are injected.
+    // Lives on the Controller so its host-synthesis fallback can reach this.hostAgent (R3).
+    if (opts.personaRunner && opts.personaConfig?.enabled) {
+      this.personaPanel = new PersonaPanel({
+        runner: opts.personaRunner,
+        config: opts.personaConfig,
+        hostSynthesize: (personas, pctx) => this._personaHostSynthesize(personas, pctx),
+        log: (m) => { void this.journal.write({ type: 'decision', phase: 'P2', action: m }) },
+      })
+    }
     this.fsm = new FSM({
       onJournal: (entry) => {
         void this.journal.write({
@@ -357,6 +376,25 @@ export class Controller {
     this.masker = new ObservationMasker(20)
     this.outputDir = path.join(opts.repoRoot, '.autodev', 'phase-output')
     this.pauseFilePath = opts.pauseFilePath ?? path.join(opts.repoRoot, '.autodev', 'PAUSE')
+  }
+
+  /**
+   * R3: the persona panel's host-synthesis fallback — steer the host to act as the given
+   * personas and parse the debate it writes. Called by PersonaPanel only when a Gemini
+   * session fails, and always sequentially (never while a phase steer is in flight).
+   */
+  private async _personaHostSynthesize(personas: string[], pctx: PersonaContext): Promise<PersonaDebateEntry[]> {
+    const outFile = path.join(this.outputDir, 'persona-fallback.json')
+    try {
+      await this.hostAgent.steer(buildHostSynthesisPrompt(personas, pctx, outFile), {
+        expectFile: outFile,
+        ...(this.opts.steerTimeoutMs !== undefined ? { timeoutMs: this.opts.steerTimeoutMs } : {}),
+      })
+      const raw = JSON.parse(await fs.readFile(outFile, 'utf-8'))
+      return coercePersonaDebate(raw, personas)
+    } catch {
+      return personas.map((p) => ({ persona: p, stance: '', objections: [] }))
+    }
   }
 
   // ── Wire all pi events ────────────────────────────────────────────────────
@@ -547,6 +585,12 @@ export class Controller {
         } catch {
           checks.push('outputDir: not yet created (normal before first run)')
         }
+        const pc = this.opts.personaConfig
+        checks.push(
+          this.personaPanel
+            ? `persona-subagents: enabled (model ${pc?.model ?? '?'}, concurrency ${pc?.concurrency ?? '?'})`
+            : 'persona-subagents: disabled (host-synthesis) — set GEMINI_API_KEY (+ AUTODEV_PERSONA_SUBAGENTS=1) to enable'
+        )
         const probe = async (name: string, hc?: { healthCheck(): Promise<{ ok: boolean; details?: string }> }) => {
           if (!hc) { checks.push(`${name}: not wired`); return }
           try {
@@ -909,7 +953,7 @@ export class Controller {
       // ── P2 ELABORATE ─────────────────────────────────────────────────────
       if (await this._isPaused()) { await this._waitResume() }
 
-      const p2 = new P2Elaborate(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
+      const p2 = new P2Elaborate(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs, this.personaPanel)
       const p2Result = await p2.execute({ phase: 'P2', p1: this.phaseStore.p1, sizing: this.currentSizing })
       if (!p2Result.ok || !p2Result.output) {
         await this._escalate('P2', p2Result.reason ?? 'P2 failed')
@@ -936,7 +980,7 @@ export class Controller {
       // ── P3 PLAN ──────────────────────────────────────────────────────────
       if (await this._isPaused()) { await this._waitResume() }
 
-      const p3 = new P3Plan(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
+      const p3 = new P3Plan(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs, this.personaPanel)
       const p3Result = await p3.execute({
         phase: 'P3',
         p1: this.phaseStore.p1,
@@ -1028,7 +1072,7 @@ export class Controller {
         await this.fsm.backedge('P3')
         this.opts.transparency.setHudStatus('P3', 'H9 re-plan', 'running', 'opus')
         // Re-run from P3 with updated context
-        const p3b = new P3Plan(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
+        const p3b = new P3Plan(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs, this.personaPanel)
         const p3bResult = await p3b.execute({
           phase: 'P3',
           p1: this.phaseStore.p1,
@@ -1591,7 +1635,7 @@ export class Controller {
       // ── P3 PLAN ──────────────────────────────────────────────────────────
       if (await this._isPaused()) { await this._waitResume() }
 
-      const p3 = new P3Plan(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
+      const p3 = new P3Plan(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs, this.personaPanel)
       const p3Result = await p3.execute({
         phase: 'P3',
         p1: this.phaseStore.p1!,
@@ -2375,7 +2419,7 @@ export class Controller {
   }
 
   private async _rerunP2(note: string | undefined): Promise<boolean> {
-    const r = new P2Elaborate(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
+    const r = new P2Elaborate(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs, this.personaPanel)
     const res = await r.execute({ phase: 'P2', p1: this.phaseStore.p1!, sizing: this.currentSizing })
     if (!res.ok || !res.output) { await this._escalate('P2', res.reason ?? 'P2 re-run failed'); return false }
     this.phaseStore.p2 = res.output
@@ -2384,7 +2428,7 @@ export class Controller {
   }
 
   private async _rerunP3(note: string | undefined): Promise<boolean> {
-    const r = new P3Plan(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs)
+    const r = new P3Plan(this.hostAgent, this.outputDir, this.opts.steerTimeoutMs, this.personaPanel)
     const res = await r.execute({ phase: 'P3', p1: this.phaseStore.p1!, p2: this.phaseStore.p2!, sizing: this.currentSizing })
     if (!res.ok || !res.output) {
       const f = res as { ok: false; reason?: string; operatorBrief?: unknown }
