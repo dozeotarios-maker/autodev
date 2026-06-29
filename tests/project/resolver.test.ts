@@ -265,6 +265,22 @@ describe('resolveProjectDir — step 4: new project', () => {
     expect(r1.dir).toBe(r2.dir)
     void registry2
   })
+
+  it('forceTemporal (testing mode) → fresh timestamped folder every run, ignoring cwd', async () => {
+    const buildRoot = '/tmp/fake-build-root-temp'
+    const registry = new ProjectRegistry(tmpDir)
+    const r1 = await resolveProjectDir({
+      cwd: '/tmp/no-such-dir', idea: 'same idea', registry,
+      homeDir: '/tmp/fake-home-t', buildRoot, forceTemporal: true, now: 1000,
+    })
+    const r2 = await resolveProjectDir({
+      cwd: '/tmp/no-such-dir', idea: 'same idea', registry,
+      homeDir: '/tmp/fake-home-t', buildRoot, forceTemporal: true, now: 2000,
+    })
+    expect(r1.isNew).toBe(true)
+    expect(r1.dir.startsWith(buildRoot + path.sep)).toBe(true)
+    expect(r1.dir).not.toBe(r2.dir) // fresh per run — different timestamp
+  })
 })
 
 describe('resolveProjectDir — guardrail: never return homeDir', () => {

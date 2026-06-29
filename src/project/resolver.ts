@@ -53,6 +53,14 @@ export interface ResolveOpts {
   selfRoot?: string
   /** Base dir for NEW projects. Default: AUTODEV_BUILD_ROOT env, else <os.tmpdir()>/autodev. */
   buildRoot?: string
+  /**
+   * TESTING ONLY: force a brand-new fresh (timestamped) folder every run, ignoring
+   * cwd/registry/active. Defaults from the AUTODEV_TEMP_BUILDS env. Real runs leave this
+   * false and resolve normally — building wherever pi is opened.
+   */
+  forceTemporal?: boolean
+  /** Injectable clock (ms) for the temporal timestamp. Default: Date.now(). */
+  now?: number
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -140,11 +148,29 @@ function isForbidden(dir: string, homeDir: string, selfRoot?: string): boolean {
   return false
 }
 
+/** TESTING: a brand-new timestamped folder under the build root, fresh on every call. */
+async function freshTemporal(idea: string, registry: ProjectRegistry, opts: ResolveOpts): Promise<ResolveResult> {
+  const rawSlug = slugify(idea)
+  const slug = rawSlug.length > 0 ? rawSlug : 'project'
+  const base = opts.buildRoot ?? process.env['AUTODEV_BUILD_ROOT'] ?? path.join(os.tmpdir(), 'autodev')
+  const ms = typeof opts.now === 'number' ? opts.now : Date.now()
+  const stamp = new Date(ms).toISOString().replace(/[:.]/g, '-').replace('Z', '')
+  const name = `${slug}-${stamp}`
+  const dir = path.join(base, name)
+  await registry.register(name, dir)
+  return { dir, name, isNew: true, isExisting: false }
+}
+
 // ── Resolver ──────────────────────────────────────────────────────────────────
 
 export async function resolveProjectDir(opts: ResolveOpts): Promise<ResolveResult> {
   const { cwd, idea, registry } = opts
   const homeDir = opts.homeDir ?? os.homedir()
+
+  // TESTING: fresh temporal folder every run (opt-in via AUTODEV_TEMP_BUILDS). Real runs skip
+  // this entirely and resolve normally below — building wherever pi is opened.
+  const forceTemporal = opts.forceTemporal ?? /^(1|true|yes|on)$/i.test(process.env['AUTODEV_TEMP_BUILDS'] ?? '')
+  if (forceTemporal) return freshTemporal(idea, registry, opts)
 
   // Step 1: cwd is a registered project
   const registeredName = await registry.findByDir(cwd)
